@@ -6,115 +6,152 @@
 <title>تفعيل Mizan IQ</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0D3B6E,#185FA5);font-family:Arial,sans-serif}
-.box{background:#fff;border-radius:20px;padding:40px;width:460px;max-width:95vw;box-shadow:0 24px 64px rgba(0,0,0,.3);text-align:center}
-.brand{font-size:36px;font-weight:900;margin-bottom:8px}
-.brand span:first-child{color:#185FA5}
-.brand span:last-child{color:#B8860B}
-.sub{font-size:12px;color:#666;margin-bottom:24px}
-.warn{background:#FEF3C7;border:1px solid #F59E0B;border-radius:10px;padding:14px;margin-bottom:20px;font-size:13px;color:#92400E}
-.err{background:#FEE2E2;border:1px solid #EF4444;border-radius:8px;padding:12px;margin-bottom:18px;font-size:13px;color:#B91C1C;display:none}
-label{font-size:12px;font-weight:700;color:#374151;display:block;margin-bottom:6px;text-align:right}
-input{width:100%;padding:12px 14px;border:2px solid #D1D5DB;border-radius:10px;font-size:15px;font-family:monospace;text-align:center;letter-spacing:2px;text-transform:uppercase;outline:none;transition:border .2s}
+body{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0D3B6E,#185FA5);font-family:Arial,sans-serif;direction:rtl}
+.box{background:#fff;border-radius:20px;padding:36px;width:460px;max-width:95vw;box-shadow:0 24px 64px rgba(0,0,0,.3);text-align:center}
+.brand{font-size:34px;font-weight:900;margin-bottom:6px}
+.brand .b1{color:#185FA5}.brand .b2{color:#B8860B}
+.sub{font-size:12px;color:#888;margin-bottom:20px}
+.warn{background:#FEF3C7;border:1px solid #F59E0B;border-radius:10px;padding:12px;margin-bottom:18px;font-size:13px;color:#92400E}
+.err{background:#FEE2E2;border:1px solid #EF4444;border-radius:8px;padding:10px;margin-bottom:14px;font-size:13px;color:#B91C1C;display:none}
+.section{background:#F8FAFC;border-radius:12px;padding:16px;margin-bottom:14px;text-align:right}
+.section h3{font-size:12px;font-weight:700;color:#374151;margin-bottom:10px;display:flex;align-items:center;gap:6px}
+label{font-size:11px;font-weight:700;color:#6B7280;display:block;margin-bottom:4px}
+input{width:100%;padding:10px 12px;border:1.5px solid #D1D5DB;border-radius:8px;font-size:13px;outline:none;transition:border .2s;background:#fff;color:#111;margin-bottom:10px}
 input:focus{border-color:#185FA5}
-button{width:100%;padding:13px;background:#185FA5;color:white;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;margin-top:12px;transition:background .2s}
-button:hover{background:#0D3B6E}
-button:disabled{background:#9CA3AF;cursor:not-allowed}
-.msg{font-size:13px;color:#6B7280;min-height:24px;margin-top:12px}
-.footer{font-size:11px;color:#9CA3AF;border-top:1px solid #E5E7EB;padding-top:16px;margin-top:20px}
+input#keyInput{font-family:monospace;letter-spacing:2px;text-align:center;text-transform:uppercase;font-size:14px}
+.btn{width:100%;padding:13px;background:#185FA5;color:white;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;margin-top:4px;transition:all .2s}
+.btn:hover{background:#0D3B6E;transform:translateY(-1px)}
+.btn:disabled{background:#9CA3AF;cursor:not-allowed;transform:none}
+.msg{font-size:13px;min-height:22px;margin-top:10px;color:#6B7280}
+.footer{font-size:11px;color:#9CA3AF;margin-top:18px;padding-top:14px;border-top:1px solid #E5E7EB}
 .footer a{color:#185FA5;text-decoration:none}
+.success{background:#D1FAE5;border:1px solid #059669;border-radius:8px;padding:14px;margin-top:10px;color:#065F46;font-size:14px;display:none}
 </style>
 </head>
 <body>
 <div class="box">
-  <div class="brand"><span>Mizan </span><span>IQ</span></div>
+  <div class="brand"><span class="b1">Mizan </span><span class="b2">IQ</span></div>
   <div class="sub">الذكاء الذي يفهم أرقامك</div>
-  <div class="warn">🔐 هذه النسخة محمية بحقوق الملكية الفكرية</div>
+  <div class="warn">🔐 هذه النسخة محمية بحقوق الملكية الفكرية<br><small>خالد العمري — Mizan IQ</small></div>
+  
   <div class="err" id="errBox"></div>
-  <label>🔑 مفتاح التفعيل</label>
-  <input type="text" id="keyInput" placeholder="MIZAN-XXXX-XXXX-XXXX" autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false">
-  <div style="margin-top:16px;text-align:right">
-    <label style="font-size:12px;font-weight:700;color:#374151;display:block;margin-bottom:6px">👤 اسم المستخدم</label>
-    <input type="text" id="userInput" placeholder="اختر اسم مستخدم" autocomplete="off" style="width:100%;padding:12px 14px;border:2px solid #D1D5DB;border-radius:10px;font-size:14px;text-align:right;outline:none;margin-bottom:12px">
-    <label style="font-size:12px;font-weight:700;color:#374151;display:block;margin-bottom:6px">🔒 كلمة المرور</label>
-    <input type="password" id="passInput" placeholder="اختر كلمة مرور" autocomplete="off" style="width:100%;padding:12px 14px;border:2px solid #D1D5DB;border-radius:10px;font-size:14px;text-align:right;outline:none">
+
+  <!-- Step 1: Activation Key -->
+  <div class="section" id="step1">
+    <h3>🔑 الخطوة ١ — مفتاح التفعيل</h3>
+    <label>أدخل المفتاح الذي أرسله لك المدرب</label>
+    <input type="text" id="keyInput" placeholder="MIZAN-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false">
   </div>
-  <button id="activateBtn">🚀 تفعيل البرنامج</button>
+
+  <!-- Step 2: Create Account -->
+  <div class="section" id="step2">
+    <h3>👤 الخطوة ٢ — إنشاء حسابك</h3>
+    <label>اسم المستخدم (للدخول للبرنامج)</label>
+    <input type="text" id="userInput" placeholder="مثال: omar123" autocomplete="off" spellcheck="false">
+    <label>كلمة المرور</label>
+    <input type="password" id="passInput" placeholder="٤ أحرف على الأقل" autocomplete="off">
+    <label>تأكيد كلمة المرور</label>
+    <input type="password" id="pass2Input" placeholder="أعد كتابة كلمة المرور" autocomplete="off">
+  </div>
+
+  <button class="btn" id="activateBtn">🚀 تفعيل البرنامج والدخول</button>
   <div class="msg" id="msgBox"></div>
+  <div class="success" id="successBox">✅ تم التفعيل! جاري فتح البرنامج...</div>
+
   <div class="footer">
-    خالد العمري — Mizan IQ<br>
-    <a href="mailto:loloo31@gmail.com">loloo31@gmail.com</a>
+    للمساعدة تواصل مع المدرب:<br>
+    خالد العمري — <a href="mailto:loloo31@gmail.com">loloo31@gmail.com</a>
   </div>
 </div>
 
 <script>
-var KEY_PATTERN=/^MIZAN-[A-Z0-9]{4,8}-[A-Z0-9]{4,8}-[A-Z0-9]{4,8}$/;
-var inp=document.getElementById('keyInput');
-var btn=document.getElementById('activateBtn');
-var msg=document.getElementById('msgBox');
-var err=document.getElementById('errBox');
+var KEY_PATTERN = /^MIZAN-[A-Z0-9]{4,8}-[A-Z0-9]{4,8}-[A-Z0-9]{4,8}$/;
 
-// Check if already activated
-var stored=localStorage.getItem('mizan_license');
-if(stored){
-  try{
-    var lic=JSON.parse(stored);
-    if(lic&&lic.key&&lic.valid){
-      window.location.href='index.html';
-    }
-  }catch(e){}
-}
+var keyInp  = document.getElementById('keyInput');
+var userInp = document.getElementById('userInput');
+var passInp = document.getElementById('passInput');
+var pass2   = document.getElementById('pass2Input');
+var btn     = document.getElementById('activateBtn');
+var msg     = document.getElementById('msgBox');
+var errBox  = document.getElementById('errBox');
+var success = document.getElementById('successBox');
 
-inp.addEventListener('input',function(){
-  this.value=this.value.toUpperCase();
-  err.style.display='none';
+// Auto uppercase key
+keyInp.addEventListener('input', function(){
+  this.value = this.value.toUpperCase();
 });
 
-inp.addEventListener('keydown',function(e){
-  if(e.key==='Enter') activate();
+// Enter key support
+[keyInp, userInp, passInp, pass2].forEach(function(el){
+  el.addEventListener('keydown', function(e){
+    if(e.key === 'Enter') doActivate();
+  });
 });
 
-btn.addEventListener('click',activate);
-
-function activate(){
-  var key=inp.value.trim().toUpperCase();
-  var user=document.getElementById('userInput').value.trim();
-  var pass=document.getElementById('passInput').value.trim();
-  err.style.display='none';
-  msg.textContent='';
-
-  if(!key){showErr('أدخل مفتاح التفعيل');return;}
-  if(!KEY_PATTERN.test(key)){showErr('صيغة المفتاح غير صحيحة');return;}
-  if(!user){showErr('أدخل اسم المستخدم');return;}
-  if(user.length<3){showErr('اسم المستخدم 3 أحرف على الأقل');return;}
-  if(!pass){showErr('أدخل كلمة المرور');return;}
-  if(pass.length<4){showErr('كلمة المرور 4 أحرف على الأقل');return;}
-
-  btn.disabled=true;
-  msg.textContent='جاري التفعيل...';
-
-  // Hash password simply
-  var hash=0;
-  for(var i=0;i<pass.length;i++){hash=((hash<<5)-hash)+pass.charCodeAt(i);hash|=0;}
-  hash=Math.abs(hash).toString(16);
-
-  // Save license
-  var lic={key:key,valid:true,username:user,activatedAt:new Date().toISOString()};
-  localStorage.setItem('mizan_license',JSON.stringify(lic));
-
-  // Save user account to be created on first login
-  var account={username:user,passwordHash:hash,name:user,role:'user',active:true,firstLogin:true};
-  localStorage.setItem('mizan_pending_user',JSON.stringify(account));
-
-  msg.innerHTML='<span style="color:#059669">✅ تم التفعيل! مرحباً '+user+'<br>جاري التحميل...</span>';
-  setTimeout(function(){window.location.href='index.html';},1800);
-}
+btn.addEventListener('click', doActivate);
 
 function showErr(text){
-  err.textContent='⚠️ '+text;
-  err.style.display='block';
-  btn.disabled=false;
-  msg.textContent='';
+  errBox.textContent = '⚠️ ' + text;
+  errBox.style.display = 'block';
+  btn.disabled = false;
+  msg.textContent = '';
+  setTimeout(function(){ errBox.style.display='none'; }, 4000);
+}
+
+function hashStr(s){
+  var h = 0;
+  for(var i=0; i<s.length; i++){
+    h = Math.imul(31, h) + s.charCodeAt(i) | 0;
+  }
+  return Math.abs(h).toString(16);
+}
+
+function doActivate(){
+  errBox.style.display = 'none';
+  var key  = keyInp.value.trim().toUpperCase();
+  var user = userInp.value.trim();
+  var pass = passInp.value;
+  var pass2v = pass2.value;
+
+  // Validate
+  if(!key)         { showErr('أدخل مفتاح التفعيل'); return; }
+  if(!KEY_PATTERN.test(key)) { showErr('صيغة المفتاح غير صحيحة — يجب أن يبدأ بـ MIZAN-'); return; }
+  if(!user)        { showErr('أدخل اسم المستخدم'); return; }
+  if(user.length < 3) { showErr('اسم المستخدم 3 أحرف على الأقل'); return; }
+  if(!pass)        { showErr('أدخل كلمة المرور'); return; }
+  if(pass.length < 4) { showErr('كلمة المرور 4 أحرف على الأقل'); return; }
+  if(pass !== pass2v) { showErr('كلمة المرور غير متطابقة'); return; }
+
+  btn.disabled = true;
+  msg.textContent = 'جاري التفعيل...';
+
+  // Save license
+  var lic = {
+    key: key,
+    valid: true,
+    username: user,
+    activatedAt: new Date().toISOString()
+  };
+  localStorage.setItem('mizan_license', JSON.stringify(lic));
+
+  // Save pending user account
+  var account = {
+    username: user,
+    passwordHash: hashStr(pass),
+    name: user,
+    role: 'user',
+    active: true
+  };
+  localStorage.setItem('mizan_pending_user', JSON.stringify(account));
+
+  // Show success
+  success.style.display = 'block';
+  msg.textContent = '';
+
+  // Redirect to main app
+  setTimeout(function(){
+    window.location.href = 'index.html';
+  }, 2000);
 }
 </script>
 </body>
