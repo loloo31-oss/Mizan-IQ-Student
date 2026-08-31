@@ -822,26 +822,22 @@ function checkLicense(){
   var stored=localStorage.getItem('mizan_license');
   if(!stored){licenseState={checked:true,valid:false,data:null,error:'no_license'};return;}
   var lic=JSON.parse(stored);
-  // Check expiry
+  if(!lic||!lic.valid){licenseState={checked:true,valid:false,data:null,error:'no_license'};return;}
   if(lic.expiry&&new Date(lic.expiry)<new Date()){
    licenseState={checked:true,valid:false,data:lic,error:'expired'};return;
   }
   licenseState={checked:true,valid:true,data:lic,error:''};
-  // Async Firebase verification (non-blocking)
-  if(lic.key&&typeof firebase!=='undefined'){
-   firebase.database().ref(LICENSE_DB_PATH+'/'+lic.key).once('value').then(function(snap){
-    var d=snap.val();
-    if(!d||d.active===false){
-     licenseState.valid=false;licenseState.error='revoked';
-     localStorage.removeItem('mizan_license');
-     render();
-    } else if(d.expiry&&new Date(d.expiry)<new Date()){
-     licenseState.valid=false;licenseState.error='expired';
-     localStorage.removeItem('mizan_license');
-     render();
+  // Create pending user if exists
+  try{
+   var pu=JSON.parse(localStorage.getItem('mizan_pending_user')||'null');
+   if(pu&&pu.username){
+    if(!db.users.find(function(u){return u.username===pu.username;})){
+     db.users.push({id:'U'+Date.now(),username:pu.username,passwordHash:pu.passwordHash,name:pu.name||pu.username,role:'user',active:true,perms:{}});
+     save();
     }
-   }).catch(function(){/* offline — use cached license */});
-  }
+    localStorage.removeItem('mizan_pending_user');
+   }
+  }catch(e2){}
  }catch(e){licenseState={checked:true,valid:false,data:null,error:'invalid'};}
 }
 
