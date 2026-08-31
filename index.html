@@ -790,6 +790,14 @@ function importCoA(){
 function render(){
  CURRENT_USER=currentUser;
  window.db=db;window.lang=lang;window.licAdminState=licAdminState;
+  // ── Create pending user on first run ─────────────────────
+  try{
+   var pu=JSON.parse(localStorage.getItem('mizan_pending_user')||'null');
+   if(pu&&pu.username&&!db.users.find(function(u){return u.username===pu.username;})){
+    db.users.push({id:'U'+Date.now(),username:pu.username,passwordHash:pu.passwordHash,name:pu.name||pu.username,role:'user',active:true,perms:{}});
+    save();localStorage.removeItem('mizan_pending_user');
+   }
+  }catch(e2){}
  var el=document.getElementById('app');
  if(!el)return;
  // ── License Check ─────────────────────────────────────────
