@@ -95,6 +95,7 @@ html[dir="ltr"] .ind{padding-left:0;padding-right:14px}
 <body>
 <div class="app" id="app"></div>
 <script>
+var licenseState={checked:false,valid:false,data:null,error:''};
 (function() {
 "use strict";
 
@@ -800,7 +801,7 @@ function render(){
 }
 // ── LICENSE SYSTEM ────────────────────────────────────────────
 var LICENSE_DB_PATH='mizan_licenses';
-var licenseState={checked:false,valid:false,data:null,error:''};
+// licenseState defined at top
 
 // ── Global State Variables ────────────────────────────────────
 var openSections={};
