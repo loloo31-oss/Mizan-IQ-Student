@@ -98,12 +98,14 @@ function showErr(text){
   setTimeout(function(){ errBox.style.display='none'; }, 4000);
 }
 
+// IMPORTANT: must produce EXACTLY the same hash as hashPwd() in index.html,
+// otherwise the password saved here will never match at login.
 function hashStr(s){
   var h = 0;
   for(var i=0; i<s.length; i++){
-    h = Math.imul(31, h) + s.charCodeAt(i) | 0;
+    h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
   }
-  return Math.abs(h).toString(16);
+  return h.toString(36);
 }
 
 function doActivate(){
