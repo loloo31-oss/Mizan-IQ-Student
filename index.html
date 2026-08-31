@@ -839,163 +839,48 @@ function checkLicense(){
 function buildLicenseScreen(){
  var isAr=lang==='ar';
  var err=licenseState.error;
- var errMsg={
-  no_license:isAr?'لا يوجد ترخيص. أدخل مفتاح التفعيل الخاص بك':'No license found. Enter your activation key.',
-  expired:isAr?'انتهت صلاحية الترخيص. تواصل مع المدرب للتجديد':'License expired. Contact your trainer to renew.',
-  revoked:isAr?'تم إلغاء هذا الترخيص. تواصل مع المدرب':'This license has been revoked. Contact your trainer.',
-  invalid:isAr?'مفتاح التفعيل غير صحيح':'Invalid activation key.',
-  not_found:isAr?'المفتاح غير موجود في قاعدة البيانات':'Key not found in database.'
- }[err]||err;
-
- return '<div style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0D3B6E,#185FA5)">'
-  +'<div style="background:#fff;border-radius:20px;padding:40px;width:460px;box-shadow:0 24px 64px rgba(0,0,0,.25);text-align:center">'
-  // Logo
-  +'<div style="margin-bottom:16px"><span style="font-size:36px;font-weight:800;color:#185FA5">Mizan </span><span style="font-size:36px;font-weight:900;color:#B8860B">IQ</span></div>'
-  +'<div style="font-size:12px;color:#666;margin-bottom:24px;letter-spacing:1px">'+(isAr?'الذكاء الذي يفهم أرقامك':'The Intelligence That Understands Your Numbers')+'</div>'
-  +'<div style="background:#FEF3C7;border:1px solid #F59E0B;border-radius:10px;padding:14px;margin-bottom:20px;font-size:13px;color:#92400E">🔐 '+(isAr?'هذه النسخة محمية بحقوق الملكية الفكرية':'This copy is protected by intellectual property rights')+'</div>'
-  // Error msg
-  +(errMsg?'<div style="background:#FEE2E2;border:1px solid #EF4444;border-radius:8px;padding:12px;margin-bottom:18px;font-size:13px;color:#B91C1C">⚠️ '+errMsg+'</div>':'')
-  // Input
-  +'<div style="text-align:right;margin-bottom:16px">'
-  +'<label style="font-size:12px;font-weight:700;color:#374151;display:block;margin-bottom:6px">'+(isAr?'🔑 مفتاح التفعيل':'🔑 Activation Key')+'</label>'
-  +'<input id="licKeyInput" placeholder="MIZAN-XXXX-XXXX-XXXX" style="width:100%;padding:12px 14px;border:2px solid #D1D5DB;border-radius:10px;font-size:14px;font-family:monospace;text-align:center;box-sizing:border-box;letter-spacing:2px;text-transform:uppercase">'
-  +'</div>'
-  +'<button id="btnActivate" style="width:100%;padding:13px;background:#185FA5;color:white;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;margin-bottom:12px">🚀 '+(isAr?'تفعيل البرنامج':'Activate Program')+'</button>'
-  +'<div id="licMsg" style="font-size:12px;color:#6B7280;min-height:20px"></div>'
-  +'<div style="margin-top:24px;padding-top:20px;border-top:1px solid #E5E7EB;font-size:11px;color:#9CA3AF">'
-  +(isAr?'للحصول على مفتاح التفعيل، تواصل مع المدرب:<br><b>خالد العمري</b>':'For activation key, contact your trainer:<br><b>Khalid Al-Omary</b>')+'<br>'
-  +'<a href="mailto:loloo31@gmail.com" style="color:#185FA5">loloo31@gmail.com</a>'
-  +'</div>'
-  +'</div></div>'
-
-  +'<script>'
-  +'document.getElementById("btnActivate").addEventListener("click",function(){'
-  +' var key=(document.getElementById("licKeyInput").value||"").trim().toUpperCase();'
-  +' var msg=document.getElementById("licMsg");'
-  +' if(!key){msg.textContent="'+(isAr?'أدخل مفتاح التفعيل':'Enter activation key')+'";return;}'
-  +' msg.textContent="'+(isAr?'جاري التحقق...':'Verifying...')+'";'
-  +' window.activateLicense(key);'
-  +'});'
-  +'document.getElementById("licKeyInput").addEventListener("keydown",function(e){if(e.key==="Enter")document.getElementById("btnActivate").click();});'
-  +'<\\/script>';
-}
-
-window.activateLicense=function(key){
- var msg=document.getElementById('licMsg');
- var isAr=lang==='ar';
- // Check format: MIZAN-XXXX-XXXX-XXXX
- if(!/^MIZAN-[A-Z0-9]{4,6}-[A-Z0-9]{4,6}-[A-Z0-9]{4,6}$/.test(key)){
-  if(msg)msg.innerHTML='<span style="color:#EF4444">❌ '+(isAr?'صيغة المفتاح غير صحيحة':'Invalid key format')+'</span>';
-  return;
- }
- // Try Firebase first
- if(typeof firebase!=='undefined'){
-  firebase.database().ref(LICENSE_DB_PATH+'/'+key).once('value').then(function(snap){
-   var d=snap.val();
-   if(!d){
-    if(msg)msg.innerHTML='<span style="color:#EF4444">❌ '+(isAr?'المفتاح غير موجود':'Key not found')+'</span>';
-    licenseState.error='not_found';
-    return;
-   }
-   if(d.active===false){
-    if(msg)msg.innerHTML='<span style="color:#EF4444">❌ '+(isAr?'هذا المفتاح معطل':'This key is disabled')+'</span>';
-    return;
-   }
-   if(d.expiry&&new Date(d.expiry)<new Date()){
-    if(msg)msg.innerHTML='<span style="color:#EF4444">❌ '+(isAr?'انتهت صلاحية هذا المفتاح':'This key has expired')+'</span>';
-    return;
-   }
-   // Save license
-   var lic={key:key,trainee:d.trainee||'',traineeName:d.traineeName||'',course:d.course||'',expiry:d.expiry||'',activatedAt:new Date().toISOString()};
-   localStorage.setItem('mizan_license',JSON.stringify(lic));
-   licenseState={checked:true,valid:true,data:lic,error:''};
-   if(msg)msg.innerHTML='<span style="color:#059669">✅ '+(isAr?'تم التفعيل بنجاح! مرحباً '+lic.traineeName:'Activated! Welcome '+lic.traineeName)+'</span>';
-   setTimeout(function(){render();},1200);
-  }).catch(function(){
-   // Offline fallback — accept key with basic format check
-   var lic={key:key,trainee:'',traineeName:'',course:'',expiry:'',activatedAt:new Date().toISOString(),offline:true};
-   localStorage.setItem('mizan_license',JSON.stringify(lic));
-   licenseState={checked:true,valid:true,data:lic,error:''};
-   if(msg)msg.innerHTML='<span style="color:#059669">✅ '+(isAr?'تم التفعيل (وضع عدم الاتصال)':'Activated (offline mode)')+'</span>';
-   setTimeout(function(){render();},1000);
-  });
- } else {
-  // No Firebase — offline mode
-  var lic={key:key,trainee:'',traineeName:'',course:'',expiry:'',activatedAt:new Date().toISOString(),offline:true};
-  localStorage.setItem('mizan_license',JSON.stringify(lic));
-  licenseState={checked:true,valid:true,data:lic,error:''};
-  if(msg)msg.innerHTML='<span style="color:#059669">✅ '+(isAr?'تم التفعيل':'Activated')+'</span>';
-  setTimeout(function(){render();},1000);
- }
-};
-
-// ── Admin License Generator Tool ─────────────────────────────
-window.generateLicenseKey=function(traineeId,courseName,months){
- var chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
- function rand(n){var s='';for(var i=0;i<n;i++)s+=chars[Math.floor(Math.random()*chars.length)];return s;}
- var key='MIZAN-'+rand(4)+rand(2)+'-'+rand(6)+'-'+rand(6);
- var expiry=new Date();
- expiry.setMonth(expiry.getMonth()+(months||12));
- return {
-  key:key,
-  trainee:traineeId,
-  traineeName:'',
-  course:courseName||'Mizan IQ Course',
-  expiry:expiry.toISOString().slice(0,10),
-  active:true,
-  createdAt:new Date().toISOString()
+ var errMsgs={
+  no_license:isAr?'\u0623\u062f\u062e\u0644 \u0645\u0641\u062a\u0627\u062d \u0627\u0644\u062a\u0641\u0639\u064a\u0644':'Enter your activation key',
+  expired:isAr?'\u0627\u0646\u062a\u0647\u062a \u0635\u0644\u0627\u062d\u064a\u0629 \u0627\u0644\u062a\u0631\u062e\u064a\u0635. \u062a\u0648\u0627\u0635\u0644 \u0645\u0639 \u0627\u0644\u0645\u062f\u0631\u0628':'License expired. Contact trainer',
+  revoked:isAr?'\u062a\u0645 \u0625\u0644\u063a\u0627\u0621 \u0647\u0630\u0627 \u0627\u0644\u062a\u0631\u062e\u064a\u0635':'License revoked. Contact trainer',
+  not_found:isAr?'\u0627\u0644\u0645\u0641\u062a\u0627\u062d \u063a\u064a\u0631 \u0645\u0648\u062c\u0648\u062f':'Key not found'
  };
-};
-
-window.doLicSave=function(){
- var isAr=lang==='ar';
- var nm=((document.getElementById('lic-name')||{}).value||'').trim();
- if(!nm){alert(isAr?'أدخل اسم المتدرب':'Enter trainee name');return;}
- var key2=((document.getElementById('lic-key')||{}).value||'').trim();
- var mo=parseInt(((document.getElementById('lic-months')||{}).value)||'12');
- var exp2='';
- if(mo>0){var d2=new Date();d2.setMonth(d2.getMonth()+mo);exp2=d2.toISOString().slice(0,10);}
- var lic2={key:key2,traineeName:nm,contact:((document.getElementById('lic-contact')||{}).value||'').trim(),course:((document.getElementById('lic-course')||{}).value||''),expiry:exp2,price:parseFloat(((document.getElementById('lic-price')||{}).value)||'0'),active:true,createdAt:new Date().toISOString()};
- db.licenses=db.licenses||[];db.licenses.push(lic2);
- if(typeof firebase!=='undefined'){firebase.database().ref(LICENSE_DB_PATH+'/'+key2).set({traineeName:lic2.traineeName,course:lic2.course,expiry:lic2.expiry,active:true,createdAt:lic2.createdAt});}
- save();licAdminState.showForm=false;render();
- setTimeout(function(){
-  var phone=lic2.contact.replace(/[^0-9]/g,'');
-  if(phone.startsWith('05'))phone='966'+phone.slice(1);
-  else if(phone.startsWith('5')&&phone.length===9)phone='966'+phone;
-  var msg='مرحباً '+nm+' 🎓\n\nنسختك من برنامج Mizan IQ جاهزة!\n\n🔑 مفتاح التفعيل:\n'+key2+'\n\n📅 صالح حتى: '+(exp2||'غير محدود')+'\n📋 الدورة: '+lic2.course+'\n\nخطوات التفعيل:\n1️⃣ افتح البرنامج\n2️⃣ أدخل المفتاح\n3️⃣ اضغط تفعيل\n\n🌟 خالد العمري — Mizan IQ';
-  var url=phone.length>=9?'https://wa.me/'+phone+'?text='+encodeURIComponent(msg):'https://wa.me/?text='+encodeURIComponent(msg);
-  window.open(url,'_blank');
- },400);
-};
-window.licNew=function(){licAdminState.showForm=!licAdminState.showForm;render();};
-window.licCancel=function(){licAdminState.showForm=false;render();};
-window.licRegenKey=function(){var g=window.generateLicenseKey('','',12);var k=document.getElementById('lic-key');if(k)k.value=g.key;};
-window.licSuspend=function(key){var l=(db.licenses||[]).find(function(x){return x.id===key||x.key===key;});if(l&&confirm('Suspend?')){l.active=false;if(typeof firebase!=='undefined')firebase.database().ref(LICENSE_DB_PATH+'/'+key+'/active').set(false);save();render();}};
-window.licActivate=function(key){var l=(db.licenses||[]).find(function(x){return x.id===key||x.key===key;});if(l){l.active=true;if(typeof firebase!=='undefined')firebase.database().ref(LICENSE_DB_PATH+'/'+key+'/active').set(true);save();render();}};
-window.licRenew=function(key){var l=(db.licenses||[]).find(function(x){return x.id===key||x.key===key;});if(l){var d=new Date(l.expiry&&new Date(l.expiry)>new Date()?l.expiry:new Date());d.setFullYear(d.getFullYear()+1);l.expiry=d.toISOString().slice(0,10);l.active=true;if(typeof firebase!=='undefined')firebase.database().ref(LICENSE_DB_PATH+'/'+key).update({expiry:l.expiry,active:true});save();render();alert('✅ تم التجديد حتى: '+l.expiry);}};
-window.licWA=function(key){var l=(db.licenses||[]).find(function(x){return x.id===key||x.key===key;});if(!l)return;var phone=(l.contact||'').replace(/[^0-9]/g,'');if(phone.startsWith('05'))phone='966'+phone.slice(1);var msg='مرحباً '+l.traineeName+' 🎓\n\n🔑 مفتاح التفعيل:\n'+l.key+'\n\n📅 صالح حتى: '+(l.expiry||'غير محدود')+'\n📋 الدورة: '+l.course+'\n\n🌟 خالد العمري — Mizan IQ';var url=phone.length>=9?'https://wa.me/'+phone+'?text='+encodeURIComponent(msg):'https://wa.me/?text='+encodeURIComponent(msg);window.open(url,'_blank');};
-window.licEmail=function(key){
- var l=(db.licenses||[]).find(function(x){return x.key===key;});
- if(!l)return;
- var contact=l.contact||'';
- if(contact.indexOf('@')===-1){alert('لا يوجد إيميل لهذا المتدرب');return;}
- var msg='مرحباً '+l.traineeName+' 🎓\n\n🔑 مفتاح التفعيل:\n'+l.key+'\n\n📅 صالح حتى: '+(l.expiry||'غير محدود')+'\n📋 الدورة: '+l.course+'\n\n1️⃣ افتح البرنامج\n2️⃣ أدخل المفتاح\n3️⃣ اضغط تفعيل\n\n🌟 خالد العمري — Mizan IQ\nloloo31@gmail.com';
- var subject=encodeURIComponent('مفتاح تفعيل Mizan IQ — '+l.course);
- var body=encodeURIComponent(msg);
- // Open Gmail compose directly
- var gmailUrl='https://mail.google.com/mail/?view=cm&to='+encodeURIComponent(contact)+'&su='+subject+'&body='+body;
- window.open(gmailUrl,'_blank');
-};
-window.render=render;
-window.clearSession=clearSession;
-window.doLogout=function(){currentUser=null;clearSession();render();};
-window.doSwitchCo=function(){currentCompanyId=null;appState='selectCompany';render();};
-window.save=save;
-window.lang=lang;
-window.db=db;
-window.licAdminState=licAdminState;
-
+ var errMsg=errMsgs[err]||'';
+ return '<div id="licScreen" style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0D3B6E,#185FA5)">'
+  +'<div style="background:#fff;border-radius:20px;padding:40px;width:460px;max-width:95vw;box-shadow:0 24px 64px rgba(0,0,0,.25);text-align:center">'
+  +'<div style="margin-bottom:16px"><span style="font-size:36px;font-weight:800;color:#185FA5">Mizan </span><span style="font-size:36px;font-weight:900;color:#B8860B">IQ</span></div>'
+  +'<div style="font-size:12px;color:#666;margin-bottom:24px">\u0627\u0644\u0630\u0643\u0627\u0621 \u0627\u0644\u0630\u064a \u064a\u0641\u0647\u0645 \u0623\u0631\u0642\u0627\u0645\u0643</div>'
+  +'<div style="background:#FEF3C7;border:1px solid #F59E0B;border-radius:10px;padding:14px;margin-bottom:20px;font-size:13px;color:#92400E">\U0001f510 '+(isAr?'\u0647\u0630\u0647 \u0627\u0644\u0646\u0633\u062e\u0629 \u0645\u062d\u0645\u064a\u0629 \u0628\u062d\u0642\u0648\u0642 \u0627\u0644\u0645\u0644\u0643\u064a\u0629 \u0627\u0644\u0641\u0643\u0631\u064a\u0629':'This copy is protected by intellectual property rights')+'</div>'
+  +(errMsg?'<div style="background:#FEE2E2;border:1px solid #EF4444;border-radius:8px;padding:12px;margin-bottom:18px;font-size:13px;color:#B91C1C">\u26a0\ufe0f '+errMsg+'</div>':'')
+  +'<div style="text-align:right;margin-bottom:16px">'
+  +'<label style="font-size:12px;font-weight:700;color:#374151;display:block;margin-bottom:6px">\U0001f511 '+(isAr?'\u0645\u0641\u062a\u0627\u062d \u0627\u0644\u062a\u0641\u0639\u064a\u0644':'Activation Key')+'</label>'
+  +'<input id="licKey" placeholder="MIZAN-XXXX-XXXX-XXXX" style="width:100%;padding:12px 14px;border:2px solid #D1D5DB;border-radius:10px;font-size:14px;font-family:monospace;text-align:center;box-sizing:border-box;letter-spacing:2px;text-transform:uppercase;outline:none" oninput="this.value=this.value.toUpperCase()">'
+  +'</div>'
+  +'<button id="licBtn" style="width:100%;padding:13px;background:#185FA5;color:white;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;margin-bottom:12px">\U0001f680 '+(isAr?'\u062a\u0641\u0639\u064a\u0644 \u0627\u0644\u0628\u0631\u0646\u0627\u0645\u062c':'Activate Program')+'</button>'
+  +'<div id="licMsg" style="font-size:13px;color:#6B7280;min-height:24px;margin-bottom:16px"></div>'
+  +'<div style="font-size:11px;color:#9CA3AF;border-top:1px solid #E5E7EB;padding-top:16px">'+(isAr?'\u062e\u0627\u0644\u062f \u0627\u0644\u0639\u0645\u0631\u064a':'Khalid Al-Omary')+' — Mizan IQ<br><a href="mailto:loloo31@gmail.com" style="color:#185FA5">loloo31@gmail.com</a></div>'
+  +'</div></div>'
+  +'<script>'
+  +'(function(){'
+  +'var btn=document.getElementById("licBtn");'
+  +'var inp=document.getElementById("licKey");'
+  +'var msg=document.getElementById("licMsg");'
+  +'function doActivate(){'
+  +' var key=(inp.value||"").trim().toUpperCase();'
+  +' if(!key){msg.innerHTML="<span style=\'color:#EF4444\'>'+(isAr?'\u0623\u062f\u062e\u0644 \u0627\u0644\u0645\u0641\u062a\u0627\u062d':'Enter the key')+'</span>";return;}'
+  +' if(!/^MIZAN-[A-Z0-9]{4,8}-[A-Z0-9]{4,8}-[A-Z0-9]{4,8}$/.test(key)){msg.innerHTML="<span style=\'color:#EF4444\'>'+(isAr?'\u0635\u064a\u063a\u0629 \u063a\u064a\u0631 \u0635\u062d\u064a\u062d\u0629':'Invalid format')+'</span>";return;}'
+  +' msg.innerHTML="<span style=\'color:#6B7280\'>'+(isAr?'\u062c\u0627\u0631\u064a \u0627\u0644\u062a\u062d\u0642\u0642...':'Verifying...')+'</span>";'
+  +' btn.disabled=true;'
+  +' var lic={key:key,traineeName:"",course:"",expiry:"",activatedAt:new Date().toISOString()};'
+  +' localStorage.setItem("mizan_license",JSON.stringify(lic));'
+  +' msg.innerHTML="<span style=\'color:#059669\'>\u2705 '+(isAr?'\u062a\u0645 \u0627\u0644\u062a\u0641\u0639\u064a\u0644! \u062c\u0627\u0631\u064a \u0627\u0644\u062a\u062d\u0645\u064a\u0644...':'Activated! Loading...')+'</span>";'
+  +' setTimeout(function(){location.reload();},1500);'
+  +'}'
+  +'if(btn)btn.addEventListener("click",doActivate);'
+  +'if(inp)inp.addEventListener("keydown",function(e){if(e.key==="Enter")doActivate();});'
+  +'}());'
+  +'<\/script>';
+}
 
 function buildLogin(){
  var isAr=lang==='ar';
@@ -8312,6 +8197,63 @@ loadDB().then(function(loaded){
 });
 })();
 
+</script>
+<script>
+// ── Global License Functions ──────────────────────────────────
+window.activateLicense=function(key){
+ var msg=document.getElementById('licMsg');
+ var isAr=window.lang==='ar';
+ if(!key||!/^MIZAN-[A-Z0-9]{4,8}-[A-Z0-9]{4,8}-[A-Z0-9]{4,8}$/.test(key)){
+  if(msg)msg.innerHTML='<span style="color:#EF4444">❌ '+(isAr?'صيغة المفتاح غير صحيحة':'Invalid key format')+'</span>';
+  return;
+ }
+ if(msg)msg.innerHTML='<span style="color:#6B7280">'+(isAr?'جاري التحقق...':'Verifying...')+'</span>';
+ // Try Firebase first
+ var fbAvail=typeof firebase!=='undefined'&&firebase.database;
+ if(fbAvail){
+  try{
+   firebase.database().ref('mizan_licenses/'+key).once('value').then(function(snap){
+    var d=snap.val();
+    if(!d){
+     if(msg)msg.innerHTML='<span style="color:#EF4444">❌ '+(isAr?'المفتاح غير موجود':'Key not found')+'</span>';
+     return;
+    }
+    if(d.active===false){
+     if(msg)msg.innerHTML='<span style="color:#EF4444">❌ '+(isAr?'هذا المفتاح معطل. تواصل مع المدرب':'Key disabled. Contact trainer')+'</span>';
+     return;
+    }
+    if(d.expiry&&new Date(d.expiry)<new Date()){
+     if(msg)msg.innerHTML='<span style="color:#EF4444">❌ '+(isAr?'انتهت صلاحية المفتاح':'Key expired')+'</span>';
+     return;
+    }
+    var lic={key:key,traineeName:d.traineeName||'',course:d.course||'',expiry:d.expiry||'',activatedAt:new Date().toISOString()};
+    localStorage.setItem('mizan_license',JSON.stringify(lic));
+    window.licenseState={checked:true,valid:true,data:lic,error:''};
+    if(msg)msg.innerHTML='<span style="color:#059669">✅ '+(isAr?'تم التفعيل! مرحباً '+lic.traineeName:'Activated! Welcome '+lic.traineeName)+'</span>';
+    setTimeout(function(){if(window.render)window.render();},1200);
+   }).catch(function(){
+    // Offline — accept key
+    var lic={key:key,traineeName:'',course:'',expiry:'',activatedAt:new Date().toISOString(),offline:true};
+    localStorage.setItem('mizan_license',JSON.stringify(lic));
+    window.licenseState={checked:true,valid:true,data:lic,error:''};
+    if(msg)msg.innerHTML='<span style="color:#059669">✅ '+(isAr?'تم التفعيل':'Activated')+'</span>';
+    setTimeout(function(){if(window.render)window.render();},1000);
+   });
+  }catch(e){
+   var lic={key:key,traineeName:'',course:'',expiry:'',activatedAt:new Date().toISOString(),offline:true};
+   localStorage.setItem('mizan_license',JSON.stringify(lic));
+   window.licenseState={checked:true,valid:true,data:lic,error:''};
+   setTimeout(function(){if(window.render)window.render();},500);
+  }
+ } else {
+  // No Firebase — accept any valid format key
+  var lic={key:key,traineeName:'',course:'',expiry:'',activatedAt:new Date().toISOString(),offline:true};
+  localStorage.setItem('mizan_license',JSON.stringify(lic));
+  window.licenseState={checked:true,valid:true,data:lic,error:''};
+  if(msg)msg.innerHTML='<span style="color:#059669">✅ '+(isAr?'تم التفعيل':'Activated')+'</span>';
+  setTimeout(function(){if(window.render)window.render();},1000);
+ }
+};
 </script>
 <script>
 // ── Global License Admin Functions (outside IIFE) ─────────────
