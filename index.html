@@ -821,8 +821,8 @@ function licStrHash(s){
  for(var i=0;i<s.length;i++){h=(Math.imul(31,h)+s.charCodeAt(i))|0;}
  return h;
 }
-function licChecksum(partA,partB){
- var h=licStrHash(partA+'|'+partB+'|'+LICENSE_SALT);
+function licChecksum(partA,partB,expCode){
+ var h=licStrHash(partA+'|'+partB+'|'+expCode+'|'+LICENSE_SALT);
  var s=Math.abs(h).toString(36).toUpperCase();
  while(s.length<6)s='0'+s;
  return s.slice(0,6);
@@ -833,10 +833,34 @@ function licRandSeg(len){
  for(var i=0;i<len;i++)s+=chars.charAt(Math.floor(Math.random()*chars.length));
  return s;
 }
+// spec<=0 (or falsy '0') = lifetime key, encoded as '00000000'.
+// Otherwise the expiry date is baked into the key as YYYYMMDD, and is
+// part of the checksum input — a trainee can't edit the date without
+// breaking the checksum.
+// spec accepts: a plain number/numeric-string = months (back-compat),
+// a string ending in 'm' = months (e.g. '12m'), or a string ending in
+// 'd' = days (e.g. '15d').
+function licExpCode(spec){
+ var s=String(spec==null?'':spec).trim();
+ if(!s||s==='0')return '00000000';
+ var d=new Date();
+ if(/d$/i.test(s)){
+  var days=parseInt(s,10);
+  if(!days||days<=0)return '00000000';
+  d.setDate(d.getDate()+days);
+ }else{
+  var mo=parseInt(s,10);
+  if(!mo||mo<=0)return '00000000';
+  d.setMonth(d.getMonth()+mo);
+ }
+ var y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0');
+ return ''+y+m+day;
+}
 window.generateLicenseKey=function(seedA,seedB,months){
  var partA=licRandSeg(6),partB=licRandSeg(6);
- var key='MIZAN-'+partA+'-'+partB+'-'+licChecksum(partA,partB);
- return {key:key,partA:partA,partB:partB};
+ var expCode=licExpCode(months);
+ var key='MIZAN-'+partA+'-'+partB+'-'+expCode+'-'+licChecksum(partA,partB,expCode);
+ return {key:key,partA:partA,partB:partB,expCode:expCode};
 };
 
 // ── Global State Variables ────────────────────────────────────
@@ -5252,7 +5276,7 @@ function pLicenseAdmin(){
    +'</div>'
    +'<div class="fr2">'
    +fld(isAr?'اسم الدورة':'Course','<select id="lic-course" style="width:100%;padding:8px;border:1px solid var(--bd2);border-radius:var(--r);background:var(--sf);color:var(--tx);font-size:13px"><option>دورة محاسبة - مستوى أول</option><option>دورة محاسبة - مستوى ثاني</option><option>دورة Mizan IQ الشاملة</option><option>دورة ZATCA</option><option>دورة خاصة</option></select>')
-   +fld(isAr?'مدة الترخيص':'Duration','<select id="lic-months" style="width:100%;padding:8px;border:1px solid var(--bd2);border-radius:var(--r);background:var(--sf);color:var(--tx);font-size:13px"><option value="6">6 شهور</option><option value="12" selected>12 شهر</option><option value="24">24 شهر</option><option value="0">غير محدود</option></select>')
+   +fld(isAr?'مدة الترخيص':'Duration','<select id="lic-months" onchange="window.licRegenKey()" style="width:100%;padding:8px;border:1px solid var(--bd2);border-radius:var(--r);background:var(--sf);color:var(--tx);font-size:13px"><option value="15d">15 يوم</option><option value="6m">6 شهور</option><option value="12m" selected>12 شهر</option><option value="24m">24 شهر</option><option value="0">غير محدود</option></select>')
    +'</div>'
    +'<div class="fr2">'
    +fld(isAr?'السعر (ر.س)':'Price','<input id="lic-price" type="number" value="500" style="width:100%;padding:8px;border:1px solid var(--bd2);border-radius:var(--r);background:var(--sf);color:var(--tx);font-size:13px">')
@@ -5261,7 +5285,7 @@ function pLicenseAdmin(){
    +'<div style="display:flex;gap:8px;margin-top:10px">'
    +'<button class="btn bp" style="background:#0F6E56;border-color:#0F6E56" onclick="window.doLicSave()">💾 '+(isAr?'حفظ وإرسال':'Save & Send')+'</button>'
    +'<button class="btn" onclick="window.licCancel()">✖ '+(isAr?'إلغاء':'Cancel')+'</button>'
-   +'<button class="btn" onclick="(function(){var g=window.generateLicenseKey(\'\',\'\',12);var k=document.getElementById(\'lic-key\');if(k)k.value=g.key;})()" style="margin-right:auto">🔄 '+(isAr?'مفتاح جديد':'New Key')+'</button>'
+   +'<button class="btn" onclick="window.licRegenKey()" style="margin-right:auto">🔄 '+(isAr?'مفتاح جديد':'New Key')+'</button>'
    +'</div></div>';
  }
 
@@ -8209,6 +8233,10 @@ document.getElementById('app').innerHTML = '<div style="display:flex;align-items
 var skipNextRemote=false;
 document.documentElement.setAttribute('dir',lang==='ar'?'rtl':'ltr');
 document.documentElement.setAttribute('lang',lang);
+// Expose to the license-panel handlers below, which live in separate
+// <script> tags outside this IIFE and can't see these names directly.
+window.render=render;
+window.save=save;
 loadDB().then(function(loaded){
  db=loaded;
  render();
@@ -8290,14 +8318,19 @@ window.activateLicense=function(key){
 </script>
 <script>
 // ── Global License Admin Functions (outside IIFE) ─────────────
+var PROGRAM_URL='https://loloo31-oss.github.io/Mizan-IQ-Student/activate.html';
 window.doLicSave=function(){
  var isAr=window.lang==='ar';
  var nm=((document.getElementById('lic-name')||{}).value||'').trim();
  if(!nm){alert(isAr?'أدخل اسم المتدرب':'Enter trainee name');return;}
  var key2=((document.getElementById('lic-key')||{}).value||'').trim();
- var mo=parseInt(((document.getElementById('lic-months')||{}).value)||'12');
- var exp2='';
- if(mo>0){var d2=new Date();d2.setMonth(d2.getMonth()+mo);exp2=d2.toISOString().slice(0,10);}
+ // Derive the expiry straight from the generated key's own embedded date
+ // segment (MIZAN-partA-partB-YYYYMMDD-checksum), instead of recomputing
+ // it separately from the duration dropdown — this guarantees the admin's
+ // bookkeeping record always matches what's actually baked into the key,
+ // whatever duration unit (days/months) was used to generate it.
+ var expCode2=(key2.split('-')[3]||'00000000');
+ var exp2=(expCode2==='00000000')?'':(expCode2.slice(0,4)+'-'+expCode2.slice(4,6)+'-'+expCode2.slice(6,8));
  var lic2={key:key2,traineeName:nm,
   contact:((document.getElementById('lic-contact')||{}).value||'').trim(),
   course:((document.getElementById('lic-course')||{}).value||''),
@@ -8314,24 +8347,87 @@ window.doLicSave=function(){
   var phone=lic2.contact.replace(/[^0-9]/g,'');
   if(phone.startsWith('05'))phone='966'+phone.slice(1);
   else if(phone.startsWith('5')&&phone.length===9)phone='966'+phone;
-  var msg='مرحباً '+nm+' 🎓\n\nنسختك من برنامج Mizan IQ جاهزة!\n\n🔑 مفتاح التفعيل:\n'+key2+'\n\n📅 صالح حتى: '+(exp2||'غير محدود')+'\n📋 الدورة: '+lic2.course+'\n\nخطوات التفعيل:\n1️⃣ افتح البرنامج\n2️⃣ أدخل المفتاح\n3️⃣ اضغط تفعيل البرنامج\n\n🌟 خالد العمري — Mizan IQ\nloloo31@gmail.com';
+  var msg='مرحباً '+nm+' 🎓\n\nنسختك من برنامج Mizan IQ جاهزة!\n\n🔑 مفتاح التفعيل:\n'+key2+'\n\n📅 صالح حتى: '+(exp2||'غير محدود')+'\n📋 الدورة: '+lic2.course+'\n\nخطوات التفعيل:\n1️⃣ افتح رابط البرنامج:\n'+PROGRAM_URL+'\n2️⃣ أدخل المفتاح أعلاه\n3️⃣ اضغط تفعيل البرنامج\n\n🌟 خالد العمري — Mizan IQ\nloloo31@gmail.com';
   // WhatsApp
   var waUrl=phone.length>=9?'https://wa.me/'+phone+'?text='+encodeURIComponent(msg):'https://wa.me/?text='+encodeURIComponent(msg);
   window.open(waUrl,'_blank');
-  // Email via mailto (opens default mail app)
+  // Email via Gmail's web compose window (opens directly in the browser
+  // instead of going through mailto:, which is controlled by the OS's
+  // default mail-handler setting and was opening Edge/Outlook instead of
+  // Gmail).
   var contact=lic2.contact||'';
   if(contact.indexOf('@')>-1){
    var subject=encodeURIComponent('مفتاح تفعيل برنامج Mizan IQ — '+lic2.course);
    var body=encodeURIComponent(msg);
    setTimeout(function(){
-    window.location.href='mailto:'+contact+'?subject='+subject+'&body='+body;
+    window.open('https://mail.google.com/mail/?view=cm&fs=1&to='+encodeURIComponent(contact)+'&su='+subject+'&body='+body,'_blank');
    },800);
   }
  },500);
 };
 window.licNew=function(){if(window.licAdminState)window.licAdminState.showForm=!window.licAdminState.showForm;if(window.render)window.render();};
 window.licCancel=function(){if(window.licAdminState)window.licAdminState.showForm=false;if(window.render)window.render();};
-window.licRegenKey=function(){if(window.generateLicenseKey){var g=window.generateLicenseKey('','',12);var k=document.getElementById('lic-key');if(k)k.value=g.key;}};
+window.licRegenKey=function(){
+ if(!window.generateLicenseKey)return;
+ var moEl=document.getElementById('lic-months');
+ var mo=moEl?moEl.value:'12';
+ var g=window.generateLicenseKey('','',mo);
+ var k=document.getElementById('lic-key');
+ if(k)k.value=g.key;
+};
+
+// These were referenced by the license table buttons but never defined —
+// added so ⏸/▶/🔄/📱/📧 actually work. NOTE: this list is only a local
+// record on this admin's own browser (no server), so Suspend/Activate here
+// do not actually block or restore a trainee's copy — see chat for details.
+function licFind(key){return (window.db&&window.db.licenses||[]).find(function(x){return x.key===key;});}
+function licMsgFor(l){
+ var isAr=window.lang==='ar';
+ return isAr?
+  ('مرحباً '+l.traineeName+' 🎓\n\nنسختك من برنامج Mizan IQ جاهزة!\n\n🔑 مفتاح التفعيل:\n'+l.key+'\n\n📅 صالح حتى: '+(l.expiry||'غير محدود')+'\n📋 الدورة: '+l.course+'\n\nخطوات التفعيل:\n1️⃣ افتح رابط البرنامج:\n'+PROGRAM_URL+'\n2️⃣ أدخل المفتاح\n3️⃣ اضغط تفعيل البرنامج\n\n🌟 خالد العمري — Mizan IQ\nloloo31@gmail.com'):
+  ('Hello '+l.traineeName+' 🎓\n\nYour Mizan IQ license is ready!\n\n🔑 Activation Key:\n'+l.key+'\n\n📅 Valid until: '+(l.expiry||'Unlimited')+'\n📋 Course: '+l.course+'\n\nActivation steps:\n1️⃣ Open the program link:\n'+PROGRAM_URL+'\n2️⃣ Enter the key above\n3️⃣ Click "Activate Program"\n\nGood luck! 🌟\nKhalid Al-Omary — Mizan IQ');
+}
+window.licSuspend=function(key){
+ var l=licFind(key);if(!l)return;
+ l.active=false;
+ if(window.save)window.save();
+ if(window.render)window.render();
+};
+window.licActivate=function(key){
+ var l=licFind(key);if(!l)return;
+ l.active=true;
+ if(window.save)window.save();
+ if(window.render)window.render();
+};
+window.licRenew=function(key){
+ var l=licFind(key);if(!l)return;
+ var isAr=window.lang==='ar';
+ var mo=parseInt(prompt(isAr?'كم شهر تريد تمديد الترخيص؟':'Extend by how many months?','12')||'0',10);
+ if(!mo)return;
+ var base=(l.expiry&&new Date(l.expiry)>new Date())?new Date(l.expiry):new Date();
+ base.setMonth(base.getMonth()+mo);
+ l.expiry=base.toISOString().slice(0,10);
+ l.active=true;
+ if(window.save)window.save();
+ if(window.render)window.render();
+};
+window.licWA=function(key){
+ var l=licFind(key);if(!l)return;
+ var phone=(l.contact||'').replace(/[^0-9]/g,'');
+ if(phone.indexOf('05')===0)phone='966'+phone.slice(1);
+ else if(phone.indexOf('5')===0&&phone.length===9)phone='966'+phone;
+ var waUrl=phone.length>=9?('https://wa.me/'+phone+'?text='+encodeURIComponent(licMsgFor(l))):('https://wa.me/?text='+encodeURIComponent(licMsgFor(l)));
+ window.open(waUrl,'_blank');
+};
+window.licEmail=function(key){
+ var l=licFind(key);if(!l)return;
+ var contact=l.contact||'';
+ if(contact.indexOf('@')===-1){alert(window.lang==='ar'?'لا يوجد إيميل مسجل لهذا المتدرب':'No email on file for this trainee');return;}
+ var subject=encodeURIComponent('مفتاح تفعيل برنامج Mizan IQ — '+l.course);
+ // Gmail web-compose link instead of mailto: (mailto: is OS-default-handler
+ // controlled and was opening Edge/Outlook instead of Gmail).
+ window.open('https://mail.google.com/mail/?view=cm&fs=1&to='+encodeURIComponent(contact)+'&su='+subject+'&body='+encodeURIComponent(licMsgFor(l)),'_blank');
+};
 </script>
 </body>
 </html>
