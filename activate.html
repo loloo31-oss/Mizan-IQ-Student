@@ -65,7 +65,7 @@ input#keyInput{font-family:monospace;letter-spacing:2px;text-align:center;text-t
 </div>
 
 <script>
-var KEY_PATTERN = /^MIZAN-[A-Z0-9]{4,8}-[A-Z0-9]{4,8}-[A-Z0-9]{4,8}$/;
+var KEY_PATTERN = /^MIZAN-[A-Z0-9]{4,8}-[A-Z0-9]{4,8}-[0-9]{8}-[A-Z0-9]{4,8}$/;
 
 var keyInp  = document.getElementById('keyInput');
 var userInp = document.getElementById('userInput');
@@ -76,9 +76,23 @@ var msg     = document.getElementById('msgBox');
 var errBox  = document.getElementById('errBox');
 var success = document.getElementById('successBox');
 
-// Auto uppercase key
+// Auto uppercase key + strip anything that isn't A-Z/0-9/hyphen.
+// This matters because keys are usually pasted in from WhatsApp/email —
+// those can carry invisible characters (bidi marks, stray spaces) around
+// a Latin string embedded in Arabic text, which silently breaks the
+// format check even though the key "looks" right on screen.
+function sanitizeKey(v){
+  return (v || '')
+    .toUpperCase()
+    .replace(/[‐-―−﹘﹣－]/g, '-') // various dash look-alikes -> plain hyphen
+    .replace(/[^A-Z0-9-]/g, ''); // drop anything else (invisible bidi marks, stray spaces, etc.)
+}
 keyInp.addEventListener('input', function(){
-  this.value = this.value.toUpperCase();
+  this.value = sanitizeKey(this.value);
+});
+keyInp.addEventListener('paste', function(){
+  var el = this;
+  setTimeout(function(){ el.value = sanitizeKey(el.value); }, 0);
 });
 
 // Enter key support
@@ -115,29 +129,39 @@ function licStrHash(s){
   for(var i=0;i<s.length;i++){h=(Math.imul(31,h)+s.charCodeAt(i))|0;}
   return h;
 }
-function licChecksum(partA,partB){
-  var h=licStrHash(partA+'|'+partB+'|'+LICENSE_SALT);
+function licChecksum(partA,partB,expCode){
+  var h=licStrHash(partA+'|'+partB+'|'+expCode+'|'+LICENSE_SALT);
   var s=Math.abs(h).toString(36).toUpperCase();
   while(s.length<6)s='0'+s;
   return s.slice(0,6);
 }
 function isValidLicenseKey(k){
   var parts=k.split('-');
-  if(parts.length!==4||parts[0]!=='MIZAN')return false;
-  return licChecksum(parts[1],parts[2])===parts[3];
+  if(parts.length!==5||parts[0]!=='MIZAN')return false;
+  return licChecksum(parts[1],parts[2],parts[3])===parts[4];
+}
+// '00000000' means a lifetime key (no expiry). Returns '' for that case,
+// otherwise 'YYYY-MM-DD'.
+function licExpiryFromKey(k){
+  var expCode=k.split('-')[3];
+  if(!expCode||expCode==='00000000')return '';
+  return expCode.slice(0,4)+'-'+expCode.slice(4,6)+'-'+expCode.slice(6,8);
 }
 
 function doActivate(){
   errBox.style.display = 'none';
-  var key  = keyInp.value.trim().toUpperCase();
+  var key  = sanitizeKey(keyInp.value.trim());
+  keyInp.value = key; // reflect the cleaned value back so what's shown = what's checked
   var user = userInp.value.trim();
   var pass = passInp.value;
   var pass2v = pass2.value;
 
   // Validate
   if(!key)         { showErr('أدخل مفتاح التفعيل'); return; }
-  if(!KEY_PATTERN.test(key)) { showErr('صيغة المفتاح غير صحيحة — يجب أن يبدأ بـ MIZAN-'); return; }
+  if(!KEY_PATTERN.test(key)) { showErr('صيغة المفتاح غير صحيحة — يجب أن يبدأ بـ MIZAN- (المُدخل حاليًا: '+key+')'); return; }
   if(!isValidLicenseKey(key)) { showErr('هذا المفتاح غير صالح — تأكد من نسخه كاملاً بدون أخطاء، أو تواصل مع المدرب'); return; }
+  var keyExpiry = licExpiryFromKey(key);
+  if(keyExpiry && new Date(keyExpiry) < new Date()) { showErr('انتهت صلاحية هذا المفتاح. تواصل مع المدرب للحصول على مفتاح جديد'); return; }
   if(!user)        { showErr('أدخل اسم المستخدم'); return; }
   if(user.length < 3) { showErr('اسم المستخدم 3 أحرف على الأقل'); return; }
   if(!pass)        { showErr('أدخل كلمة المرور'); return; }
@@ -152,6 +176,7 @@ function doActivate(){
     key: key,
     valid: true,
     username: user,
+    expiry: keyExpiry, // '' = lifetime key; index.html blocks access once this date passes
     activatedAt: new Date().toISOString()
   };
   localStorage.setItem('mizan_license', JSON.stringify(lic));
