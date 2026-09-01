@@ -108,6 +108,25 @@ function hashStr(s){
   return h.toString(36);
 }
 
+// ── License key verification (must mirror index.html exactly) ──
+var LICENSE_SALT='MzIQ-9Kf3-Secret-2026-XyQ';
+function licStrHash(s){
+  var h=0;
+  for(var i=0;i<s.length;i++){h=(Math.imul(31,h)+s.charCodeAt(i))|0;}
+  return h;
+}
+function licChecksum(partA,partB){
+  var h=licStrHash(partA+'|'+partB+'|'+LICENSE_SALT);
+  var s=Math.abs(h).toString(36).toUpperCase();
+  while(s.length<6)s='0'+s;
+  return s.slice(0,6);
+}
+function isValidLicenseKey(k){
+  var parts=k.split('-');
+  if(parts.length!==4||parts[0]!=='MIZAN')return false;
+  return licChecksum(parts[1],parts[2])===parts[3];
+}
+
 function doActivate(){
   errBox.style.display = 'none';
   var key  = keyInp.value.trim().toUpperCase();
@@ -118,6 +137,7 @@ function doActivate(){
   // Validate
   if(!key)         { showErr('أدخل مفتاح التفعيل'); return; }
   if(!KEY_PATTERN.test(key)) { showErr('صيغة المفتاح غير صحيحة — يجب أن يبدأ بـ MIZAN-'); return; }
+  if(!isValidLicenseKey(key)) { showErr('هذا المفتاح غير صالح — تأكد من نسخه كاملاً بدون أخطاء، أو تواصل مع المدرب'); return; }
   if(!user)        { showErr('أدخل اسم المستخدم'); return; }
   if(user.length < 3) { showErr('اسم المستخدم 3 أحرف على الأقل'); return; }
   if(!pass)        { showErr('أدخل كلمة المرور'); return; }
