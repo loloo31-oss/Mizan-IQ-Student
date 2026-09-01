@@ -4,6 +4,25 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>تفعيل Mizan IQ</title>
+<script>
+// If this device already has a valid, non-expired license activated on it,
+// skip this activation screen entirely and go straight into the real
+// program — a trainee should only see this page once, the first time they
+// activate. On every visit after that (e.g. if they keep using the same
+// link the trainer sent them), they get bounced straight to index.html.
+// An expired license does NOT redirect — the trainee needs to land on this
+// page to enter a fresh key.
+(function(){
+  try{
+    var stored = localStorage.getItem('mizan_license');
+    if(!stored) return;
+    var lic = JSON.parse(stored);
+    if(lic && lic.valid && (!lic.expiry || new Date(lic.expiry) >= new Date())){
+      window.location.replace('index.html');
+    }
+  }catch(e){}
+})();
+</script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0D3B6E,#185FA5);font-family:Arial,sans-serif;direction:rtl}
