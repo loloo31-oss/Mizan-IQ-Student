@@ -635,7 +635,6 @@ function buildLogin(){
   +'<div id="loginErr" style="color:#dc2626;font-size:12px;margin-bottom:10px;display:none">'+(isAr?'اسم المستخدم أو كلمة المرور غير صحيحة':'Invalid username or password')+'</div>'
   +'<button id="btnLogin" style="width:100%;padding:12px;background:#185FA5;color:white;border:none;border-radius:var(--r);font-size:15px;font-weight:700;cursor:pointer">'+(isAr?'تسجيل الدخول':'Sign In')+'</button>'
   +'<div style="margin-top:12px;text-align:center"><a href="#" id="btnBackToCompanies" style="font-size:12px;color:var(--t2);text-decoration:none">'+(isAr?'← العودة لقائمة الشركات':'&#8592; Back to companies')+'</a></div>'
-  +'<div style="margin-top:10px;font-size:11px;color:var(--t3);text-align:center">'+(isAr?'افتراضي: admin / admin123':'Default: admin / admin123')+'</div>'
   +'<div style="margin-top:6px;font-size:11px;text-align:center"><a href="#" id="btnResetAdmin" style="color:var(--pu);text-decoration:none">'+(isAr?'نسيت كلمة المرور؟':'Forgot password? Reset admin')+'</a></div>'
   +'</div></div>';
 }
@@ -802,7 +801,33 @@ function render(){
  if(!el)return;
  // ── License Check ─────────────────────────────────────────
  if(!licenseState.checked)checkLicense();
- if(!licenseState.valid){el.innerHTML=buildLicenseScreen();return;}
+ if(!licenseState.valid){
+  el.innerHTML=buildLicenseScreen();
+  setTimeout(function(){
+   var btn=document.getElementById('licBtn'),inp=document.getElementById('licKey'),msg=document.getElementById('licMsg');
+   if(!btn||!inp||!msg)return;
+   inp.addEventListener('input',function(){this.value=sanitizeLicenseKey(this.value);});
+   function doActivate(){
+    var isAr2=lang==='ar';
+    var key=sanitizeLicenseKey(inp.value.trim());
+    inp.value=key;
+    if(!key){msg.innerHTML='<span style="color:#EF4444">'+(isAr2?'أدخل المفتاح':'Enter the key')+'</span>';return;}
+    if(!KEY_PATTERN.test(key)){msg.innerHTML='<span style="color:#EF4444">'+(isAr2?'صيغة غير صحيحة':'Invalid format')+'</span>';return;}
+    if(!isValidLicenseKey(key)){msg.innerHTML='<span style="color:#EF4444">'+(isAr2?'هذا المفتاح غير صالح':'This key is not valid')+'</span>';return;}
+    var exp=licExpiryFromKey(key);
+    if(exp&&new Date(exp)<new Date()){msg.innerHTML='<span style="color:#EF4444">'+(isAr2?'انتهت صلاحية هذا المفتاح':'This key has expired')+'</span>';return;}
+    msg.innerHTML='<span style="color:#6B7280">'+(isAr2?'جاري التحقق...':'Verifying...')+'</span>';
+    btn.disabled=true;
+    var lic={key:key,valid:true,traineeName:'',course:'',expiry:exp,activatedAt:new Date().toISOString()};
+    localStorage.setItem('mizan_license',JSON.stringify(lic));
+    msg.innerHTML='<span style="color:#059669">✅ '+(isAr2?'تم التفعيل! جاري التحميل...':'Activated! Loading...')+'</span>';
+    setTimeout(function(){location.reload();},1500);
+   }
+   btn.addEventListener('click',doActivate);
+   inp.addEventListener('keydown',function(e){if(e.key==='Enter')doActivate();});
+  },50);
+  return;
+ }
  // ── Normal App Flow ───────────────────────────────────────
  if(!currentUser){el.innerHTML=buildLogin();setTimeout(function(){var uEl=document.getElementById('loginUser'),pEl=document.getElementById('loginPwd'),bEl=document.getElementById('btnLogin');if(!bEl)return;function doLogin(){var uv=((uEl&&uEl.value)||'').trim();var pv=((pEl&&pEl.value)||'').trim();var usr=db.users.find(function(x){return x.username===uv&&x.active;});if(!usr||usr.passwordHash!==hashPwd(pv)){var e2=document.getElementById('loginErr');if(e2)e2.style.display='block';return;}currentUser=usr;saveSession(usr);render();}bEl.addEventListener('click',doLogin);if(pEl)pEl.addEventListener('keydown',function(e){if(e.key==='Enter')doLogin();});var rEl=document.getElementById('btnResetAdmin');if(rEl)rEl.addEventListener('click',function(e){e.preventDefault();var adm=db.users.find(function(x){return x.role==='admin';});if(adm){adm.passwordHash=hashPwd('admin123');save();alert('Admin password reset to: admin123');}});},50);return;} try{el.innerHTML=buildLayout();bindEvents();}
  catch(e){el.innerHTML='<div style="color:red;padding:20px;background:#fff1f0;margin:20px;border-radius:8px"><b>Error: </b>'+e.message+'<br><small>'+(e.stack||'').replace(/</g,'&lt;').slice(0,400)+'</small></div>';}
@@ -826,6 +851,23 @@ function licChecksum(partA,partB,expCode){
  var s=Math.abs(h).toString(36).toUpperCase();
  while(s.length<6)s='0'+s;
  return s.slice(0,6);
+}
+// Used by the in-app "license expired / re-activate" screen (mirrors the
+// checks in activate.html exactly, so a key rejected/accepted there behaves
+// the same way here).
+var KEY_PATTERN=/^MIZAN-[A-Z0-9]{4,8}-[A-Z0-9]{4,8}-[0-9]{8}-[A-Z0-9]{4,8}$/;
+function isValidLicenseKey(k){
+ var parts=k.split('-');
+ if(parts.length!==5||parts[0]!=='MIZAN')return false;
+ return licChecksum(parts[1],parts[2],parts[3])===parts[4];
+}
+function licExpiryFromKey(k){
+ var expCode=k.split('-')[3];
+ if(!expCode||expCode==='00000000')return '';
+ return expCode.slice(0,4)+'-'+expCode.slice(4,6)+'-'+expCode.slice(6,8);
+}
+function sanitizeLicenseKey(v){
+ return (v||'').toUpperCase().replace(/[‐-―−﹘﹣－]/g,'-').replace(/[^A-Z0-9-]/g,'');
 }
 function licRandSeg(len){
  var chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I to avoid confusion when read aloud
@@ -916,27 +958,14 @@ function buildLicenseScreen(){
   +'<button id="licBtn" style="width:100%;padding:13px;background:#185FA5;color:white;border:none;border-radius:10px;font-size:15px;font-weight:700;cursor:pointer;margin-bottom:12px">\U0001f680 '+(isAr?'\u062a\u0641\u0639\u064a\u0644 \u0627\u0644\u0628\u0631\u0646\u0627\u0645\u062c':'Activate Program')+'</button>'
   +'<div id="licMsg" style="font-size:13px;color:#6B7280;min-height:24px;margin-bottom:16px"></div>'
   +'<div style="font-size:11px;color:#9CA3AF;border-top:1px solid #E5E7EB;padding-top:16px">'+(isAr?'\u062e\u0627\u0644\u062f \u0627\u0644\u0639\u0645\u0631\u064a':'Khalid Al-Omary')+' — Mizan IQ<br><a href="mailto:loloo31@gmail.com" style="color:#185FA5">loloo31@gmail.com</a></div>'
-  +'</div></div>'
-  +'<script>'
-  +'(function(){'
-  +'var btn=document.getElementById("licBtn");'
-  +'var inp=document.getElementById("licKey");'
-  +'var msg=document.getElementById("licMsg");'
-  +'function doActivate(){'
-  +' var key=(inp.value||"").trim().toUpperCase();'
-  +' if(!key){msg.innerHTML="<span style=\'color:#EF4444\'>'+(isAr?'\u0623\u062f\u062e\u0644 \u0627\u0644\u0645\u0641\u062a\u0627\u062d':'Enter the key')+'</span>";return;}'
-  +' if(!/^MIZAN-[A-Z0-9]{4,8}-[A-Z0-9]{4,8}-[A-Z0-9]{4,8}$/.test(key)){msg.innerHTML="<span style=\'color:#EF4444\'>'+(isAr?'\u0635\u064a\u063a\u0629 \u063a\u064a\u0631 \u0635\u062d\u064a\u062d\u0629':'Invalid format')+'</span>";return;}'
-  +' msg.innerHTML="<span style=\'color:#6B7280\'>'+(isAr?'\u062c\u0627\u0631\u064a \u0627\u0644\u062a\u062d\u0642\u0642...':'Verifying...')+'</span>";'
-  +' btn.disabled=true;'
-  +' var lic={key:key,traineeName:"",course:"",expiry:"",activatedAt:new Date().toISOString()};'
-  +' localStorage.setItem("mizan_license",JSON.stringify(lic));'
-  +' msg.innerHTML="<span style=\'color:#059669\'>\u2705 '+(isAr?'\u062a\u0645 \u0627\u0644\u062a\u0641\u0639\u064a\u0644! \u062c\u0627\u0631\u064a \u0627\u0644\u062a\u062d\u0645\u064a\u0644...':'Activated! Loading...')+'</span>";'
-  +' setTimeout(function(){location.reload();},1500);'
-  +'}'
-  +'if(btn)btn.addEventListener("click",doActivate);'
-  +'if(inp)inp.addEventListener("keydown",function(e){if(e.key==="Enter")doActivate();});'
-  +'}());'
-  +'<\/script>';
+  +'</div></div>';
+ // NOTE: this HTML used to carry its own inline <script> tag for the
+ // Activate button. Scripts inserted via .innerHTML never execute in a
+ // real browser (a well-known DOM behavior) \u2014 so that script was dead on
+ // arrival: clicking "Activate" here did nothing at all, regardless of
+ // what key was typed. The real wiring now happens in render(), the same
+ // way the login screen's buttons are wired (getElementById + addEventListener
+ // right after the innerHTML assignment).
 }
 
 function buildLogin(){
@@ -961,7 +990,6 @@ function buildLogin(){
   +'<div id="loginErr" style="color:#dc2626;font-size:12px;margin-bottom:10px;display:none">'+(isAr?'اسم المستخدم أو كلمة المرور غير صحيحة':'Invalid username or password')+'</div>'
   +'<button id="btnLogin" style="width:100%;padding:12px;background:#185FA5;color:white;border:none;border-radius:var(--r);font-size:15px;font-weight:700;cursor:pointer">'+(isAr?'تسجيل الدخول':'Sign In')+'</button>'
   +'<div style="margin-top:12px;text-align:center"><a href="#" id="btnBackToCompanies" style="font-size:12px;color:var(--t2);text-decoration:none">'+(isAr?'← العودة لقائمة الشركات':'&#8592; Back to companies')+'</a></div>'
-  +'<div style="margin-top:10px;font-size:11px;color:var(--t3);text-align:center">'+(isAr?'افتراضي: admin / admin123':'Default: admin / admin123')+'</div>'
   +'<div style="margin-top:6px;font-size:11px;text-align:center"><a href="#" id="btnResetAdmin" style="color:var(--pu);text-decoration:none">'+(isAr?'نسيت كلمة المرور؟':'Forgot password? Reset admin')+'</a></div>'
   +'</div></div>';
 }
