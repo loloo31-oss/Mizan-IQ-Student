@@ -23,6 +23,33 @@
   }catch(e){}
 })();
 </script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script>
+// Same config as index.html — see the comment there for what this is and
+// isn't used for (auth + the /licenses registry only, never the
+// accounting data itself).
+var MIZAN_FB_CONFIG={
+ apiKey:"AIzaSyBi0ac-BIAl1M8DvCuAZRORF5HzIm0m89k",
+ authDomain:"account-pro-d511d.firebaseapp.com",
+ databaseURL:"https://account-pro-d511d-default-rtdb.asia-southeast1.firebasedatabase.app",
+ projectId:"account-pro-d511d",
+ storageBucket:"account-pro-d511d.firebasestorage.app",
+ messagingSenderId:"63478300303",
+ appId:"1:63478300303:web:a44d0207835c4e7ad47afa"
+};
+var MIZAN_AUTH_DOMAIN='mizaniq-trainees.app';
+try{
+ firebase.initializeApp(MIZAN_FB_CONFIG);
+ window.mizanAuth=firebase.auth();
+ window.mizanLicensesRef=firebase.database().ref('licenses');
+ window.mizanUsersRef=firebase.database().ref('users');
+}catch(e){ console.error('Mizan Firebase init failed',e); }
+function usernameToEmail(u){
+ return String(u||'').trim().toLowerCase().replace(/[^a-z0-9_.-]/g,'')+'@'+MIZAN_AUTH_DOMAIN;
+}
+</script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{min-height:100vh;display:flex;align-items:center;justify-content:center;background:linear-gradient(135deg,#0D3B6E,#185FA5);font-family:Arial,sans-serif;direction:rtl}
@@ -68,7 +95,7 @@ input#keyInput{font-family:monospace;letter-spacing:2px;text-align:center;text-t
     <label>اسم المستخدم (للدخول للبرنامج)</label>
     <input type="text" id="userInput" placeholder="مثال: omar123" autocomplete="off" spellcheck="false">
     <label>كلمة المرور</label>
-    <input type="password" id="passInput" placeholder="٤ أحرف على الأقل" autocomplete="off">
+    <input type="password" id="passInput" placeholder="٦ أحرف على الأقل" autocomplete="off">
     <label>تأكيد كلمة المرور</label>
     <input type="password" id="pass2Input" placeholder="أعد كتابة كلمة المرور" autocomplete="off">
   </div>
@@ -175,49 +202,60 @@ function doActivate(){
   var pass = passInp.value;
   var pass2v = pass2.value;
 
-  // Validate
+  // Local checks first (fast, no network needed for obviously-wrong input).
+  // The REAL authority on whether this key may be used is the /licenses
+  // record on the server (checked further below) — the checksum here is
+  // just a quick sanity filter.
   if(!key)         { showErr('أدخل مفتاح التفعيل'); return; }
   if(!KEY_PATTERN.test(key)) { showErr('صيغة المفتاح غير صحيحة — يجب أن يبدأ بـ MIZAN- (المُدخل حاليًا: '+key+')'); return; }
   if(!isValidLicenseKey(key)) { showErr('هذا المفتاح غير صالح — تأكد من نسخه كاملاً بدون أخطاء، أو تواصل مع المدرب'); return; }
-  var keyExpiry = licExpiryFromKey(key);
-  if(keyExpiry && new Date(keyExpiry) < new Date()) { showErr('انتهت صلاحية هذا المفتاح. تواصل مع المدرب للحصول على مفتاح جديد'); return; }
   if(!user)        { showErr('أدخل اسم المستخدم'); return; }
   if(user.length < 3) { showErr('اسم المستخدم 3 أحرف على الأقل'); return; }
   if(!pass)        { showErr('أدخل كلمة المرور'); return; }
-  if(pass.length < 4) { showErr('كلمة المرور 4 أحرف على الأقل'); return; }
+  if(pass.length < 6) { showErr('كلمة المرور 6 أحرف على الأقل'); return; } // Firebase's own minimum
   if(pass !== pass2v) { showErr('كلمة المرور غير متطابقة'); return; }
+  if(!window.mizanAuth||!window.mizanLicensesRef){ showErr('تعذر الاتصال بالخادم. تحقق من اتصالك بالإنترنت وحاول مجددًا'); return; }
 
   btn.disabled = true;
-  msg.textContent = 'جاري التفعيل...';
+  msg.textContent = 'جاري التحقق من المفتاح...';
 
-  // Save license
-  var lic = {
-    key: key,
-    valid: true,
-    username: user,
-    expiry: keyExpiry, // '' = lifetime key; index.html blocks access once this date passes
-    activatedAt: new Date().toISOString()
-  };
-  localStorage.setItem('mizan_license', JSON.stringify(lic));
-
-  // Save pending user account
-  var account = {
-    username: user,
-    passwordHash: hashStr(pass),
-    name: user,
-    role: 'user',
-    active: true
-  };
-  localStorage.setItem('mizan_pending_user', JSON.stringify(account));
-
-  // Show success
-  success.style.display = 'block';
-  msg.textContent = '';
-
-  // Redirect to main app
-  setTimeout(function(){
-    window.location.href = 'index.html';
-  }, 2000);
+  var licRef = window.mizanLicensesRef.child(key);
+  var licData;
+  licRef.once('value').then(function(snap){
+    licData = snap.val();
+    if(!licData){ throw {code:'mizan/not-found'}; }
+    if(licData.active === false){ throw {code:'mizan/suspended'}; }
+    if(licData.claimedBy){ throw {code:'mizan/claimed'}; }
+    if(licData.expiry && new Date(licData.expiry) < new Date()){ throw {code:'mizan/expired'}; }
+    msg.textContent = 'جاري إنشاء حسابك...';
+    return window.mizanAuth.createUserWithEmailAndPassword(usernameToEmail(user), pass);
+  }).then(function(cred){
+    var uid = cred.user.uid;
+    return Promise.all([
+      licRef.update({claimedBy: uid, claimedUsername: user}),
+      window.mizanUsersRef.child(uid).set({username: user, licenseKey: key, createdAt: new Date().toISOString()})
+    ]);
+  }).then(function(){
+    // Local flag only so index.html's pre-login screen knows this device
+    // has activated once — the real, live check happens against Firebase
+    // at every login from here on (see firebaseManaged in index.html).
+    var lic = {key:key, valid:true, firebaseManaged:true, expiry: licData.expiry||'', activatedAt: new Date().toISOString()};
+    try{ localStorage.setItem('mizan_license', JSON.stringify(lic)); }catch(e){}
+    success.style.display = 'block';
+    msg.textContent = '';
+    setTimeout(function(){ window.location.href = 'index.html'; }, 1500);
+  }).catch(function(err){
+    btn.disabled = false;
+    var code = err && err.code;
+    if(code === 'mizan/not-found') showErr('هذا المفتاح غير موجود — تأكد من نسخه بشكل صحيح أو تواصل مع المدرب');
+    else if(code === 'mizan/suspended') showErr('تم إلغاء هذا المفتاح — تواصل مع المدرب');
+    else if(code === 'mizan/claimed') showErr('هذا المفتاح مستخدم بالفعل من قبل — تواصل مع المدرب للحصول على مفتاح جديد');
+    else if(code === 'mizan/expired') showErr('انتهت صلاحية هذا المفتاح — تواصل مع المدرب للحصول على مفتاح جديد');
+    else if(code === 'auth/email-already-in-use') showErr('اسم المستخدم "'+user+'" مستخدم بالفعل — اختر اسم مستخدم آخر');
+    else if(code === 'auth/weak-password') showErr('كلمة المرور ضعيفة جدًا — استخدم 6 أحرف على الأقل');
+    else if(code === 'auth/network-request-failed') showErr('تعذر الاتصال بالخادم — تحقق من اتصالك بالإنترنت');
+    else showErr('حدث خطأ أثناء التفعيل: '+((err&&err.message)||'غير معروف'));
+  });
 }
 </script>
 </body>
