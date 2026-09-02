@@ -8473,31 +8473,32 @@ window.doLicSave=function(){
    alert((isAr?'تحذير: تم الحفظ محليًا لكن فشل رفع الترخيص للخادم — قد لا يستطيع المتدرب التفعيل. التفاصيل: ':'Warning: saved locally but publishing the license to the server failed — the trainee may not be able to activate. Details: ')+(err&&err.message?err.message:err));
   });
  }
- setTimeout(function(){
-  // Message language follows the admin panel's CURRENT interface language
-  // at the moment of sending (licMsgFor reads window.lang live), not the
-  // language it happened to be in when the license was first created.
-  var msg=licMsgFor(lic2);
-  // WhatsApp — only if a phone number was entered.
-  if(lic2.phone){
-   var phone=lic2.phone.replace(/[^0-9]/g,'');
-   if(phone.startsWith('05'))phone='966'+phone.slice(1);
-   else if(phone.startsWith('5')&&phone.length===9)phone='966'+phone;
-   var waUrl=phone.length>=9?'https://wa.me/'+phone+'?text='+encodeURIComponent(msg):'https://wa.me/?text='+encodeURIComponent(msg);
-   window.open(waUrl,'_blank');
-  }
-  // Email via Gmail's web compose window (opens directly in the browser
-  // instead of going through mailto:, which is controlled by the OS's
-  // default mail-handler setting and was opening Edge/Outlook instead of
-  // Gmail) — only if an email was entered. Independent of the phone/
-  // WhatsApp step above: both can fire, either can fire alone.
-  if(lic2.email){
-   var subject=encodeURIComponent((isAr?'مفتاح تفعيل برنامج Mizan IQ — ':'Mizan IQ activation key — ')+lic2.course);
-   setTimeout(function(){
-    window.open('https://mail.google.com/mail/?view=cm&fs=1&to='+encodeURIComponent(lic2.email)+'&su='+subject+'&body='+encodeURIComponent(msg),'_blank');
-   },lic2.phone?800:0);
-  }
- },500);
+ // Open WhatsApp / Gmail SYNCHRONOUSLY, right here in the click handler —
+ // not inside a setTimeout. Browsers only allow window.open() to bypass
+ // the popup blocker when it happens as a direct, immediate result of a
+ // user gesture (the click on "Save & Send"); delaying it even by a few
+ // hundred milliseconds loses that "user activation" and the tab either
+ // gets blocked outright or opens blank/broken — which is exactly the bug
+ // this replaces.
+ var msg=licMsgFor(lic2);
+ // WhatsApp — only if a phone number was entered.
+ if(lic2.phone){
+  var phone=lic2.phone.replace(/[^0-9]/g,'');
+  if(phone.startsWith('05'))phone='966'+phone.slice(1);
+  else if(phone.startsWith('5')&&phone.length===9)phone='966'+phone;
+  var waUrl=phone.length>=9?'https://wa.me/'+phone+'?text='+encodeURIComponent(msg):'https://wa.me/?text='+encodeURIComponent(msg);
+  window.open(waUrl,'_blank');
+ }
+ // Email via Gmail's web compose window (opens directly in the browser
+ // instead of going through mailto:, which is controlled by the OS's
+ // default mail-handler setting and was opening Edge/Outlook instead of
+ // Gmail) — only if an email was entered. Independent of the phone/
+ // WhatsApp step above: both can fire, either can fire alone, and both
+ // fire in the same synchronous click for the same reason as above.
+ if(lic2.email){
+  var subject=encodeURIComponent((isAr?'مفتاح تفعيل برنامج Mizan IQ — ':'Mizan IQ activation key — ')+lic2.course);
+  window.open('https://mail.google.com/mail/?view=cm&fs=1&to='+encodeURIComponent(lic2.email)+'&su='+subject+'&body='+encodeURIComponent(msg),'_blank');
+ }
 };
 window.licNew=function(){if(window.licAdminState)window.licAdminState.showForm=!window.licAdminState.showForm;if(window.render)window.render();};
 window.licCancel=function(){if(window.licAdminState)window.licAdminState.showForm=false;if(window.render)window.render();};
