@@ -91,6 +91,64 @@ html[dir="ltr"] .ind{padding-left:0;padding-right:14px}
 </style>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script>
+// ── Mizan IQ real backend: auth + licenses ONLY ────────────────────
+// This is intentionally separate from the older, still-unused
+// HAS_CLOUD/accountpro-db block further down (its FB_CONFIG variable is
+// deliberately left undefined so that legacy full-data-sync code stays
+// inert). This config powers exactly two things: real trainee sign-up/
+// sign-in (Firebase Authentication, replacing the old locally-hashed
+// password check) and a real license registry (Realtime Database, under
+// /licenses and /users) that the admin panel and every trainee device can
+// both see live. Accounting data itself (chart of accounts, journals,
+// invoices, etc.) is NOT part of this and stays local per device, exactly
+// as before.
+var MIZAN_FB_CONFIG={
+ apiKey:"AIzaSyBi0ac-BIAl1M8DvCuAZRORF5HzIm0m89k",
+ authDomain:"account-pro-d511d.firebaseapp.com",
+ databaseURL:"https://account-pro-d511d-default-rtdb.asia-southeast1.firebasedatabase.app",
+ projectId:"account-pro-d511d",
+ storageBucket:"account-pro-d511d.firebasestorage.app",
+ messagingSenderId:"63478300303",
+ appId:"1:63478300303:web:a44d0207835c4e7ad47afa"
+};
+// Trainees only ever type a username — Firebase Authentication's
+// email/password provider needs something shaped like an email, so we
+// silently map username -> username@<this fake domain>. It never has to
+// resolve to a real mailbox; Firebase never sends anything to it.
+var MIZAN_AUTH_DOMAIN='mizaniq-trainees.app';
+// A single fixed service account used ONLY so the admin panel's writes to
+// /licenses (issuing, suspending, renewing) are allowed by the database
+// security rules below, without changing how you log into the admin panel
+// itself (that stays local/unchanged). It auto-creates itself on first use.
+var MIZAN_SERVICE_EMAIL='service@mizaniq-app.internal';
+var MIZAN_SERVICE_PASSWORD='Mzn-Svc-9f3Kx72Qz-Admin!';
+try{
+ firebase.initializeApp(MIZAN_FB_CONFIG);
+ window.mizanAuth=firebase.auth();
+ window.mizanLicensesRef=firebase.database().ref('licenses');
+ window.mizanUsersRef=firebase.database().ref('users');
+}catch(e){ console.error('Mizan Firebase init failed',e); }
+function usernameToEmail(u){
+ return String(u||'').trim().toLowerCase().replace(/[^a-z0-9_.-]/g,'')+'@'+MIZAN_AUTH_DOMAIN;
+}
+window.usernameToEmail=usernameToEmail;
+function ensureServiceAdminAuth(){
+ if(!window.mizanAuth)return Promise.reject(new Error('no-auth'));
+ var cu=window.mizanAuth.currentUser;
+ if(cu&&cu.email===MIZAN_SERVICE_EMAIL)return Promise.resolve(cu);
+ return window.mizanAuth.signInWithEmailAndPassword(MIZAN_SERVICE_EMAIL,MIZAN_SERVICE_PASSWORD)
+  .then(function(cred){return cred.user;})
+  .catch(function(err){
+   if(err&&err.code==='auth/user-not-found'){
+    return window.mizanAuth.createUserWithEmailAndPassword(MIZAN_SERVICE_EMAIL,MIZAN_SERVICE_PASSWORD).then(function(cred){return cred.user;});
+   }
+   throw err;
+  });
+}
+window.ensureServiceAdminAuth=ensureServiceAdminAuth;
+</script>
 </head>
 <body>
 <div class="app" id="app"></div>
@@ -829,7 +887,69 @@ function render(){
   return;
  }
  // ── Normal App Flow ───────────────────────────────────────
- if(!currentUser){el.innerHTML=buildLogin();setTimeout(function(){var uEl=document.getElementById('loginUser'),pEl=document.getElementById('loginPwd'),bEl=document.getElementById('btnLogin');if(!bEl)return;function doLogin(){var uv=((uEl&&uEl.value)||'').trim();var pv=((pEl&&pEl.value)||'').trim();var usr=db.users.find(function(x){return x.username===uv&&x.active;});if(!usr||usr.passwordHash!==hashPwd(pv)){var e2=document.getElementById('loginErr');if(e2)e2.style.display='block';return;}currentUser=usr;saveSession(usr);render();}bEl.addEventListener('click',doLogin);if(pEl)pEl.addEventListener('keydown',function(e){if(e.key==='Enter')doLogin();});var rEl=document.getElementById('btnResetAdmin');if(rEl)rEl.addEventListener('click',function(e){e.preventDefault();var adm=db.users.find(function(x){return x.role==='admin';});if(adm){adm.passwordHash=hashPwd('admin123');save();alert('Admin password reset to: admin123');}});},50);return;} try{el.innerHTML=buildLayout();bindEvents();}
+ if(!currentUser){
+  el.innerHTML=buildLogin();
+  setTimeout(function(){
+   var uEl=document.getElementById('loginUser'),pEl=document.getElementById('loginPwd'),bEl=document.getElementById('btnLogin');
+   if(!bEl)return;
+   function showLoginErr(text){
+    var e2=document.getElementById('loginErr');
+    if(!e2)return;
+    if(text)e2.textContent=text;
+    e2.style.display='block';
+   }
+   function doLogin(){
+    var uv=((uEl&&uEl.value)||'').trim();
+    var pv=((pEl&&pEl.value)||'').trim();
+    var e2=document.getElementById('loginErr');
+    if(e2)e2.style.display='none';
+    // Local accounts (the admin account, and any user created directly in
+    // db.users) are checked first and keep working exactly as before —
+    // this part of the login system was NOT changed.
+    var usr=db.users.find(function(x){return x.username===uv&&x.active;});
+    if(usr){
+     if(usr.passwordHash===hashPwd(pv)){currentUser=usr;saveSession(usr);render();}
+     else showLoginErr();
+     return;
+    }
+    // Not a known local account -> treat it as a trainee account and
+    // verify it against the real backend (Firebase Authentication +
+    // the /licenses registry), instead of a locally-stored password hash.
+    if(!window.mizanAuth||!window.usernameToEmail){showLoginErr();return;}
+    bEl.disabled=true;
+    window.mizanAuth.signInWithEmailAndPassword(window.usernameToEmail(uv),pv).then(function(cred){
+     return window.mizanUsersRef.child(cred.user.uid).once('value').then(function(snap){
+      var prof=snap.val();
+      if(!prof||!prof.licenseKey)throw {code:'mizan/no-profile'};
+      return window.mizanLicensesRef.child(prof.licenseKey).once('value').then(function(licSnap){
+       var lic=licSnap.val();
+       if(!lic||lic.active===false)throw {code:'mizan/suspended'};
+       if(lic.expiry&&new Date(lic.expiry)<new Date())throw {code:'mizan/expired'};
+       currentUser={id:cred.user.uid,username:prof.username||uv,name:prof.username||uv,role:'user',active:true,perms:{}};
+       window.mizanCurrentTrainee={uid:cred.user.uid,licenseKey:prof.licenseKey};
+       try{localStorage.setItem('mizan_license',JSON.stringify({key:prof.licenseKey,valid:true,firebaseManaged:true,expiry:lic.expiry||'',activatedAt:new Date().toISOString()}));}catch(e3){}
+       bEl.disabled=false;
+       render();
+      });
+     });
+    }).catch(function(err){
+     bEl.disabled=false;
+     window.mizanAuth.signOut().catch(function(){});
+     var isAr2=lang==='ar';
+     var msg=isAr2?'اسم المستخدم أو كلمة المرور غير صحيحة':'Invalid username or password';
+     if(err&&err.code==='mizan/suspended')msg=isAr2?'تم إيقاف هذا الحساب. تواصل مع المدرب':'This account has been suspended. Contact your trainer';
+     else if(err&&err.code==='mizan/expired')msg=isAr2?'انتهت صلاحية الترخيص. تواصل مع المدرب':'Your license has expired. Contact your trainer';
+     showLoginErr(msg);
+    });
+   }
+   bEl.addEventListener('click',doLogin);
+   if(pEl)pEl.addEventListener('keydown',function(e){if(e.key==='Enter')doLogin();});
+   var rEl=document.getElementById('btnResetAdmin');
+   if(rEl)rEl.addEventListener('click',function(e){e.preventDefault();var adm=db.users.find(function(x){return x.role==='admin';});if(adm){adm.passwordHash=hashPwd('admin123');save();alert('Admin password reset to: admin123');}});
+  },50);
+  return;
+ }
+ try{el.innerHTML=buildLayout();bindEvents();}
  catch(e){el.innerHTML='<div style="color:red;padding:20px;background:#fff1f0;margin:20px;border-radius:8px"><b>Error: </b>'+e.message+'<br><small>'+(e.stack||'').replace(/</g,'&lt;').slice(0,400)+'</small></div>';}
 }
 // ── LICENSE SYSTEM ────────────────────────────────────────────
@@ -917,7 +1037,15 @@ function checkLicense(){
   if(!stored){licenseState={checked:true,valid:false,data:null,error:'no_license'};return;}
   var lic=JSON.parse(stored);
   if(!lic||!lic.valid){licenseState={checked:true,valid:false,data:null,error:'no_license'};return;}
-  if(lic.expiry&&new Date(lic.expiry)<new Date()){
+  // Accounts created through the real backend (Firebase, marked
+  // firebaseManaged below) are re-checked live at every login and session
+  // restore (see doLogin / onAuthStateChanged) — that's the authoritative,
+  // always-current check now, so a stale locally-cached expiry here (e.g.
+  // right after the admin renews a license, which only updates the server)
+  // must not block them from even reaching the login screen. Older,
+  // purely-local accounts (activated before this migration) have no such
+  // live check, so they keep the original local expiry gate.
+  if(!lic.firebaseManaged&&lic.expiry&&new Date(lic.expiry)<new Date()){
    licenseState={checked:true,valid:false,data:lic,error:'expired'};return;
   }
   licenseState={checked:true,valid:true,data:lic,error:''};
@@ -8191,6 +8319,31 @@ window.save=save;
 loadDB().then(function(loaded){
  db=loaded;
  render();
+ // Restore a trainee's session automatically if Firebase already has one
+ // persisted for this browser (so they don't have to log in every single
+ // time they open the app — this also doubles as a live re-check: if the
+ // admin suspended this trainee, or their license has since expired, they
+ // get signed out here instead of silently staying "logged in".)
+ if(window.mizanAuth){
+  window.mizanAuth.onAuthStateChanged(function(fbUser){
+   if(currentUser||!fbUser||fbUser.email===MIZAN_SERVICE_EMAIL)return;
+   window.mizanUsersRef.child(fbUser.uid).once('value').then(function(snap){
+    var prof=snap.val();
+    if(!prof||!prof.licenseKey)return;
+    return window.mizanLicensesRef.child(prof.licenseKey).once('value').then(function(licSnap){
+     var lic=licSnap.val();
+     if(!lic||lic.active===false||(lic.expiry&&new Date(lic.expiry)<new Date())){
+      window.mizanAuth.signOut().catch(function(){});
+      return;
+     }
+     currentUser={id:fbUser.uid,username:prof.username,name:prof.username,role:'user',active:true,perms:{}};
+     window.mizanCurrentTrainee={uid:fbUser.uid,licenseKey:prof.licenseKey};
+     try{localStorage.setItem('mizan_license',JSON.stringify({key:prof.licenseKey,valid:true,firebaseManaged:true,expiry:lic.expiry||'',activatedAt:new Date().toISOString()}));}catch(e4){}
+     render();
+    });
+   }).catch(function(){});
+  });
+ }
  // Listen for remote changes (sync across devices)
  if(HAS_CLOUD&&fbRef){
   fbRef.on('value',function(snap){
@@ -8294,6 +8447,20 @@ window.doLicSave=function(){
  window.save();
  window.licAdminState.showForm=false;
  window.render();
+ // Publish the same license to the real backend (Realtime Database) so a
+ // trainee can actually activate it, and so Suspend/Renew below take real,
+ // immediate effect instead of only updating this admin's own local table.
+ if(window.ensureServiceAdminAuth&&window.mizanLicensesRef){
+  window.ensureServiceAdminAuth().then(function(){
+   return window.mizanLicensesRef.child(key2).set({
+    traineeName:nm,contact:lic2.contact,course:lic2.course,
+    expiry:exp2,active:true,createdAt:lic2.createdAt
+   });
+  }).catch(function(err){
+   console.error('Failed to publish license to Firebase',err);
+   alert((isAr?'تحذير: تم الحفظ محليًا لكن فشل رفع الترخيص للخادم — قد لا يستطيع المتدرب التفعيل. التفاصيل: ':'Warning: saved locally but publishing the license to the server failed — the trainee may not be able to activate. Details: ')+(err&&err.message?err.message:err));
+  });
+ }
  setTimeout(function(){
   var phone=lic2.contact.replace(/[^0-9]/g,'');
   if(phone.startsWith('05'))phone='966'+phone.slice(1);
@@ -8328,9 +8495,10 @@ window.licRegenKey=function(){
 };
 
 // These were referenced by the license table buttons but never defined —
-// added so ⏸/▶/🔄/📱/📧 actually work. NOTE: this list is only a local
-// record on this admin's own browser (no server), so Suspend/Activate here
-// do not actually block or restore a trainee's copy — see chat for details.
+// added so ⏸/▶/🔄/📱/📧 actually work. Suspend/Activate/Renew below update
+// this admin's own local table AND push the same change to the real
+// /licenses/{key} record on the server (via licPublish), so they take
+// real, immediate effect on the trainee's copy too — not just here.
 function licFind(key){return (window.db&&window.db.licenses||[]).find(function(x){return x.key===key;});}
 function licMsgFor(l){
  var isAr=window.lang==='ar';
@@ -8338,17 +8506,34 @@ function licMsgFor(l){
   ('مرحباً '+l.traineeName+' 🎓\n\nنسختك من برنامج Mizan IQ جاهزة!\n\n🔑 مفتاح التفعيل:\n'+l.key+'\n\n📅 صالح حتى: '+(l.expiry||'غير محدود')+'\n📋 الدورة: '+l.course+'\n\nخطوات التفعيل:\n1️⃣ افتح رابط البرنامج:\n'+PROGRAM_URL+'\n2️⃣ أدخل المفتاح\n3️⃣ اضغط تفعيل البرنامج\n\n🌟 خالد العمري — Mizan IQ\nloloo31@gmail.com'):
   ('Hello '+l.traineeName+' 🎓\n\nYour Mizan IQ license is ready!\n\n🔑 Activation Key:\n'+l.key+'\n\n📅 Valid until: '+(l.expiry||'Unlimited')+'\n📋 Course: '+l.course+'\n\nActivation steps:\n1️⃣ Open the program link:\n'+PROGRAM_URL+'\n2️⃣ Enter the key above\n3️⃣ Click "Activate Program"\n\nGood luck! 🌟\nKhalid Al-Omary — Mizan IQ');
 }
+// Pushes a partial update to the real /licenses/{key} record (after
+// signing in as the fixed service account) so Suspend/Activate/Renew
+// take effect immediately for the trainee too, not just in this admin's
+// own local table. Failures are logged + surfaced but don't block the
+// local update from applying.
+function licPublish(key,patch){
+ if(!window.ensureServiceAdminAuth||!window.mizanLicensesRef)return;
+ window.ensureServiceAdminAuth().then(function(){
+  return window.mizanLicensesRef.child(key).update(patch);
+ }).catch(function(err){
+  console.error('Failed to sync license change to Firebase',err);
+  var isAr=window.lang==='ar';
+  alert((isAr?'تحذير: التغيير حُفظ محليًا فقط ولم يصل للخادم. التفاصيل: ':'Warning: this change saved locally only and did not reach the server. Details: ')+(err&&err.message?err.message:err));
+ });
+}
 window.licSuspend=function(key){
  var l=licFind(key);if(!l)return;
  l.active=false;
  if(window.save)window.save();
  if(window.render)window.render();
+ licPublish(key,{active:false});
 };
 window.licActivate=function(key){
  var l=licFind(key);if(!l)return;
  l.active=true;
  if(window.save)window.save();
  if(window.render)window.render();
+ licPublish(key,{active:true});
 };
 window.licRenew=function(key){
  var l=licFind(key);if(!l)return;
@@ -8361,6 +8546,7 @@ window.licRenew=function(key){
  l.active=true;
  if(window.save)window.save();
  if(window.render)window.render();
+ licPublish(key,{expiry:l.expiry,active:true});
 };
 window.licWA=function(key){
  var l=licFind(key);if(!l)return;
