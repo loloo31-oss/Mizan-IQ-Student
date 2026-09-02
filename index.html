@@ -8383,7 +8383,12 @@ window.doLicSave=function(){
   var phone=lic2.phone.replace(/[^0-9]/g,'');
   if(phone.startsWith('05'))phone='966'+phone.slice(1);
   else if(phone.startsWith('5')&&phone.length===9)phone='966'+phone;
-  var waUrl=phone.length>=9?'https://wa.me/'+phone+'?text='+encodeURIComponent(msg):'https://wa.me/?text='+encodeURIComponent(msg);
+  // web.whatsapp.com/send opens straight into the chat in an ALREADY-
+  // authenticated browser tab — wa.me instead bounces through an extra
+  // api.whatsapp.com landing page ("Continue to WhatsApp Web") whose
+  // click-through navigation was landing on a blank/stuck page for some
+  // users. Going directly to web.whatsapp.com skips that hop entirely.
+  var waUrl=phone.length>=9?'https://web.whatsapp.com/send?phone='+phone+'&text='+encodeURIComponent(msg):'https://wa.me/?text='+encodeURIComponent(msg);
   window.open(waUrl,'_blank');
  }
  // Email via Gmail's web compose window (opens directly in the browser
@@ -8472,7 +8477,9 @@ window.licWA=function(key){
  var phone=phoneRaw.replace(/[^0-9]/g,'');
  if(phone.indexOf('05')===0)phone='966'+phone.slice(1);
  else if(phone.indexOf('5')===0&&phone.length===9)phone='966'+phone;
- var waUrl=phone.length>=9?('https://wa.me/'+phone+'?text='+encodeURIComponent(licMsgFor(l))):('https://wa.me/?text='+encodeURIComponent(licMsgFor(l)));
+ // web.whatsapp.com/send opens straight into the chat (see the matching
+ // comment in doLicSave above for why this replaces wa.me here too).
+ var waUrl=phone.length>=9?('https://web.whatsapp.com/send?phone='+phone+'&text='+encodeURIComponent(licMsgFor(l))):('https://wa.me/?text='+encodeURIComponent(licMsgFor(l)));
  window.open(waUrl,'_blank');
 };
 window.licEmail=function(key){
@@ -8489,4 +8496,3 @@ window.licEmail=function(key){
 </script>
 </body>
 </html>
-Western
