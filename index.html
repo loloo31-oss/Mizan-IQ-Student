@@ -138,11 +138,21 @@ function ensureServiceAdminAuth(){
  if(!window.mizanAuth)return Promise.reject(new Error('no-auth'));
  var cu=window.mizanAuth.currentUser;
  if(cu&&cu.email===MIZAN_SERVICE_EMAIL)return Promise.resolve(cu);
- return window.mizanAuth.signInWithEmailAndPassword(MIZAN_SERVICE_EMAIL,MIZAN_SERVICE_PASSWORD)
+ // Try creating the service account first (only ever succeeds once, the
+ // very first time this ever runs on a device), then fall back to signing
+ // in if it already exists. This order is deliberate: newer Firebase Auth
+ // versions return the generic 'auth/invalid-credential' (not the older,
+ // more specific 'auth/user-not-found') when signing in to an account that
+ // doesn't exist yet, which made the previous sign-in-first order unable
+ // to reliably detect "doesn't exist yet" and auto-create it.
+ // 'auth/email-already-in-use' from createUser, by contrast, is still an
+ // unambiguous signal, so leading with create-then-fall-back-to-sign-in
+ // works reliably either way.
+ return window.mizanAuth.createUserWithEmailAndPassword(MIZAN_SERVICE_EMAIL,MIZAN_SERVICE_PASSWORD)
   .then(function(cred){return cred.user;})
   .catch(function(err){
-   if(err&&err.code==='auth/user-not-found'){
-    return window.mizanAuth.createUserWithEmailAndPassword(MIZAN_SERVICE_EMAIL,MIZAN_SERVICE_PASSWORD).then(function(cred){return cred.user;});
+   if(err&&err.code==='auth/email-already-in-use'){
+    return window.mizanAuth.signInWithEmailAndPassword(MIZAN_SERVICE_EMAIL,MIZAN_SERVICE_PASSWORD).then(function(cred){return cred.user;});
    }
    throw err;
   });
