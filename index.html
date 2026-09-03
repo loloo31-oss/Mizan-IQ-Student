@@ -313,6 +313,7 @@ var fAcc='',fFrom='',fTo='',stimer=null,lastSave=null;
 var tAcc={},tJE={},tInv={},tCus={},tSup={},tRcpt={},tPymt={},tCC={},tUser={};
 var tFAEdit={},tFA=null,tLocEdit={};
 var currentUser=null;
+var backupReminderChecked=false; // set once per page load — see maybeShowBackupReminder()
 var rptFrom='',rptTo='',rptLevel='all',rptShowCodes=false,rptLoaded=false; // report filters
 
 // HELPERS
@@ -808,16 +809,80 @@ function importCoA(){
 // back, independent of the device/browser it was created on.
 function exportBackup(){
  var payload=JSON.stringify(db,null,2);
+ var ts=new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+ var fname='mizan-iq-backup-'+ts+'.json';
+ // Prefer the File System Access API's native "Save As" dialog, so the user
+ // can pick the drive/folder themselves (a plain <a download> instead always
+ // saves straight to the browser's fixed default Downloads folder, with no
+ // location prompt). Must be called synchronously from the click handler —
+ // browsers only grant this while still inside the "user activation" of the
+ // click that triggered it — which is exactly how exportBackup() is invoked
+ // (see window.xAction / the data-action click delegate below).
+ if(window.showSaveFilePicker){
+  window.showSaveFilePicker({
+   suggestedName:fname,
+   types:[{description:'JSON Backup',accept:{'application/json':['.json']}}]
+  }).then(function(handle){
+   return handle.createWritable().then(function(writable){
+    return writable.write(payload).then(function(){return writable.close();});
+   });
+  }).then(function(){
+   markBackupDone();
+  }).catch(function(err){
+   if(err&&err.name==='AbortError')return; // user closed the Save-As dialog — do nothing
+   exportBackupClassic(payload,fname); // picker failed for some other reason — fall back
+  });
+  return;
+ }
+ // Fallback for browsers without the File System Access API (Firefox,
+ // Safari, older Chrome/Edge): a classic forced download. Where the user
+ // can't pick a location this way, they can still get a Save-As prompt every
+ // time by turning on their browser's "Ask where to save each file before
+ // downloading" setting.
+ exportBackupClassic(payload,fname);
+}
+function exportBackupClassic(payload,fname){
  var blob=new Blob([payload],{type:'application/json'});
  var url=URL.createObjectURL(blob);
  var a=document.createElement('a');
- var ts=new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
  a.href=url;
- a.download='mizan-iq-backup-'+ts+'.json';
+ a.download=fname;
  document.body.appendChild(a);
  a.click();
  document.body.removeChild(a);
  setTimeout(function(){URL.revokeObjectURL(url);},1000);
+ markBackupDone();
+}
+// Records the moment a backup actually went out (both save paths call this —
+// see the writable.close().then() above for the File System Access path).
+// Two things read this: the "Last backup" line on the Backup & Restore page,
+// and the weekly reminder below, which uses it to avoid nagging again right
+// after the user just backed up.
+function markBackupDone(){
+ try{
+  var now=String(Date.now());
+  localStorage.setItem('mizan_last_backup_at',now);
+  localStorage.setItem('mizan_last_backup_reminder_at',now);
+ }catch(e){}
+ if(view==='backup')render(); // refresh the "Last backup" timestamp if it's on screen
+}
+// Weekly reminder: if it's been 7+ days since the user was last asked (or
+// since they last actually backed up — see markBackupDone), nudge them once.
+// Deliberately re-arms itself every 7 days from whichever came later (a
+// reminder shown, or a real backup) rather than nagging on every single page
+// load, and offers to run the export right there so acting on it is one click.
+var WEEK_MS=7*24*60*60*1000;
+function maybeShowBackupReminder(){
+ try{
+  var last=localStorage.getItem('mizan_last_backup_reminder_at');
+  if(last&&(Date.now()-Number(last))<WEEK_MS)return;
+  localStorage.setItem('mizan_last_backup_reminder_at',String(Date.now()));
+ }catch(e){return;}
+ var isAr=lang==='ar';
+ var doIt=confirm(isAr
+  ?'⏰ تذكير أسبوعي: يُنصح بعمل نسخة احتياطية من بيانات البرنامج بشكل دورى حتى لا تفقدها. هل تريد تصدير نسخة احتياطية الآن؟'
+  :'⏰ Weekly reminder: it\'s a good idea to back up your program data regularly so you don\'t lose it. Export a backup now?');
+ if(doIt)exportBackup();
 }
 function importBackupFile(file){
  var isAr=lang==='ar';
@@ -846,6 +911,15 @@ function importBackupFile(file){
 function render(){
  CURRENT_USER=currentUser;
  window.db=db;window.lang=lang;window.licAdminState=licAdminState;
+ // Once per page load, once someone is actually logged in (local admin,
+ // local user, or a restored/fresh trainee session — every login path ends
+ // up here), check whether the weekly backup reminder is due. Delayed so the
+ // native confirm() dialog doesn't pop up over a screen that hasn't painted
+ // yet.
+ if(currentUser&&!backupReminderChecked){
+  backupReminderChecked=true;
+  setTimeout(maybeShowBackupReminder,1200);
+ }
   // ── Create pending user on first run ─────────────────────
   try{
    var pu=JSON.parse(localStorage.getItem('mizan_pending_user')||'null');
@@ -1198,6 +1272,7 @@ function buildLayout(){
   {k:'users',       i:'users', l:(isAr?'المستخدمون':'Users')+' ('+db.users.filter(function(u){return u.role!=='admin';}).length+'/3)'},
   {k:'licadmin',    i:'scale', l:isAr?'🔐 لوحة تحكم التراخيص':'🔐 License Control Panel'},
   {k:'fiscalyear',  i:'doc',   l:isAr?'إغلاق السنة المالية':'Fiscal Year Close'},
+  {k:'backup',      i:'save',  l:isAr?'💾 النسخ الاحتياطي':'💾 Backup & Restore'},
 
   // ── Training ───────────────────────────────────────────────
   {sec:isAr?'🎓 التدريب المحاسبي':'🎓 Training'},
@@ -1239,7 +1314,7 @@ function buildLayout(){
    }
   });
   if(currentSec!==null)nav+='</div>';
- var pages={dashboard:pDashboard,training:pTraining,ai_settings:pAISettings,ai_bank:pAIBank,ai_analysis:pAIAnalysis,ai_cashflow:pAICashFlow,ai_forecast:pAIForecast,coa:pCOA,items:pItems,po:pPurchaseOrders,purchases:pPurchases,sales2:pSales2,stockrpt:pStockRpt,fixedassets:pFixedAssets,assetlocations:pAssetLocations,depreciation:pDepreciation,users:pUsers,fiscalyear:pFiscalYear,journal:pJournal,receipt:pReceipt,payment:pPayment,trial:pTrial,income:pIncome,balance:pBalance,equity:pEquity,workcap:pWorkCap,statement:pStatement,agingAR:pAgingAR,agingAP:pAgingAP,taxSales:pTaxSales,taxPurchases:pTaxPurchases,zakat:pZakat,budget:pBudget,budgetcmp:pBudgetCompare,mgmtdash:pMgmtDash,boarddash:pBoardDash,licadmin:pLicenseAdmin,customers:pCustomers,suppliers:pSuppliers,settings:pSettings,costcenters:pCostCenters,ccreport:pCCReport};
+ var pages={dashboard:pDashboard,training:pTraining,ai_settings:pAISettings,ai_bank:pAIBank,ai_analysis:pAIAnalysis,ai_cashflow:pAICashFlow,ai_forecast:pAIForecast,coa:pCOA,items:pItems,po:pPurchaseOrders,purchases:pPurchases,sales2:pSales2,stockrpt:pStockRpt,fixedassets:pFixedAssets,assetlocations:pAssetLocations,depreciation:pDepreciation,users:pUsers,fiscalyear:pFiscalYear,journal:pJournal,receipt:pReceipt,payment:pPayment,trial:pTrial,income:pIncome,balance:pBalance,equity:pEquity,workcap:pWorkCap,statement:pStatement,agingAR:pAgingAR,agingAP:pAgingAP,taxSales:pTaxSales,taxPurchases:pTaxPurchases,zakat:pZakat,budget:pBudget,budgetcmp:pBudgetCompare,mgmtdash:pMgmtDash,boarddash:pBoardDash,licadmin:pLicenseAdmin,customers:pCustomers,suppliers:pSuppliers,settings:pSettings,backup:pBackup,costcenters:pCostCenters,ccreport:pCCReport};
  if(view==='fixedassets'&&tFA){return pAssetDetail();}
  var fn=pages[view]||pDashboard;
  var isAr=lang==='ar';
@@ -5495,18 +5570,33 @@ function pSettings(){
  h+='</div></div>';
  h+='<div class="card" style="max-width:660px"><div class="ct">Company Logo</div>'+'<div style="display:flex;align-items:flex-start;gap:18px;flex-wrap:wrap">'+(co.logo?'<img src="'+co.logo+'" style="height:80px;max-width:180px;object-fit:contain;border:1px solid var(--bd);border-radius:var(--r);padding:6px;background:#fff">':'<div style="width:120px;height:80px;border:2px dashed var(--bd2);border-radius:var(--r);display:flex;align-items:center;justify-content:center;color:var(--t3);font-size:12px">No logo</div>')+'<div style="display:flex;flex-direction:column;gap:8px"><label style="font-size:12px;font-weight:600;color:var(--t2)">Upload Logo (PNG / JPG / SVG)</label>'+'<input type="file" id="logoFile" accept="image/*" style="font-size:12px;width:auto">'+(co.logo?'<button class="btn bdr bsm" id="btnDelLogo">Remove Logo</button>':'')+'<span style="font-size:11px;color:var(--t3)">Recommended: 300x100px, transparent background. Max 500KB</span>'+'</div></div></div>';
  h+='<div class="card" style="max-width:660px;border:2px dashed var(--bd2)"><div class="ct">Preview</div><div style="padding:12px;background:var(--bg);border-radius:var(--r)"><strong>'+co.name+'</strong><br><span style="font-size:12px;color:var(--t2)">'+co.address+'</span><br><span style="display:inline-block;background:var(--gnb);color:var(--gn);padding:2px 10px;border-radius:99px;font-size:11px;font-weight:700;margin-top:5px">VAT: '+co.vatNo+'</span> <span style="font-size:12px;color:var(--t2)">'+vatR()+'% | '+cur()+'</span></div></div>';
- h+='<div class="card" style="max-width:660px"><div class="ct">💾 '+(isAr?'النسخ الاحتياطي والاستعادة':'Backup & Restore')+'</div>'
-  +'<div style="font-size:12px;color:var(--t2);margin-bottom:14px;line-height:1.7">'
+  return h+'</div>';
+}
+
+// Split out from pSettings() into its own nav item so it isn't buried under
+// Company/VAT/Currency fields — the whole point is that a user worried about
+// losing data can find it in one click, not scroll past unrelated settings.
+function pBackup(){
+ var isAr=lang==='ar';
+ var h=tb((isAr?'💾 النسخ الاحتياطي والاستعادة':'💾 Backup & Restore'),'');
+ h+='<div class="pg"><div class="card" style="max-width:660px">';
+ h+='<div style="font-size:13px;color:var(--t2);margin-bottom:16px;line-height:1.8">'
   +(isAr
    ?'بيانات البرنامج (الحسابات والقيود والفواتير والعملاء...) محفوظة فقط على هذا الجهاز/المتصفح، وليست مرفوعة لأى سيرفر. صدّر نسخة احتياطية بشكل دورى واحفظها فى مكان آمن، حتى لا تفقد بياناتك عند تغيير الجهاز أو عمل فورمات أو مسح بيانات المتصفح.'
    :'Program data (accounts, journals, invoices, customers...) is stored only on this device/browser, not on any server. Export a backup regularly and keep it somewhere safe, so you don\'t lose your data if you change devices, reformat, or clear browser data.')
-  +'</div>'
-  +'<div style="display:flex;gap:10px;flex-wrap:wrap">'
+  +'</div>';
+ var lastAt=null;
+ try{lastAt=localStorage.getItem('mizan_last_backup_at');}catch(e){}
+ h+='<div style="font-size:12px;color:var(--t3);margin-bottom:16px;padding:8px 12px;background:var(--bg);border-radius:var(--r)">'
+  +(isAr?'آخر نسخة احتياطية: ':'Last backup: ')
+  +(lastAt?'<strong style="color:var(--t2)">'+new Date(Number(lastAt)).toLocaleString(isAr?'ar-SA':'en-US')+'</strong>':(isAr?'لم يتم عمل نسخة احتياطية بعد':'No backup made yet'))
+  +'</div>';
+ h+='<div style="display:flex;gap:10px;flex-wrap:wrap">'
   +'<button class="btn bp" data-action="exportBackup">⬇️ '+(isAr?'تصدير نسخة احتياطية':'Export Backup')+'</button>'
   +'<label class="btn bdr" for="importBackupFile" style="cursor:pointer;margin:0;display:inline-flex;align-items:center">⬆️ '+(isAr?'استيراد نسخة احتياطية':'Import Backup')+'</label>'
   +'<input type="file" id="importBackupFile" accept=".json,application/json" style="display:none">'
-  +'</div></div>';
-  return h+'</div>';
+  +'</div></div></div>';
+ return h;
 }
 
 function pFiscalYear(){
