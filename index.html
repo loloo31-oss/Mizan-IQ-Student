@@ -796,6 +796,53 @@ function importCoA(){
  alert('Chart of Accounts imported successfully! 138 accounts added.');
 }
 
+// ── Backup / Restore ────────────────────────────────────────────
+// The accounting data (db: accounts, journals, invoices, customers,
+// suppliers, receipts, payments, fixed assets, etc.) lives only in this
+// browser's local storage (see save()/loadFromLocalStorage() above) — it is
+// NOT synced to any server. That's deliberate (each trainee's practice data
+// stays private to their own device instead of mixing with everyone else's
+// on a shared cloud path), but it also means a device format, a browser
+// switch, or clearing site data wipes it with no way to recover it. These
+// two functions give the user a manual way to move that data to a file and
+// back, independent of the device/browser it was created on.
+function exportBackup(){
+ var payload=JSON.stringify(db,null,2);
+ var blob=new Blob([payload],{type:'application/json'});
+ var url=URL.createObjectURL(blob);
+ var a=document.createElement('a');
+ var ts=new Date().toISOString().slice(0,19).replace(/[:T]/g,'-');
+ a.href=url;
+ a.download='mizan-iq-backup-'+ts+'.json';
+ document.body.appendChild(a);
+ a.click();
+ document.body.removeChild(a);
+ setTimeout(function(){URL.revokeObjectURL(url);},1000);
+}
+function importBackupFile(file){
+ var isAr=lang==='ar';
+ var reader=new FileReader();
+ reader.onload=function(ev){
+  var parsed;
+  try{parsed=JSON.parse(ev.target.result);}catch(err){
+   alert(isAr?'⚠️ الملف غير صالح — تأكد أنه ملف نسخة احتياطية (JSON) صحيح.':'⚠️ Invalid file — make sure this is a valid backup (JSON) file.');
+   return;
+  }
+  if(!parsed||!Array.isArray(parsed.accounts)){
+   alert(isAr?'⚠️ هذا الملف لا يبدو نسخة احتياطية صحيحة من Mizan IQ.':'⚠️ This file does not look like a valid Mizan IQ backup.');
+   return;
+  }
+  if(!confirm(isAr?'سيتم استبدال كل بيانات البرنامج الحالية (الحسابات والقيود والفواتير والعملاء...) بالبيانات الموجودة فى هذا الملف. هذا الإجراء لا يمكن التراجع عنه. هل تريد المتابعة؟':'This will REPLACE all current program data (accounts, journals, invoices, customers...) with the data in this file. This cannot be undone. Continue?')){
+   return;
+  }
+  db=normalizeDB(parsed);
+  save();
+  render();
+  alert(isAr?'✅ تم استعادة النسخة الاحتياطية بنجاح.':'✅ Backup restored successfully.');
+ };
+ reader.readAsText(file);
+}
+
 function render(){
  CURRENT_USER=currentUser;
  window.db=db;window.lang=lang;window.licAdminState=licAdminState;
@@ -5432,6 +5479,7 @@ function pLicenseAdmin(){
 
 function pSettings(){
  var co=db.company;
+ var isAr=lang==='ar';
  var curs=['SAR','USD','EUR','GBP','AED','KWD','BHD','OMR','QAR','EGP'];
  var h=tb(tr('sec_settings'),'<button class="btn bp" data-action="saveSettings">'+ic('save')+' Save Settings</button><button class="btn bdr" data-action="importCoA" style="margin-right:8px">📥 Import IFRS Chart of Accounts</button>');
  h+='<div class="pg"><div class="card" style="max-width:660px"><div class="ct">Company Information</div><div class="fg">';
@@ -5447,6 +5495,17 @@ function pSettings(){
  h+='</div></div>';
  h+='<div class="card" style="max-width:660px"><div class="ct">Company Logo</div>'+'<div style="display:flex;align-items:flex-start;gap:18px;flex-wrap:wrap">'+(co.logo?'<img src="'+co.logo+'" style="height:80px;max-width:180px;object-fit:contain;border:1px solid var(--bd);border-radius:var(--r);padding:6px;background:#fff">':'<div style="width:120px;height:80px;border:2px dashed var(--bd2);border-radius:var(--r);display:flex;align-items:center;justify-content:center;color:var(--t3);font-size:12px">No logo</div>')+'<div style="display:flex;flex-direction:column;gap:8px"><label style="font-size:12px;font-weight:600;color:var(--t2)">Upload Logo (PNG / JPG / SVG)</label>'+'<input type="file" id="logoFile" accept="image/*" style="font-size:12px;width:auto">'+(co.logo?'<button class="btn bdr bsm" id="btnDelLogo">Remove Logo</button>':'')+'<span style="font-size:11px;color:var(--t3)">Recommended: 300x100px, transparent background. Max 500KB</span>'+'</div></div></div>';
  h+='<div class="card" style="max-width:660px;border:2px dashed var(--bd2)"><div class="ct">Preview</div><div style="padding:12px;background:var(--bg);border-radius:var(--r)"><strong>'+co.name+'</strong><br><span style="font-size:12px;color:var(--t2)">'+co.address+'</span><br><span style="display:inline-block;background:var(--gnb);color:var(--gn);padding:2px 10px;border-radius:99px;font-size:11px;font-weight:700;margin-top:5px">VAT: '+co.vatNo+'</span> <span style="font-size:12px;color:var(--t2)">'+vatR()+'% | '+cur()+'</span></div></div>';
+ h+='<div class="card" style="max-width:660px"><div class="ct">💾 '+(isAr?'النسخ الاحتياطي والاستعادة':'Backup & Restore')+'</div>'
+  +'<div style="font-size:12px;color:var(--t2);margin-bottom:14px;line-height:1.7">'
+  +(isAr
+   ?'بيانات البرنامج (الحسابات والقيود والفواتير والعملاء...) محفوظة فقط على هذا الجهاز/المتصفح، وليست مرفوعة لأى سيرفر. صدّر نسخة احتياطية بشكل دورى واحفظها فى مكان آمن، حتى لا تفقد بياناتك عند تغيير الجهاز أو عمل فورمات أو مسح بيانات المتصفح.'
+   :'Program data (accounts, journals, invoices, customers...) is stored only on this device/browser, not on any server. Export a backup regularly and keep it somewhere safe, so you don\'t lose your data if you change devices, reformat, or clear browser data.')
+  +'</div>'
+  +'<div style="display:flex;gap:10px;flex-wrap:wrap">'
+  +'<button class="btn bp" data-action="exportBackup">⬇️ '+(isAr?'تصدير نسخة احتياطية':'Export Backup')+'</button>'
+  +'<label class="btn bdr" for="importBackupFile" style="cursor:pointer;margin:0;display:inline-flex;align-items:center">⬆️ '+(isAr?'استيراد نسخة احتياطية':'Import Backup')+'</label>'
+  +'<input type="file" id="importBackupFile" accept=".json,application/json" style="display:none">'
+  +'</div></div>';
   return h+'</div>';
 }
 
@@ -5946,6 +6005,7 @@ window.xAction=function(type){
   exportXLS(aoa4,'Sales','Sales_'+today());return;
  }
  if(type==='importCoA'){importCoA();return;}
+ if(type==='exportBackup'){exportBackup();return;}
  if(type==='editOB'){modal='ob';render();return;}
  if(type==='addFA'){tFAEdit={};modal='fa';render();return;}
  if(type==='backFA'){tFA=null;view='fixedassets';render();return;}
@@ -7378,6 +7438,11 @@ function bindEvents(){
   modal=null;save();render();
  });
  // Settings
+ on1('importBackupFile','change',function(e){
+  var file=e.target.files[0];
+  if(file)importBackupFile(file);
+  e.target.value=''; // allow re-selecting the same file next time
+ });
  on1('logoFile','change',function(e){
   var file=e.target.files[0];if(!file)return;
   var reader=new FileReader();
