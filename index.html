@@ -247,6 +247,58 @@ try{
  }
 }catch(e){HAS_CLOUD=false;}
 
+// ── Auto sub-ledger account generation for Customers/Suppliers ──────────
+// When a new customer/supplier is added (see mSaveContact), or when an
+// existing one is missing a valid linked account (see the normalizeDB()
+// backfill below), the app auto-creates a dedicated sub-ledger account for
+// it under the correct parent: Local/Foreign Customers (1103-01/1103-02)
+// for customers, Local/Foreign Suppliers (2101-01/2101-02) for suppliers --
+// picked by whether the contact's country is Saudi Arabia -- falling back
+// to the main Accounts Receivable/Payable account (1103/2101) directly if
+// those specific sub-accounts don't exist in the current COA (e.g. after a
+// different chart was imported). Generated codes look like "1103-01-001".
+// These helpers take the accounts array explicitly (rather than reading the
+// global db) because normalizeDB() also runs before `db` itself is set.
+function contactParentAccId(accountsArr,isSup,country){
+ var isForeign=!!country&&country!=='Saudi Arabia';
+ var candidates=isSup
+  ?(isForeign?['2101-02','2101']:['2101-01','2101'])
+  :(isForeign?['1103-02','1103']:['1103-01','1103']);
+ for(var i=0;i<candidates.length;i++){
+  if(accountsArr.some(function(a){return a.id===candidates[i];}))return candidates[i];
+ }
+ return null;
+}
+function genSubLedgerAccId(accountsArr,parentId){
+ var prefix=parentId+'-';
+ var maxN=0;
+ accountsArr.forEach(function(a){
+  if(a.id.indexOf(prefix)===0){
+   var rest=a.id.slice(prefix.length);
+   if(/^\d+$/.test(rest)){var n=parseInt(rest,10);if(n>maxN)maxN=n;}
+  }
+ });
+ var seq=String(maxN+1);
+ while(seq.length<3)seq='0'+seq;
+ return prefix+seq;
+}
+function autoCreateContactAccount(accountsArr,isSup,contact){
+ var parentId=contactParentAccId(accountsArr,isSup,contact.country);
+ if(!parentId)return '';
+ var newId=genSubLedgerAccId(accountsArr,parentId);
+ accountsArr.push({
+  id:newId,
+  name:contact.name||newId,
+  nameAr:contact.nameAr||'',
+  type:isSup?'Liability':'Asset',
+  normal:isSup?'Credit':'Debit',
+  bal:0,
+  isMain:false,
+  pid:parentId,
+  autoGen:true
+ });
+ return newId;
+}
 function normalizeDB(d){
  if(!d.exp)d.exp={};
  if(!d.customers)d.customers=[];
@@ -284,15 +336,120 @@ function normalizeDB(d){
  });
  if(!d.users)d.users=[];
  if(d.company.vatRate===undefined)d.company.vatRate=15;
+ // Self-heal a company stamp/signature that ended up as an unusable data
+ // URI (e.g. from the 0px-canvas edge case fixed in wireImageUploadField)
+ // -- it would otherwise sit there forever as a "truthy but invisible"
+ // value, silently failing to render on the Balance Confirmation Letter
+ // and everywhere else it's used, with no way for the user to tell it's
+ // broken versus just not-yet-uploaded. Clearing it here just reverts to
+ // the normal "no stamp/signature uploaded" state so it can be re-uploaded.
+ ['stamp','signature','logo'].forEach(function(f){
+  var v=d.company[f];
+  if(v&&!/^data:image\/[a-z0-9+.-]+;base64,.{20,}$/i.test(v))d.company[f]='';
+ });
  d.accounts.filter(function(a){return a.isMain;}).forEach(function(a){if(d.exp[a.id]===undefined)d.exp[a.id]=true;});
+ // Backfill: any customer/supplier that does not have its OWN dedicated
+ // sub-ledger account yet gets one auto-generated -- see
+ // autoCreateContactAccount() above. A linked account only counts as
+ // "already fine" when it (a) still exists and (b) is a genuine leaf
+ // (no other account is nested under it) -- this also catches contacts
+ // that were linked directly to a shared bucket/Main account (e.g. plain
+ // "1103" / "2101" / "1103-01" / "2101-01") rather than to a personal
+ // sub-account, which is exactly the "no account number shown" case.
+ // Count how many contacts currently point at each linkedAccId, so that
+ // two customers/suppliers sharing one generic bucket account (e.g. both
+ // linked straight to "1103-01"/"2101-01") are BOTH recognized as not
+ // having a personal account, regardless of processing order.
+ var linkCount={};
+ d.customers.concat(d.suppliers).forEach(function(c){
+  if(c.linkedAccId)linkCount[c.linkedAccId]=(linkCount[c.linkedAccId]||0)+1;
+ });
+ function hasOwnLeafAcc(linkedId){
+  if(!linkedId)return false;
+  var acc=d.accounts.find(function(a){return a.id===linkedId;});
+  if(!acc)return false;
+  if(acc.isMain)return false;
+  if(d.accounts.some(function(x){return x.pid===acc.id;}))return false;
+  if((linkCount[linkedId]||0)>1)return false;
+  return true;
+ }
+ d.customers.forEach(function(c){
+  if(!hasOwnLeafAcc(c.linkedAccId)){var nid=autoCreateContactAccount(d.accounts,false,c);if(nid)c.linkedAccId=nid;}
+ });
+ d.suppliers.forEach(function(s){
+  if(!hasOwnLeafAcc(s.linkedAccId)){var nid=autoCreateContactAccount(d.accounts,true,s);if(nid)s.linkedAccId=nid;}
+ });
  return d;
 }
+// ── Multi-company support ────────────────────────────────────────────────
+// A "registry" of companies (id+name) lives under COMP_REG_KEY; whichever
+// one is currently open is remembered under ACTIVE_CO_KEY; and each
+// company's own accounting data (accounts/journals/customers/invoices/...
+// and its own branding in db.company) is stored under its own
+// coStorageKey(id) — a separate localStorage entry per company, so
+// switching never mixes data between companies.
+// The one thing kept IDENTICAL across every company is db.users (logins,
+// passwords, permissions): it's mirrored into USERS_KEY on every save()
+// and re-applied onto whichever company db loads (applyGlobalUsers), so a
+// single login works everywhere and a user added/edited under any company
+// is instantly available under all the others too.
+// This only governs the local-storage path; when HAS_CLOUD/fbRef is active
+// the app still syncs a single shared company as before (unchanged).
+var COMP_REG_KEY='ap7_companies';
+var ACTIVE_CO_KEY='ap7_active_company';
+var USERS_KEY='ap7_users_global';
+function coStorageKey(id){return 'ap7_co_'+id;}
+function getCompanyRegistry(){
+ try{var s=localStorage.getItem(COMP_REG_KEY);if(s){var a=JSON.parse(s);if(Array.isArray(a))return a;}}catch(e){}
+ return null;
+}
+function saveCompanyRegistry(list){try{localStorage.setItem(COMP_REG_KEY,JSON.stringify(list));}catch(e){}}
+function getActiveCompanyId(){try{return localStorage.getItem(ACTIVE_CO_KEY)||'';}catch(e){return '';}}
+function setActiveCompanyId(id){try{localStorage.setItem(ACTIVE_CO_KEY,id);}catch(e){}}
+function getGlobalUsers(){
+ try{var s=localStorage.getItem(USERS_KEY);if(s){var a=JSON.parse(s);if(Array.isArray(a)&&a.length)return a;}}catch(e){}
+ return null;
+}
+function saveGlobalUsers(users){try{if(users)localStorage.setItem(USERS_KEY,JSON.stringify(users));}catch(e){}}
+function applyGlobalUsers(d){
+ var gu=getGlobalUsers();
+ if(gu)d.users=gu; else saveGlobalUsers(d.users);
+ return d;
+}
+// Makes sure a company registry + active company exist, migrating any
+// pre-multi-company data (the old single 'ap7' key) into "Company 1" the
+// very first time this runs — so existing users never lose their data.
+function ensureCompanySetup(){
+ var reg=getCompanyRegistry();
+ if(reg&&reg.length){
+  if(!getActiveCompanyId())setActiveCompanyId(reg[0].id);
+  return reg;
+ }
+ var id='co1',legacy=null;
+ try{var s=localStorage.getItem('ap7');if(s)legacy=JSON.parse(s);}catch(e){}
+ if(legacy&&Array.isArray(legacy.accounts)){
+  try{localStorage.setItem(coStorageKey(id),JSON.stringify(legacy));}catch(e){}
+  // Users are NOT seeded into the global store here on purpose: they still
+  // need normalizeDB()'s healing (e.g. a missing admin passwordHash) first,
+  // which loadFromLocalStorage()'s applyGlobalUsers() does right after this
+  // returns. Saving the raw, unhealed copy here would permanently pin the
+  // broken version into the global store.
+  reg=[{id:id,name:(legacy.company&&legacy.company.name)||'Company 1'}];
+ } else {
+  reg=[{id:id,name:'Company 1'}];
+ }
+ saveCompanyRegistry(reg);
+ setActiveCompanyId(id);
+ return reg;
+}
 function loadFromLocalStorage(){
+ ensureCompanySetup();
+ var key=coStorageKey(getActiveCompanyId());
  try{
-  var s=localStorage.getItem('ap7');
-  if(s){var d=JSON.parse(s);if(d&&Array.isArray(d.accounts))return normalizeDB(d);}
- }catch(e){try{localStorage.removeItem('ap7');}catch(e2){}}
- return normalizeDB(JSON.parse(JSON.stringify(DEF)));
+  var s=localStorage.getItem(key);
+  if(s){var d=JSON.parse(s);if(d&&Array.isArray(d.accounts))return applyGlobalUsers(normalizeDB(d));}
+ }catch(e){try{localStorage.removeItem(key);}catch(e2){}}
+ return applyGlobalUsers(normalizeDB(JSON.parse(JSON.stringify(DEF))));
 }
 function loadDB(){
  if(HAS_CLOUD&&fbRef){
@@ -313,7 +470,58 @@ var fAcc='',fFrom='',fTo='',stimer=null,lastSave=null;
 var tAcc={},tJE={},tInv={},tCus={},tSup={},tRcpt={},tPymt={},tCC={},tUser={};
 var tFAEdit={},tFA=null,tLocEdit={};
 var currentUser=null;
+var coSwitcherOpen=false;
+// Renders the small "switch company" popover shown under the ⇄ button in
+// the sidebar: one row per registered company (✓ marks the active one)
+// plus an "add new company" row at the bottom.
+function coSwitcherMenuHtml(){
+ var isAr=lang==='ar';
+ var reg=getCompanyRegistry();
+ if(!reg||!reg.length)reg=[{id:getActiveCompanyId()||'current',name:(db&&db.company&&db.company.name)||'Company 1'}];
+ var activeId=getActiveCompanyId();
+ var side=isAr?'right':'left';
+ var rows=reg.map(function(c){
+  var active=c.id===activeId;
+  return '<div data-action="selectCo" data-id="'+c.id+'" style="padding:8px 10px;font-size:12px;cursor:pointer;color:'+(active?'#185FA5':'#222')+';background:'+(active?'#eef4fb':'#fff')+';font-weight:'+(active?'700':'400')+';white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-bottom:1px solid #eee">'
+   +(active?'✓ ':'')+(c.name||c.id)+'</div>';
+ }).join('');
+ return '<div style="position:absolute;'+side+':0;bottom:38px;min-width:180px;max-width:240px;max-height:220px;overflow-y:auto;background:#fff;border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,0.35);z-index:200;text-align:'+side+'">'
+  +rows
+  +'<div data-action="addCo" style="padding:9px 10px;font-size:12px;cursor:pointer;color:#185FA5;font-weight:700;background:#f7faff">+ '+(isAr?'إضافة شركة جديدة':'Add new company')+'</div>'
+  +'</div>';
+}
+// Switches the active company and reloads its own data set (accounts,
+// journals, customers, invoices...) without logging the user out — users
+// are shared across all companies, so the same session just points at a
+// different company's data after this.
+function switchToCompany(id){
+ coSwitcherOpen=false;
+ setActiveCompanyId(id);
+ view='dashboard';modal=null;
+ tAcc={};tJE={};tInv={};tCus={};tSup={};tRcpt={};tPymt={};tCC={};tUser={};
+ tFAEdit={};tFA=null;tLocEdit={};
+ loadDB().then(function(loaded){
+  db=loaded;
+  render();
+  if(typeof upgradeSmallCompanyImages==='function')upgradeSmallCompanyImages();
+ });
+}
+// Creates a brand-new, empty company (standard chart of accounts, no
+// transactions) registers it, and switches to it.
+function addNewCompany(name){
+ var reg=getCompanyRegistry()||[];
+ var id='co'+Date.now();
+ reg.push({id:id,name:name});
+ saveCompanyRegistry(reg);
+ var fresh=normalizeDB(JSON.parse(JSON.stringify(DEF)));
+ fresh.company.name=name;
+ var gu=getGlobalUsers();
+ if(gu)fresh.users=gu; else saveGlobalUsers(fresh.users);
+ try{localStorage.setItem(coStorageKey(id),JSON.stringify(fresh));}catch(e){}
+ switchToCompany(id);
+}
 var backupReminderChecked=false; // set once per page load — see maybeShowBackupReminder()
+var cbState={contactId:''}; // Balance Confirmation Letter — see pConfirmBalance()
 var rptFrom='',rptTo='',rptLevel='all',rptShowCodes=false,rptLoaded=false; // report filters
 
 // HELPERS
@@ -323,6 +531,17 @@ function cur(){return db.company.currency||'SAR';}
 function vatR(){return Number(db.company.vatRate)||15;}
 function today(){return new Date().toISOString().slice(0,10);}
 function accN(a){return (lang==='ar'&&a&&a.nameAr)?a.nameAr:a?a.name:'';}
+// Sums an account's balance recursively through any child accounts (needed
+// since Local/Foreign Customers & Suppliers, e.g. "1103-01", can now have
+// their own auto-generated children -- see autoCreateContactAccount() --
+// so postings land on the deepest leaf, not that in-between account, and a
+// parent's displayed balance must roll those up rather than show its own
+// (unused) bal field). An account with no children just returns its own bal.
+function acctRollupBal(a){
+ var children=db.accounts.filter(function(x){return x.pid===a.id;});
+ if(!children.length)return a.bal||0;
+ return children.reduce(function(s,c){return s+acctRollupBal(c);},0);
+}
 function aName(id){var a=db.accounts.find(function(x){return x.id===id;});if(!a)return id;return (lang==='ar'&&a.nameAr)?a.nameAr:a.name;}
 function leafAccs(){return db.accounts.filter(function(a){return !db.accounts.some(function(s){return s.pid===a.id;});});}
 function mainBal(id){return db.accounts.filter(function(s){return s.pid===id;}).reduce(function(s,x){return s+x.bal;},0);}
@@ -463,8 +682,14 @@ function save(){
  clearTimeout(stimer);
  stimer=setTimeout(function(){
   var el=document.getElementById('sv');
-  // Always save locally as instant backup
-  try{localStorage.setItem('ap7',JSON.stringify(db));}catch(e){}
+  // Always save locally as instant backup — under THIS company's own key,
+  // and mirror db.users into the shared global store so logins/permissions
+  // stay identical no matter which company is currently open.
+  try{
+   saveGlobalUsers(db.users);
+   localStorage.setItem(coStorageKey(getActiveCompanyId()),JSON.stringify(db));
+   localStorage.setItem('ap7',JSON.stringify(db)); // legacy key, kept as an extra safety copy
+  }catch(e){}
   if(HAS_CLOUD&&fbRef){
    if(el)el.textContent='Saving to cloud...';
    skipNextRemote=true;
@@ -502,6 +727,90 @@ function on1(id,evt,fn){
  // Also store for modal re-render recovery
  if(evt==='click')window['__handler_'+id]=fn;
 }
+// Shared by the Company Stamp / Financial Manager Signature uploads in
+// pSettings() — same resize-then-store-as-base64 approach as the existing
+// Company Logo upload (on1('logoFile',...) below), just parameterized so it
+// isn't copy-pasted a third time.
+function wireImageUploadField(inputId,dbField,maxW,maxH){
+ on1(inputId,'change',function(e){
+  var file=e.target.files[0];if(!file)return;
+  var reader=new FileReader();
+  reader.onload=function(ev){
+   var img=new Image();
+   img.onload=function(){
+    var w=img.width,h=img.height;
+    // Scale to FIT the maxW x maxH box, preserving aspect ratio -- in
+    // EITHER direction. The original code only ever scaled a source image
+    // DOWN when it exceeded the box; a small source (a tightly-cropped
+    // stamp or signature photo, e.g. 40x30px) was stored at its own tiny
+    // original size unchanged. That's what actually made stamps/signatures
+    // look "missing": the real image WAS there, just a few pixels across
+    // inside a much larger container everywhere it's displayed (Settings
+    // preview, the Balance Confirmation Letter) -- easy to mistake for a
+    // blank space or a rendering failure. Scaling up small sources too
+    // (capped at a sane 8x so a truly tiny/low-quality source doesn't blow
+    // up into an unusably blurry mess) keeps every upload a consistent,
+    // clearly-visible size.
+    var scale=Math.min(maxW/w,maxH/h,8);
+    w=Math.max(1,Math.round(w*scale));
+    h=Math.max(1,Math.round(h*scale));
+    var canvas=document.createElement('canvas');
+    canvas.width=w;canvas.height=h;
+    var ctx=canvas.getContext('2d');
+    ctx.drawImage(img,0,0,w,h);
+    // Stamps/signatures are usually transparent-background PNGs meant to
+    // overlay on a document — keep PNG whenever the source was PNG (or has
+    // no reliable extension/type to judge by), only fall back to JPEG for
+    // photos of a physical stamp/signature.
+    var isPNG=file.type==='image/png'||file.name.toLowerCase().endsWith('.png')||!file.type;
+    var compressed=isPNG?canvas.toDataURL('image/png'):canvas.toDataURL('image/jpeg',0.85);
+    db.company[dbField]=compressed;
+    save();render();
+   };
+   img.src=ev.target.result;
+  };
+  reader.readAsDataURL(file);
+ });
+}
+// Retroactively fixes any stamp/signature that was already stored small
+// (uploaded before the upscale-on-upload fix above existed) — re-uploading
+// isn't the only way to end up with one; it can also arrive via a restored
+// backup. Runs once at boot (see loadDB().then below); decoding an image
+// is async, so this can't live inside normalizeDB(). Safe to call on every
+// boot: an image already at a good size is left untouched (no save/render
+// triggered), so this only ever does real work exactly once per image.
+function upgradeSmallCompanyImages(){
+ var fields=[['stamp',220,220],['signature',280,120]];
+ var pending=fields.length,changed=false;
+ function finish(){
+  pending--;
+  if(pending===0&&changed){save();render();}
+ }
+ fields.forEach(function(f){
+  var key=f[0],maxW=f[1],maxH=f[2];
+  var src=db.company[key];
+  if(!src){finish();return;}
+  var img=new Image();
+  img.onload=function(){
+   var w=img.width,h=img.height;
+   var scale=Math.min(maxW/w,maxH/h,8);
+   // Already a good size (or the source is too large to need help) --
+   // nothing to do. The 1.15 margin avoids pointlessly re-encoding an
+   // image that's already essentially at target size.
+   if(scale<=1.15||w<1||h<1){finish();return;}
+   var nw=Math.max(1,Math.round(w*scale)),nh=Math.max(1,Math.round(h*scale));
+   var canvas=document.createElement('canvas');
+   canvas.width=nw;canvas.height=nh;
+   canvas.getContext('2d').drawImage(img,0,0,nw,nh);
+   var isPNG=src.indexOf('data:image/png')===0;
+   db.company[key]=isPNG?canvas.toDataURL('image/png'):canvas.toDataURL('image/jpeg',0.85);
+   changed=true;
+   finish();
+  };
+  img.onerror=function(){finish();};
+  img.src=src;
+ });
+}
 
 // EXCEL
 function exportXLS(aoa,sname,fname){
@@ -523,6 +832,213 @@ function printHTML(title,body){
  var w=window.open('','_blank','width=960,height=750');
  if(w){w.document.write(html);w.document.close();}
  else{var blob=new Blob([html],{type:'text/html'});var u=URL.createObjectURL(blob);window.open(u,'_blank');setTimeout(function(){URL.revokeObjectURL(u);},8000);}
+}
+
+// ── Balance Confirmation Letter ───────────────────────────────
+// (Contacts › Balance Confirmation Letter — see pConfirmBalance() further
+// down for the page itself.) IDs are unique across customers/suppliers
+// ("CUS-…"/"SUP-…"), so a contact is looked up by scanning both lists
+// rather than needing a separate "type" selector in the UI.
+function findContactById(id){
+ if(!id)return null;
+ var c=(db.customers||[]).find(function(x){return x.id===id;});
+ if(c)return Object.assign({},c,{__isSup:false});
+ var s=(db.suppliers||[]).find(function(x){return x.id===id;});
+ if(s)return Object.assign({},s,{__isSup:true});
+ return null;
+}
+// The letter's fixed bilingual title — used everywhere the letter is
+// presented (on-screen preview, the PDF/print header, the Word doc's own
+// <title>), regardless of the app's current UI language. Per the user's
+// explicit request, the LETTER ITSELF always carries both languages side by
+// side; only the surrounding app chrome (buttons, page labels, the search
+// box) still follows the current UI language like the rest of the app.
+var CONFIRM_LETTER_TITLE='خطاب مطابقة رصيد حساب / Account Balance Confirmation Letter';
+// Builds the letter's body HTML (no page chrome) — shared by the on-screen
+// preview, the PDF/print path (via printHTML, which adds the logo header),
+// and the Word export (which adds its own minimal header). `acc` is the
+// contact's linked account; its stored bal is always expressed IN THE
+// ACCOUNT'S OWN NORMAL DIRECTION (see how journal posting updates .bal
+// elsewhere in this file: normal Debit -> bal+=dr-cr, normal Credit ->
+// bal+=cr-dr), so a negative bal means the balance has actually flipped to
+// the opposite side of the account's normal side — e.g. a receivable
+// (normal Debit) with a negative bal means the customer overpaid and is
+// effectively in credit, not debit. That distinction isn't part of this
+// fixed template's own wording (it states a single balance figure), so it
+// isn't shown here — accBalanceEffective() below is kept in case a future
+// tweak wants to reintroduce it.
+//
+// IMPORTANT: this deliberately does NOT read acc.bal directly. The live
+// Purchase/Sales Invoice posting flow (the actual "Post" button — see the
+// action==='post' branch in xAction) only ever pushes a journal entry; it
+// never updates the account's own .bal field (only a couple of long-dead,
+// unreachable code paths and fixed-asset depreciation still do that). So
+// for a customer/supplier's linked account, acc.bal can sit at 0 forever
+// while real invoice activity has already posted through db.journals --
+// exactly what made this letter show 0.00 for a supplier who clearly had
+// a live balance on the Account Statement screen. accBalRange(acc.id)
+// (same engine used by Account Statement / Trial Balance) starts from
+// acc.bal and replays every journals/receipts/payments line for that
+// account with no date bound, so it reflects the true balance as of today
+// regardless of which posting path (synced or not) created it.
+function accBalanceEffective(acc){
+ var bal=accBalRange(acc.id);
+ var effSide=acc.normal==='Debit'?(bal>=0?'Debit':'Credit'):(bal>=0?'Credit':'Debit');
+ return {side:effSide,amount:Math.abs(bal)};
+}
+// Compact single-page bilingual template (approved design, Sep 2026):
+// every field that can be merged onto one line is merged, and the
+// recipient's acknowledgment section is a compact 2-column table instead
+// of two long stacked blocks — this is what keeps the whole letter on one
+// printed page. The balance sentence is debit/credit-AWARE: it reads
+// "your credit balance with us" or "your debit balance with us" (and the
+// matching Arabic "رصيدكم الدائن لدينا" / "رصيدكم المدين لدينا")
+// depending on accBalanceEffective(acc).side, so it always describes the
+// account's actual current nature rather than a fixed direction.
+function confirmLetterBodyHtml(contact,acc){
+ var co=db.company;
+ var eff=accBalanceEffective(acc);
+ var amount=eff.amount;
+ var d=new Date();
+ var dateStr=String(d.getDate()).padStart(2,'0')+' / '+String(d.getMonth()+1).padStart(2,'0')+' / '+d.getFullYear();
+ var nameEn=contact.name||contact.id;
+ var nameAr=contact.nameAr||contact.name||contact.id;
+ var curCode=cur(); // company's configured currency (e.g. "SAR")
+ var curArLabel=curCode==='SAR'?'ريال سعودي':curCode;
+ var amountFmt=N(amount);
+ var LTR='direction:ltr;text-align:left';
+ var RTL='direction:rtl;text-align:right';
+ var cellBase='padding:6pt 8pt;border:0.75pt solid #ccc;vertical-align:top';
+ // bg (optional) highlights a row — used for the debit/credit balance line.
+ function row(en,ar,bg){
+  var extra=bg?';background:'+bg:'';
+  return '<tr><td style="'+LTR+';'+cellBase+extra+'">'+en+'</td><td style="'+RTL+';'+cellBase+extra+'">'+ar+'</td></tr>';
+ }
+ // Our own company's sign-off — Company name and (a default) Title are
+ // things we actually know; the signer's personal Name is left blank for
+ // manual entry, and Signature/Stamp embed the uploaded images when present
+ // (see pSettings()'s Company Stamp / Financial Manager Signature cards),
+ // otherwise fall back to a blank line for a physical signature.
+ var blank='.....................................';
+ // onerror fallback: if the stored image ever turns out to be an unusable
+ // data URI (e.g. an extreme-aspect-ratio upload rounded down to a 0px
+ // canvas dimension before this was guarded against below — see
+ // wireImageUploadField), the <img> would otherwise render as nothing at
+ // all, with no visible sign anything is even meant to be there. Falling
+ // back to the same dotted blank line here keeps the letter presentable in
+ // any browser-rendered context (on-screen preview, the Print/PDF popup);
+ // it has no effect in the Word export, which isn't a live script context.
+ var sigImg=co.signature?'<span><img src="'+co.signature+'" style="height:26px;max-width:75px;object-fit:contain;display:inline-block;vertical-align:middle" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'inline\'"><span style="display:none">'+blank+'</span></span>':blank;
+ var stampImg=co.stamp?'<span><img src="'+co.stamp+'" style="height:34px;max-width:55px;object-fit:contain;display:inline-block;vertical-align:middle" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'inline\'"><span style="display:none">'+blank+'</span></span>':blank;
+ var balEn=eff.side==='Credit'
+  ?'Please be informed that your <u>credit</u> balance with us amounts to <strong>'+curCode+' '+amountFmt+'</strong>.'
+  :'Please be informed that your <u>debit</u> balance with us amounts to <strong>'+curCode+' '+amountFmt+'</strong>.';
+ var balAr=eff.side==='Credit'
+  ?'نفيدكم بأن رصيدكم <u>الدائن</u> لدينا يبلغ <strong>'+amountFmt+' '+curArLabel+'</strong>.'
+  :'نفيدكم بأن رصيدكم <u>المدين</u> لدينا يبلغ <strong>'+amountFmt+' '+curArLabel+'</strong>.';
+ var titleBlock='<div style="text-align:center;margin-bottom:8pt">'
+  +'<div style="font-size:13pt;font-weight:800;color:#0D3B6E">خطاب مطابقة رصيد حساب &nbsp;/&nbsp; ACCOUNT BALANCE CONFIRMATION LETTER</div>'
+  +'</div>';
+ var table='<table style="width:100%;border-collapse:collapse;margin-bottom:8pt;font-size:9.5pt;line-height:1.35">'
+  +'<tr><th style="width:50%;background:#0D3B6E;color:#fff;padding:5pt 8pt;font-size:8.5pt;'+LTR+'">English – Left Side</th>'
+  +'<th style="width:50%;background:#0D3B6E;color:#fff;padding:5pt 8pt;font-size:8.5pt;'+RTL+'">العربية – Right Side</th></tr>'
+  +row('<strong>Date:</strong> '+dateStr+' &nbsp;&nbsp; <strong>Dear Sirs,</strong> '+nameEn,
+       '<strong>التاريخ:</strong> '+dateStr+' &nbsp;&nbsp; <strong>السادة/</strong> '+nameAr+' المحترمين،')
+  +row(
+   'Greetings, we kindly request you to review, reconcile and confirm your account balance with our company as of <strong>'+dateStr+'</strong>, according to our accounting records and the attached statement of account. In case of any discrepancy, please provide us with the relevant details to complete the reconciliation.',
+   'تحية طيبة وبعد، نرجو منكم التكرم بمراجعة ومطابقة وتأكيد رصيد حسابكم لدى شركتنا كما هو في تاريخ <strong>'+dateStr+'</strong>، وفقًا لسجلاتنا المحاسبية وكشف الحساب المرفق. وفي حال وجود أي فروقات، يرجى تزويدنا بتفاصيلها لاستكمال المطابقة.'
+  )
+  +row(balEn,balAr,'#f4f8fc')
+  +row('Kindly sign and stamp below and return this letter to us as confirmation of the balance.<br><strong>Yours faithfully,</strong> '+(co.name||''),
+       'يرجى التكرم بالتوقيع والختم أدناه وإعادة الخطاب إلينا تأكيدًا لمطابقة الرصيد.<br><strong>وتفضلوا بقبول فائق الاحترام والتقدير،</strong> '+(co.name||''))
+  +row('<strong>Name:</strong> '+blank+' &nbsp;&nbsp; <strong>Title:</strong> Financial Manager',
+       '<strong>الاسم:</strong> '+blank+' &nbsp;&nbsp; <strong>المسمى الوظيفي:</strong> المدير المالي')
+  +row('<strong>Signature:</strong> '+sigImg+' &nbsp;&nbsp; <strong>Stamp:</strong> '+stampImg,
+       '<strong>التوقيع:</strong> '+sigImg+' &nbsp;&nbsp; <strong>الختم:</strong> '+stampImg)
+  +'</table>';
+ // The recipient's own acknowledgment — a compact 2-column table (English
+ // left / Arabic right, same pattern as the main table above) instead of
+ // two long stacked blocks, entirely blank/fillable by hand since it
+ // represents the counterparty's own confirmation.
+ var ack='<table style="width:100%;border-collapse:collapse;font-size:9pt;line-height:1.3">'
+  +'<tr><th style="width:50%;background:#7a1f1f;color:#fff;padding:5pt 8pt;font-size:8.5pt;'+LTR+'">BALANCE CONFIRMATION (by recipient)</th>'
+  +'<th style="width:50%;background:#7a1f1f;color:#fff;padding:5pt 8pt;font-size:8.5pt;'+RTL+'">إقرار مطابقة الرصيد (يعبأ من الطرف الآخر)</th></tr>'
+  +row('We confirm the above balance <strong>agrees / does not agree</strong> with our records. &nbsp; ☐ <strong>Confirmed</strong> &nbsp; ☐ <strong>Not Confirmed</strong>',
+       'نقر بأن الرصيد أعلاه <strong>مطابق / غير مطابق</strong> لسجلاتنا. &nbsp; ☐ <strong>مطابق</strong> &nbsp; ☐ <strong>غير مطابق</strong>')
+  +row('If not agreed, details: '+blank+blank,'في حال عدم المطابقة، التفاصيل: '+blank+blank)
+  +row('<strong>Company:</strong> '+blank+' &nbsp;&nbsp; <strong>Authorized Person:</strong> '+blank,
+       '<strong>اسم الشركة:</strong> '+blank+' &nbsp;&nbsp; <strong>اسم المسؤول:</strong> '+blank)
+  +row('<strong>Title:</strong> '+blank+' &nbsp;&nbsp; <strong>Signature:</strong> '+blank,
+       '<strong>المسمى الوظيفي:</strong> '+blank+' &nbsp;&nbsp; <strong>التوقيع:</strong> '+blank)
+  +row('<strong>Date:</strong> '+blank+' &nbsp;&nbsp; <strong>Company Stamp:</strong> '+blank,
+       '<strong>التاريخ:</strong> '+blank+' &nbsp;&nbsp; <strong>ختم الشركة:</strong> '+blank)
+  +'</table>';
+ return titleBlock+table+ack;
+}
+// "Export to Word" the low-dependency way: an HTML file with Word's own XML
+// namespaces and a .doc extension — Word opens and renders this as a real
+// document (images included), with no docx-generation library needed. Same
+// Blob-download technique as exportXLS() above, just a different MIME/ext.
+function exportConfirmLetterWord(title,bodyHtml,fnameBase){
+ var co=db.company;
+ var logoHtml=co.logo?'<img src="'+co.logo+'" style="height:65px;max-width:180px">':'<div style="font-size:14pt;font-weight:900;color:#0D3B6E">'+(co.name||'')+'</div>';
+ var header='<table width="100%" style="margin-bottom:14pt"><tr>'
+  +'<td style="vertical-align:top">'+logoHtml+'</td>'
+  +'<td style="vertical-align:top;text-align:right"><div style="font-size:13pt;font-weight:700;color:#0D3B6E">'+title+'</div>'
+  +'<div style="font-size:10pt;font-weight:700;color:#333">'+(co.name||'')+'</div>'
+  +(co.address?'<div style="font-size:8pt;color:#888">'+co.address+'</div>':'')
+  +(co.vatNo?'<div style="font-size:8pt;color:#888">VAT: '+co.vatNo+(co.cr?' | CR: '+co.cr:'')+'</div>':'')
+  +'</td></tr></table><hr style="border:none;border-top:2pt solid #0D3B6E">';
+ var html='<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">'
+  +'<head><meta charset="UTF-8"><title>'+title+'</title>'
+  +'<!--[if gte mso 9]><xml><w:WordDocument><w:View>Print</w:View><w:Zoom>100</w:Zoom></w:WordDocument></xml><![endif]-->'
+  +'</head><body>'+header+bodyHtml+'</body></html>';
+ var blob=new Blob(['﻿',html],{type:'application/msword'});
+ var a=document.createElement('a');
+ a.href=URL.createObjectURL(blob);
+ a.download=fnameBase+'.doc';
+ document.body.appendChild(a);a.click();document.body.removeChild(a);
+ setTimeout(function(){URL.revokeObjectURL(a.href);},2000);
+}
+// Resolves the currently-selected contact + its linked account for the
+// three action buttons on the letter preview (cbPrintPDF/cbExportWord/
+// cbSendEmail below). Returns {contact, acc:null} when the contact has no
+// linked account yet — callers should treat a null acc as "can't generate".
+function cbCurrentLetter(){
+ var contact=findContactById(cbState.contactId);
+ if(!contact)return null;
+ var acc=(db.accounts||[]).find(function(a){return a.id===contact.linkedAccId;});
+ return {contact:contact,acc:acc||null};
+}
+function cbLetterFilenameBase(contact){
+ return 'Balance-Confirmation-'+contact.id+'-'+today();
+}
+function cbPrintPDF(){
+ var r=cbCurrentLetter();if(!r||!r.acc)return;
+ printHTML(CONFIRM_LETTER_TITLE,confirmLetterBodyHtml(r.contact,r.acc));
+}
+function cbExportWord(){
+ var r=cbCurrentLetter();if(!r||!r.acc)return;
+ exportConfirmLetterWord(CONFIRM_LETTER_TITLE,confirmLetterBodyHtml(r.contact,r.acc),cbLetterFilenameBase(r.contact));
+}
+function cbSendEmail(){
+ var r=cbCurrentLetter();if(!r||!r.acc)return;
+ var isAr=lang==='ar'; // the letter itself is always bilingual; this still
+ // picks the language for OUR OWN short instruction message below, which
+ // isn't part of the formal letter text.
+ if(!r.contact.email){alert(isAr?'لا يوجد بريد إلكتروني مسجل لهذا العميل/المورد. أضِفه أولاً من بطاقة الحساب.':'No email on file for this contact. Add one from their account card first.');return;}
+ // Download the Word letter right now so there is a file ready to attach —
+ // browsers do not let a mailto:/Gmail-compose link attach a file on its
+ // own for security reasons (same limitation as the license WhatsApp/Gmail
+ // buttons elsewhere in this file). Both calls stay synchronous so the
+ // window.open() below still counts as a direct result of this click and
+ // isn't blocked as a popup (see the note on doLicSave for why that matters).
+ exportConfirmLetterWord(CONFIRM_LETTER_TITLE,confirmLetterBodyHtml(r.contact,r.acc),cbLetterFilenameBase(r.contact));
+ var subject=encodeURIComponent(CONFIRM_LETTER_TITLE+' — '+(db.company.name||''));
+ var msg=isAr
+  ?('تحية طيبة،\n\nتم تنزيل خطاب مصادقة الرصيد الخاص بحسابكم لدينا على هذا الجهاز (ملف Word). الرجاء إرفاقه يدويًا فى هذه الرسالة قبل الإرسال.\n\nمع تحياتنا،\n'+(db.company.name||''))
+  :('Dear Sir/Madam,\n\nYour balance confirmation letter has just been downloaded to this device (Word file). Please attach it manually to this email before sending.\n\nBest regards,\n'+(db.company.name||''));
+ window.open('https://mail.google.com/mail/?view=cm&fs=1&to='+encodeURIComponent(r.contact.email)+'&su='+subject+'&body='+encodeURIComponent(msg),'_blank');
 }
 
 // RENDER
@@ -903,6 +1419,7 @@ function importBackupFile(file){
   db=normalizeDB(parsed);
   save();
   render();
+  upgradeSmallCompanyImages();
   alert(isAr?'✅ تم استعادة النسخة الاحتياطية بنجاح.':'✅ Backup restored successfully.');
  };
  reader.readAsText(file);
@@ -1238,6 +1755,7 @@ function buildLayout(){
   {sec:isAr?'👥 العملاء والموردون':'👥 Contacts'},
   {k:'customers',   i:'users', l:tr('lbl_customers')+' ('+db.customers.length+')'},
   {k:'suppliers',   i:'truck', l:tr('lbl_suppliers')+' ('+db.suppliers.length+')'},
+  {k:'confirmbal',  i:'doc',   l:isAr?'📄 خطاب مصادقة رصيد':'📄 Balance Confirmation Letter'},
 
   // ── Financial Reports ──────────────────────────────────────
   {sec:isAr?'📊 التقارير المالية':'📊 Financial Reports'},
@@ -1314,7 +1832,7 @@ function buildLayout(){
    }
   });
   if(currentSec!==null)nav+='</div>';
- var pages={dashboard:pDashboard,training:pTraining,ai_settings:pAISettings,ai_bank:pAIBank,ai_analysis:pAIAnalysis,ai_cashflow:pAICashFlow,ai_forecast:pAIForecast,coa:pCOA,items:pItems,po:pPurchaseOrders,purchases:pPurchases,sales2:pSales2,stockrpt:pStockRpt,fixedassets:pFixedAssets,assetlocations:pAssetLocations,depreciation:pDepreciation,users:pUsers,fiscalyear:pFiscalYear,journal:pJournal,receipt:pReceipt,payment:pPayment,trial:pTrial,income:pIncome,balance:pBalance,equity:pEquity,workcap:pWorkCap,statement:pStatement,agingAR:pAgingAR,agingAP:pAgingAP,taxSales:pTaxSales,taxPurchases:pTaxPurchases,zakat:pZakat,budget:pBudget,budgetcmp:pBudgetCompare,mgmtdash:pMgmtDash,boarddash:pBoardDash,licadmin:pLicenseAdmin,customers:pCustomers,suppliers:pSuppliers,settings:pSettings,backup:pBackup,costcenters:pCostCenters,ccreport:pCCReport};
+ var pages={dashboard:pDashboard,training:pTraining,ai_settings:pAISettings,ai_bank:pAIBank,ai_analysis:pAIAnalysis,ai_cashflow:pAICashFlow,ai_forecast:pAIForecast,coa:pCOA,items:pItems,po:pPurchaseOrders,purchases:pPurchases,sales2:pSales2,stockrpt:pStockRpt,fixedassets:pFixedAssets,assetlocations:pAssetLocations,depreciation:pDepreciation,users:pUsers,fiscalyear:pFiscalYear,journal:pJournal,receipt:pReceipt,payment:pPayment,trial:pTrial,income:pIncome,balance:pBalance,equity:pEquity,workcap:pWorkCap,statement:pStatement,agingAR:pAgingAR,agingAP:pAgingAP,taxSales:pTaxSales,taxPurchases:pTaxPurchases,zakat:pZakat,budget:pBudget,budgetcmp:pBudgetCompare,mgmtdash:pMgmtDash,boarddash:pBoardDash,licadmin:pLicenseAdmin,customers:pCustomers,suppliers:pSuppliers,confirmbal:pConfirmBalance,settings:pSettings,backup:pBackup,costcenters:pCostCenters,ccreport:pCCReport};
  if(view==='fixedassets'&&tFA){return pAssetDetail();}
  var fn=pages[view]||pDashboard;
  var isAr=lang==='ar';
@@ -1330,10 +1848,11 @@ function buildLayout(){
   +traineeBadge
   +'<nav>'+nav+'</nav>'
   +'<div class="sbf" style="flex-direction:column;gap:5px">'
- +'<div style="background:rgba(255,255,255,0.1);border-radius:var(--r);padding:6px 10px;font-size:11px;display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:2px">'
+ +'<div style="background:rgba(255,255,255,0.1);border-radius:var(--r);padding:6px 10px;font-size:11px;display:flex;align-items:center;justify-content:space-between;gap:6px;margin-bottom:2px;position:relative">'
  +'<div style="overflow:hidden"><div style="font-weight:700;color:white;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:130px">&#127970; '+(db.company.name||'')+'</div>'
  +'<div style="color:rgba(255,255,255,0.55);font-size:10px">'+(currentUser?currentUser.name:'')+'</div></div>'
- +'<button class="btn bsm" data-action="switchCo" title="تبديل الشركة" style="flex-shrink:0;font-size:14px;padding:3px 7px;background:rgba(255,255,255,0.15);border-color:rgba(255,255,255,0.3);color:white">⇄</button>'
+ +'<button class="btn bsm" data-action="switchCo" title="'+(isAr?'تبديل الشركة':'Switch company')+'" style="flex-shrink:0;font-size:14px;padding:3px 7px;background:rgba(255,255,255,0.15);border-color:rgba(255,255,255,0.3);color:white">⇄</button>'
+ +(coSwitcherOpen?coSwitcherMenuHtml():'')
  +'</div>'
  +'<div style="display:flex;gap:5px">'
  +'<button class="btn bsm" id="expD" style="flex:1;background:rgba(255,255,255,0.12);border-color:rgba(255,255,255,0.25);color:rgba(255,255,255,0.85)">'+ic('dn')+' Export</button>'
@@ -3365,9 +3884,9 @@ function pCOA(){
   h+='<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><div class="ct" style="margin:0">'+t+'</div><span class="mn" style="font-size:12px;font-weight:700;color:var(--t2)">'+N(tot)+'</span></div>';
   h+='<div class="tw"><table><thead><tr><th style="width:26px"></th><th>Code</th><th>Account</th><th>Level</th><th>Normal</th><th class="tr">Balance</th></tr></thead><tbody>';
   mains.forEach(function(m){
-   var subs=db.accounts.filter(function(s){return s.pid===m.id;});
+   var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
    var exp=db.exp[m.id]!==false;
-   var mbal=subs.reduce(function(s,x){return s+x.bal;},0);
+   var mbal=subs.reduce(function(s,x){return s+acctRollupBal(x);},0);
    h+='<tr class="mrow"><td style="text-align:center">'+(subs.length?'<span class="chev '+(exp?'open':'')+'" data-tog="'+m.id+'">'+ic('chev')+'</span>':'')+'</td>';
    h+='<td><span class="tag">'+m.id+'</span></td>';
    h+='<td><div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap"><strong>'+m.name+'</strong><button class="btn bsm bg0 asb" data-addsub="'+m.id+'">'+ic('plus')+' Sub</button><button class="btn bsm bg0" data-editacc="'+m.id+'">'+ic('edit')+'</button><button class="btn bsm bg0 bdr" data-delacc="'+m.id+'">'+ic('del')+'</button></div>'+rl(m.id)+'</td>';
@@ -3376,12 +3895,27 @@ function pCOA(){
    h+='<td class="tr mn" style="font-weight:700">'+N(mbal)+'</td>';
    h+='</tr>';
    if(exp){subs.forEach(function(s){
-    h+='<tr><td></td><td><span class="tag" style="color:var(--pu)">'+s.id+'</span></td>';
+    // A sub-account can itself have children — this is how the auto-
+    // generated customer/supplier sub-ledger accounts (e.g. "1103-01-001",
+    // under "Local Customers" 1103-01) are nested and made visible here;
+    // see autoCreateContactAccount(). Undefined defaults to expanded so
+    // they show up immediately without an extra click.
+    var subs2=db.accounts.filter(function(x){return x.pid===s.id;});
+    var exp2=db.exp[s.id]!==false;
+    h+='<tr><td style="text-align:center">'+(subs2.length?'<span class="chev '+(exp2?'open':'')+'" data-tog="'+s.id+'">'+ic('chev')+'</span>':'')+'</td><td><span class="tag" style="color:var(--pu)">'+s.id+'</span></td>';
     h+='<td style="padding-left:26px"><div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap"><span style="color:var(--t3)">&#x2514;</span>'+accN(s)+'<button class="btn bsm bg0" data-editacc="'+s.id+'">'+ic('edit')+'</button><button class="btn bsm bg0 bdr" data-delacc="'+s.id+'">'+ic('del')+'</button></div>'+rl(s.id)+'</td>';
     h+='<td><span class="b bpu" style="font-size:10px">Sub</span></td>';
     h+='<td><span class="b '+(s.normal==='Debit'?'bbl':'bgn')+'">'+s.normal+'</span></td>';
-    h+='<td class="tr mn">'+N(s.bal)+'</td>';
+    h+='<td class="tr mn">'+N(acctRollupBal(s))+'</td>';
     h+='</tr>';
+    if(exp2){subs2.forEach(function(g){
+     h+='<tr><td></td><td><span class="tag" style="color:var(--t3)">'+g.id+'</span></td>';
+     h+='<td style="padding-left:44px"><div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap"><span style="color:var(--t3)">&#x2514;</span>'+accN(g)+(g.autoGen?' <span class="b" style="font-size:9px;opacity:.7">'+(lang==='ar'?'تلقائي':'auto')+'</span>':'')+'<button class="btn bsm bg0" data-editacc="'+g.id+'">'+ic('edit')+'</button><button class="btn bsm bg0 bdr" data-delacc="'+g.id+'">'+ic('del')+'</button></div>'+rl(g.id)+'</td>';
+     h+='<td><span class="b" style="font-size:10px">Sub</span></td>';
+     h+='<td><span class="b '+(g.normal==='Debit'?'bbl':'bgn')+'">'+g.normal+'</span></td>';
+     h+='<td class="tr mn">'+N(g.bal)+'</td>';
+     h+='</tr>';
+    });}
    });}
   });
   stand.forEach(function(a){
@@ -3796,6 +4330,18 @@ function mainBalRange(mainId,from2,to2){
  if(!subs.length)return accBalRange(mainId,from2,to2);
  return subs.reduce(function(s,x){return s+accBalRange(x.id,from2,to2);},0);
 }
+// Like acctRollupBal() but date-range aware (for Trial Balance): an account
+// with no children is computed directly from its postings via
+// accBalRange(); a parent (e.g. "Local Customers" 1103-01, once individual
+// customer sub-accounts exist under it -- see autoCreateContactAccount())
+// sums its children's rolled-up balances instead, at any depth. This is
+// what keeps Trial Balance totals correct once postings move from a
+// 2-level sub-account onto its own auto-generated 3rd-level children.
+function accBalRangeRollup(accId,from2,to2){
+ var kids=db.accounts.filter(function(c){return c.pid===accId;});
+ if(!kids.length)return accBalRange(accId,from2,to2);
+ return kids.reduce(function(s,k){return s+accBalRangeRollup(k.id,from2,to2);},0);
+}
 
 function updatePITotals(){
  var sub=0,vat=0;
@@ -3876,30 +4422,43 @@ function pTrial(){
   h+='<div style="text-align:center;padding:60px 20px;color:var(--t3)"><div style="font-size:48px;margin-bottom:12px">📊</div><div style="font-size:14px;font-weight:600;color:var(--t2)">'+(isAr?'اضغط "عرض التقرير" لعرض ميزان المراجعة':'Click "Show Report" to display Trial Balance')+'</div></div>';
   h+='</div>';return h;
  }
- var types=['Asset','Liability','Equity','Revenue','Expense'],rows=[],drTotal=0,crTotal=0;
+ var types=['Asset','Liability','Equity','Revenue','Expense'],rows=[];
  types.forEach(function(tp){
   db.accounts.filter(function(a){return a.type===tp&&a.isMain;}).forEach(function(m){
-   var subs=db.accounts.filter(function(s){return s.pid===m.id;});
-   var mBal=mainBalRange(m.id,f,t);
-   if(lv!=='sub')rows.push({id:m.id,name:m.name,nameAr:m.nameAr||'',type:tp,normal:m.normal,bal:mBal,isMain:true});
+   var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
+   var mBal=accBalRangeRollup(m.id,f,t);
+   if(lv!=='sub')rows.push({id:m.id,name:m.name,nameAr:m.nameAr||'',type:tp,normal:m.normal,bal:mBal,isMain:true,lvl:0});
    subs.forEach(function(s){
-    var sBal=accBalRange(s.id,f,t);
-    if(lv!=='main')rows.push({id:s.id,name:s.name,nameAr:s.nameAr||'',type:tp,normal:s.normal,bal:sBal,isMain:false,pid:m.id});
-    // Add to totals based on actual sign
-    if(s.normal==='Debit'){if(sBal>=0)drTotal+=sBal;else crTotal+=Math.abs(sBal);}
-    else{if(sBal>=0)crTotal+=sBal;else drTotal+=Math.abs(sBal);}
+    // A sub-account can itself have children now (e.g. "Local Customers"
+    // 1103-01, once individual customer sub-accounts exist under it -- see
+    // autoCreateContactAccount()); postings land on those, not on s itself,
+    // so s's displayed balance here is the rolled-up sum of its children.
+    var subSubs=db.accounts.filter(function(ss){return ss.pid===s.id;});
+    var sBal=accBalRangeRollup(s.id,f,t);
+    if(lv!=='main')rows.push({id:s.id,name:s.name,nameAr:s.nameAr||'',type:tp,normal:s.normal,bal:sBal,isMain:false,pid:m.id,lvl:1});
+    subSubs.forEach(function(ss){
+     var ssBal=accBalRange(ss.id,f,t);
+     if(lv!=='main')rows.push({id:ss.id,name:ss.name,nameAr:ss.nameAr||'',type:tp,normal:ss.normal,bal:ssBal,isMain:false,pid:s.id,lvl:2});
+    });
    });
-   if(!subs.length){
-    if(m.normal==='Debit'){if(mBal>=0)drTotal+=mBal;else crTotal+=Math.abs(mBal);}
-    else{if(mBal>=0)crTotal+=mBal;else drTotal+=Math.abs(mBal);}
-   }
   });
   db.accounts.filter(function(a){return a.type===tp&&!a.isMain&&!a.pid;}).forEach(function(a){
    var aBal=accBalRange(a.id,f,t);
-   rows.push({id:a.id,name:a.name,nameAr:a.nameAr||'',type:tp,normal:a.normal,bal:aBal,isMain:false});
-   if(a.normal==='Debit'){if(aBal>=0)drTotal+=aBal;else crTotal+=Math.abs(aBal);}
-   else{if(aBal>=0)crTotal+=aBal;else drTotal+=Math.abs(aBal);}
+   rows.push({id:a.id,name:a.name,nameAr:a.nameAr||'',type:tp,normal:a.normal,bal:aBal,isMain:false,lvl:0});
   });
+ });
+ // Totals: one flat pass over every non-main account's OWN balance (never
+ // a rollup) -- this is what keeps the total correct and dedup-safe
+ // regardless of nesting depth or of the handful of legacy COA entries
+ // that carry BOTH isMain:true and a pid (e.g. "4101", "5101"), which are
+ // otherwise reachable via two different Main->Sub traversal paths in the
+ // rows loop above and would double-count if totals were accumulated
+ // there instead. Every leaf account is visited exactly once here.
+ var drTotal=0,crTotal=0;
+ db.accounts.filter(function(a){return !a.isMain;}).forEach(function(a){
+  var bal=accBalRange(a.id,f,t);
+  if(a.normal==='Debit'){if(bal>=0)drTotal+=bal;else crTotal+=Math.abs(bal);}
+  else{if(bal>=0)crTotal+=bal;else drTotal+=Math.abs(bal);}
  });
  var dr=drTotal,cr=crTotal;
  var ok=Math.abs(dr-cr)<0.01;
@@ -3919,7 +4478,7 @@ function pTrial(){
   if(r.normal==='Debit'){if(r.bal>=0){dr2=r.bal;cr2=0;}else{dr2=0;cr2=Math.abs(r.bal);}}
   else{if(r.bal>=0){dr2=0;cr2=r.bal;}else{dr2=Math.abs(r.bal);cr2=0;}}
   var rowBg=r.isMain?'background:var(--bg)':'';
-  var indent=r.pid?'padding-right:20px':'';
+  var indent=(r.lvl||0)?'padding-right:'+((r.lvl||0)*20)+'px':'';
   var nameDisplay=rptShowCodes?(r.id+' '):'';
   h+='<tr style="'+rowBg+'">'
    +'<td><span class="tag">'+r.id+'</span></td>'
@@ -3958,7 +4517,7 @@ function pIncome(){
  h+='<div class="mets"><div class="met"><div class="mlab">Revenue</div><div class="mv">'+fmt(d.rev)+'</div></div><div class="met"><div class="mlab">Gross Profit</div><div class="mv '+(d.gp>=0?'pos':'neg')+'">'+fmt(d.gp)+'</div></div><div class="met"><div class="mlab">Net Income</div><div class="mv '+(d.ni>=0?'pos':'neg')+'">'+fmt(d.ni)+'</div></div></div>';
  h+='<div class="card" style="max-width:560px"><div class="rh">Revenue</div>';
  db.accounts.filter(function(a){return a.type==='Revenue'&&a.isMain;}).forEach(function(m){
-  var subs=db.accounts.filter(function(s){return s.pid===m.id;});
+  var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
   var bal=subs.reduce(function(s,x){return s+accBalRange(x.id,f,t);},0);
   if(!subs.length)bal=accBalRange(m.id,f,t);
   var mCode=rptShowCodes?'<span class="tag" style="font-size:10px;margin-inline-end:4px">'+m.id+'</span>':'';
@@ -3974,7 +4533,7 @@ function pIncome(){
  h+='<div class="rt"><span>Gross Profit</span><span class="mn">'+N(d.gp)+'</span></div>';
  h+='<div class="rh">Operating Expenses</div>';
  db.accounts.filter(function(a){return a.type==='Expense'&&a.isMain&&a.id!=='5000';}).forEach(function(m){
-  var subs=db.accounts.filter(function(s){return s.pid===m.id;});
+  var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
   var bal=subs.reduce(function(s,x){return s+accBalRange(x.id,f,t);},0);
   if(!subs.length)bal=accBalRange(m.id,f,t);
   var mCode=rptShowCodes?'<span class="tag" style="font-size:10px;margin-inline-end:4px">'+m.id+'</span>':'';
@@ -5478,6 +6037,73 @@ function pSuppliers(){
  db.suppliers.forEach(function(s){h+=contactCard(s,true);});
  return h+'</div></div>';
 }
+// ── BALANCE CONFIRMATION LETTER ───────────────────────────────
+// Contacts › Balance Confirmation Letter. One bilingual search box picks any
+// customer OR supplier (IDs are unique — "CUS-…"/"SUP-…" — so no separate
+// type toggle is needed); the letter is built from that contact's linked
+// account (see mContact()'s "Linked Account" field). The action-button
+// helpers (cbCurrentLetter/cbPrintPDF/cbExportWord/cbSendEmail) live up near
+// printHTML() above; this function is just the page shell.
+function pConfirmBalance(){
+ var isAr=lang==='ar';
+ var h=tb(isAr?'📄 خطاب مصادقة رصيد':'📄 Balance Confirmation Letter','');
+ h+='<div class="pg"><div class="card" style="max-width:720px">';
+ var allContacts=(db.customers||[]).map(function(c){return{id:c.id,name:c.name,nameAr:c.nameAr,isSup:false};})
+  .concat((db.suppliers||[]).map(function(s){return{id:s.id,name:s.name,nameAr:s.nameAr,isSup:true};}));
+ h+='<datalist id="cbContactDL">'+allContacts.map(function(c){
+   var typeLbl=isAr?(c.isSup?'مورد':'عميل'):(c.isSup?'Supplier':'Customer');
+   return '<option value="'+c.id+'">'+c.id+' | '+(c.name||'')+(c.nameAr?' | '+c.nameAr:'')+' ('+typeLbl+')</option>';
+  }).join('')+'</datalist>';
+ var curName='',curInfo='';
+ if(cbState.contactId){
+  var cur0=findContactById(cbState.contactId);
+  if(cur0){
+   curName=cur0.id+' | '+(cur0.name||'')+(cur0.nameAr?' | '+cur0.nameAr:'');
+   var typeLbl0=isAr?(cur0.__isSup?'مورد':'عميل'):(cur0.__isSup?'Supplier':'Customer');
+   curInfo='<span style="color:var(--gn)">✅ '+cur0.id+' - '+(cur0.name||'')+(cur0.nameAr?' | '+cur0.nameAr:'')+' ('+typeLbl0+')</span>';
+  }
+ }
+ h+=fld(isAr?'ابحث عن العميل / المورد (عربى أو انجليزى)':'Search Customer / Supplier (Arabic or English)',
+  '<input id="cb-contact-search" list="cbContactDL" value="'+curName+'" autocomplete="off"'
+  +' placeholder="'+(isAr?'اكتب اسم أو رقم الحساب...':'Type name or account ID...')+'"'
+  +' style="width:100%;padding:8px 10px;border:1px solid var(--bd2);border-radius:var(--r);font-size:13px;background:var(--sf);color:var(--tx)">'
+  +'<input type="hidden" id="cb-contact-resolved" value="'+(cbState.contactId||'')+'">'
+  +'<div id="cb-contact-info" style="font-size:11px;color:var(--t2);margin-top:4px">'+curInfo+'</div>');
+ h+='<div style="margin-top:8px"><button class="btn bp" data-action="cbGenerate">'+(isAr?'📄 توليد الخطاب':'📄 Generate Letter')+'</button></div>';
+ h+='</div>';
+
+ if(cbState.contactId){
+  var contact=findContactById(cbState.contactId);
+  if(!contact){
+   h+='<div class="card" style="max-width:720px"><div class="es">'+(isAr?'⚠️ لم يتم العثور على هذا الحساب':'⚠️ Contact not found')+'</div></div>';
+  } else if(!contact.linkedAccId||!(db.accounts||[]).find(function(a){return a.id===contact.linkedAccId;})){
+   // Uses cbState.contactId (already known) rather than a data-id attribute
+   // — window.xAction only receives the action name, not the clicked
+   // element, so cbOpenContact below resolves the contact itself.
+   h+='<div class="card" style="max-width:720px"><div class="es">'
+    +(isAr?'⚠️ لا يوجد حساب مرتبط بهذا '+(contact.__isSup?'المورد':'العميل')+' بعد — لا يمكن حساب الرصيد بدون ربط حساب من كشف الحسابات.':'⚠️ This '+(contact.__isSup?'supplier':'customer')+' has no linked account yet — a balance can\'t be computed without one.')
+    +'<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">'
+    +'<button class="btn bdr bsm" data-action="cbOpenContact">'+(isAr?'فتح بطاقة الحساب لربطه':'Open account card to link one')+'</button>'
+    +'<button class="btn bsm" data-action="cbCancel">✖ '+(isAr?'إلغاء':'Cancel')+'</button>'
+    +'</div>'
+    +'</div></div>';
+  } else {
+   var acc=(db.accounts||[]).find(function(a){return a.id===contact.linkedAccId;});
+   var bodyHtml=confirmLetterBodyHtml(contact,acc);
+   h+='<div class="card" style="max-width:720px"><div class="ct">'+(isAr?'معاينة الخطاب':'Letter Preview')+'</div>'
+    +'<div id="cb-letter-preview" style="border:1px solid var(--bd2);border-radius:var(--r);padding:18px;background:#fff;color:#111">'+bodyHtml+'</div>'
+    +'<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:14px">'
+    +'<button class="btn bp" data-action="cbPrintPDF">🖨️ '+(isAr?'معاينة / طباعة (PDF)':'Preview / Print (PDF)')+'</button>'
+    +'<button class="btn bdr" data-action="cbExportWord">📝 '+(isAr?'تصدير Word':'Export Word')+'</button>'
+    +'<button class="btn bdr" data-action="cbSendEmail"'+(!contact.email?' style="opacity:.5" title="'+(isAr?'لا يوجد بريد إلكتروني مسجل':'No email on file')+'"':'')+'>📧 '+(isAr?'إرسال بالبريد':'Send by Email')+'</button>'
+    +'<button class="btn bdr" data-action="cbCancel">✖ '+(isAr?'إلغاء':'Cancel')+'</button>'
+    +'</div>'
+    +(!contact.email?'<div style="font-size:11px;color:var(--t3);margin-top:8px">'+(isAr?'💡 لتفعيل زر الإرسال، أضِف بريدًا إلكترونيًا لهذا الحساب من بطاقته.':'💡 To enable Send by Email, add an email to this contact\'s card.')+'</div>':'')
+    +'</div>';
+  }
+ }
+ return h;
+}
 // ── LICENSE ADMIN PANEL ───────────────────────────────────────
 function pLicenseAdmin(){
  var isAr=lang==='ar';
@@ -5569,6 +6195,11 @@ function pSettings(){
  h+='<div class="card" style="max-width:660px"><div class="ct">Currency</div><div class="fr2">'+fld('Currency','<select id="s-curr">'+curs.map(function(c){return '<option'+(co.currency===c?' selected':'')+'>'+c+'</option>';}).join('')+'</select>')+fld('Custom Code','<input id="s-currcustom" placeholder="e.g. TRY" maxlength="5" value="'+(curs.indexOf(co.currency)===-1?co.currency||'':'')+'">');
  h+='</div></div>';
  h+='<div class="card" style="max-width:660px"><div class="ct">Company Logo</div>'+'<div style="display:flex;align-items:flex-start;gap:18px;flex-wrap:wrap">'+(co.logo?'<img src="'+co.logo+'" style="height:80px;max-width:180px;object-fit:contain;border:1px solid var(--bd);border-radius:var(--r);padding:6px;background:#fff">':'<div style="width:120px;height:80px;border:2px dashed var(--bd2);border-radius:var(--r);display:flex;align-items:center;justify-content:center;color:var(--t3);font-size:12px">No logo</div>')+'<div style="display:flex;flex-direction:column;gap:8px"><label style="font-size:12px;font-weight:600;color:var(--t2)">Upload Logo (PNG / JPG / SVG)</label>'+'<input type="file" id="logoFile" accept="image/*" style="font-size:12px;width:auto">'+(co.logo?'<button class="btn bdr bsm" id="btnDelLogo">Remove Logo</button>':'')+'<span style="font-size:11px;color:var(--t3)">Recommended: 300x100px, transparent background. Max 500KB</span>'+'</div></div></div>';
+ // Used to auto-stamp/sign generated documents (currently: the Balance
+ // Confirmation Letter — see pConfirmBalance()) instead of the user having
+ // to add them by hand to every letter.
+ h+='<div class="card" style="max-width:660px"><div class="ct">🔴 '+(isAr?'ختم الشركة':'Company Stamp')+'</div>'+'<div style="display:flex;align-items:flex-start;gap:18px;flex-wrap:wrap">'+(co.stamp?'<img src="'+co.stamp+'" style="height:90px;max-width:150px;object-fit:contain;border:1px solid var(--bd);border-radius:var(--r);padding:6px;background:#fff">':'<div style="width:120px;height:90px;border:2px dashed var(--bd2);border-radius:var(--r);display:flex;align-items:center;justify-content:center;color:var(--t3);font-size:12px">'+(isAr?'لا يوجد ختم':'No stamp')+'</div>')+'<div style="display:flex;flex-direction:column;gap:8px"><label style="font-size:12px;font-weight:600;color:var(--t2)">'+(isAr?'رفع صورة الختم (PNG بخلفية شفافة يُفضّل)':'Upload Stamp Image (transparent PNG preferred)')+'</label>'+'<input type="file" id="stampFile" accept="image/*" style="font-size:12px;width:auto">'+(co.stamp?'<button class="btn bdr bsm" id="btnDelStamp">'+(isAr?'إزالة الختم':'Remove Stamp')+'</button>':'')+'</div></div></div>';
+ h+='<div class="card" style="max-width:660px"><div class="ct">✍️ '+(isAr?'توقيع المدير المالي':'Financial Manager Signature')+'</div>'+'<div style="display:flex;align-items:flex-start;gap:18px;flex-wrap:wrap">'+(co.signature?'<img src="'+co.signature+'" style="height:70px;max-width:180px;object-fit:contain;border:1px solid var(--bd);border-radius:var(--r);padding:6px;background:#fff">':'<div style="width:150px;height:70px;border:2px dashed var(--bd2);border-radius:var(--r);display:flex;align-items:center;justify-content:center;color:var(--t3);font-size:12px">'+(isAr?'لا يوجد توقيع':'No signature')+'</div>')+'<div style="display:flex;flex-direction:column;gap:8px"><label style="font-size:12px;font-weight:600;color:var(--t2)">'+(isAr?'رفع صورة التوقيع (PNG بخلفية شفافة يُفضّل)':'Upload Signature Image (transparent PNG preferred)')+'</label>'+'<input type="file" id="signatureFile" accept="image/*" style="font-size:12px;width:auto">'+(co.signature?'<button class="btn bdr bsm" id="btnDelSignature">'+(isAr?'إزالة التوقيع':'Remove Signature')+'</button>':'')+'</div></div></div>';
  h+='<div class="card" style="max-width:660px;border:2px dashed var(--bd2)"><div class="ct">Preview</div><div style="padding:12px;background:var(--bg);border-radius:var(--r)"><strong>'+co.name+'</strong><br><span style="font-size:12px;color:var(--t2)">'+co.address+'</span><br><span style="display:inline-block;background:var(--gnb);color:var(--gn);padding:2px 10px;border-radius:99px;font-size:11px;font-weight:700;margin-top:5px">VAT: '+co.vatNo+'</span> <span style="font-size:12px;color:var(--t2)">'+vatR()+'% | '+cur()+'</span></div></div>';
   return h+'</div>';
 }
@@ -5829,6 +6460,18 @@ function mContact(){
   if(curA)curAccName=curA.id+' | '+curA.name+(curA.nameAr?' | '+curA.nameAr:'');
  }
  body+=accDL;
+ // For a brand-new contact, leaving this blank auto-generates a dedicated
+ // sub-ledger account under Local/Foreign Customers or Suppliers (see
+ // autoCreateContactAccount(), called from mSaveContact) -- so the search
+ // field is now optional (an override) rather than required. When editing
+ // an existing contact the field still shows/lets you change the current
+ // link as before.
+ var autoHint=(!c.editId)
+  ?('<div style="font-size:11px;color:var(--t2);margin-top:4px">\u{1F522} '
+   +(isAr?'\u0627\u062a\u0631\u0643\u0647 \u0641\u0627\u0631\u063a\u064b\u0627 \u0644\u0625\u0646\u0634\u0627\u0621 \u0631\u0642\u0645 \u062d\u0633\u0627\u0628 \u0641\u0631\u0639\u064a \u062a\u0644\u0642\u0627\u0626\u064a\u064b\u0627 \u062a\u062d\u062a '+(isSup?'\u0627\u0644\u0645\u0648\u0631\u062f\u0648\u0646':'\u0627\u0644\u0639\u0645\u0644\u0627\u0621')+' - \u0645\u062d\u0644\u064a\u0648\u0646 / \u062e\u0627\u0631\u062c\u064a\u0648\u0646 \u062d\u0633\u0628 \u0627\u0644\u062f\u0648\u0644\u0629 \u0627\u0644\u0645\u062e\u062a\u0627\u0631\u0629.'
+   :'Leave blank to auto-generate a sub-ledger account under Local/Foreign '+(isSup?'Suppliers':'Customers')+' based on the selected country.')
+   +'</div>')
+  :'';
  body+=fld(
   (isAr?'\u0627\u0628\u062d\u062b \u0639\u0646 \u0627\u0644\u062d\u0633\u0627\u0628 '+(isSup?'(\u0630\u0645\u0645 \u062f\u0627\u0626\u0646\u0629)':'(\u0630\u0645\u0645 \u0645\u062f\u064a\u0646\u0629)'):'Search Account '+(isSup?'(Payable)':'(Receivable)')),
   '<input id="c-acc-search" list="cAccDL" value="'+curAccName+'" autocomplete="off"'
@@ -5836,6 +6479,7 @@ function mContact(){
   +' style="'+inp+'">'
   +'<input type="hidden" id="c-acc" value="'+(c.linkedAccId||'')+'"><div id="c-acc-info" style="font-size:11px;color:var(--t2);margin-top:4px">'
   +(c.linkedAccId&&curAccName?'✅ '+curAccName:'')+'</div>'
+  +autoHint
  );
  return wrap((c.editId?'Edit ':'New ')+(isSup?(isAr?'\u0645\u0648\u0631\u062f':'Supplier'):(isAr?'\u0639\u0645\u064a\u0644':'Customer')),body,'mSaveContact',(isAr?'\u062d\u0641\u0638':'Save'));
 }
@@ -5878,7 +6522,7 @@ window.xAction=function(type){
  if(type==='cancelModal'){modal=null;render();return;}
  if(type==='toggleLang'){setLang(lang==='ar'?'en':'ar');return;}
  if(type==='logout'){currentUser=null;clearSession();render();return;}
- if(type==='switchCo'){currentCompanyId=null;appState='selectCompany';render();return;}
+ if(type==='switchCo'){coSwitcherOpen=!coSwitcherOpen;render();return;}
  if(type==='saveSettings'){
   var name=((document.getElementById('s-name')||{}).value||'').trim();
   if(!name){alert(lang==='ar'?'اسم الشركة مطلوب':'Company name required.');return;}
@@ -6096,6 +6740,27 @@ window.xAction=function(type){
  }
  if(type==='importCoA'){importCoA();return;}
  if(type==='exportBackup'){exportBackup();return;}
+ if(type==='cbGenerate'){
+  var cbId=((document.getElementById('cb-contact-resolved')||{}).value||'').trim();
+  cbState.contactId=cbId;render();return;
+ }
+ if(type==='cbPrintPDF'){cbPrintPDF();return;}
+ if(type==='cbExportWord'){cbExportWord();return;}
+ if(type==='cbSendEmail'){cbSendEmail();return;}
+ if(type==='cbCancel'){
+  // Cancels the in-progress/just-generated Balance Confirmation Letter and
+  // returns to a clean search box — clears the resolved contact so no
+  // stale letter preview or "no linked account" warning stays on screen.
+  cbState.contactId='';render();return;
+ }
+ if(type==='cbOpenContact'){
+  var cbContact=findContactById(cbState.contactId);
+  if(cbContact){
+   if(cbContact.__isSup){supView=(db.suppliers||[]).find(function(s){return s.id===cbContact.id;});view='suppliers';}
+   else{cusView=(db.customers||[]).find(function(c){return c.id===cbContact.id;});view='customers';}
+  }
+  render();return;
+ }
  if(type==='editOB'){modal='ob';render();return;}
  if(type==='addFA'){tFAEdit={};modal='fa';render();return;}
  if(type==='backFA'){tFA=null;view='fixedassets';render();return;}
@@ -6134,7 +6799,7 @@ window.xAction=function(type){
   var types=['Asset','Liability','Equity','Revenue','Expense'];
   types.forEach(function(t){
    db.accounts.filter(function(a){return a.type===t&&a.isMain&&!a.pid;}).forEach(function(m){
-    var subs=db.accounts.filter(function(s){return s.pid===m.id;});
+    var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
     var bal=subs.length?subs.reduce(function(s,x){return s+x.bal;},0):m.bal;
     coaRows.push({id:m.id,name:m.name,nameAr:m.nameAr||'',type:t,level:'Main',normal:m.normal,bal:bal,indent:0,isMain:true});
     subs.forEach(function(s){
@@ -6212,37 +6877,75 @@ window.xAction=function(type){
   printHTML('Journal Entries',html);
   return;
  } else if(type==='pdfTrial'){
-  var types=['Asset','Liability','Equity','Revenue','Expense'],dr=0,cr=0;
+  var types=['Asset','Liability','Equity','Revenue','Expense'];
   var html='<table><thead><tr><th>Code</th><th>Account</th><th>Type</th><th class="tr">Debit</th><th class="tr">Credit</th></tr></thead><tbody>';
-  types.forEach(function(t){db.accounts.filter(function(a){return a.type===t&&a.isMain;}).forEach(function(m){var subs=db.accounts.filter(function(s){return s.pid===m.id;});html+='<tr class="tot"><td>'+m.id+'</td><td><strong>'+m.name+'</strong></td><td>'+t+'</td><td></td><td></td></tr>';subs.forEach(function(s){html+='<tr><td>'+s.id+'</td><td style="padding-left:14pt">'+s.name+'</td><td>'+t+'</td><td class="tr">'+(s.normal==='Debit'?N(s.bal):'')+'</td><td class="tr">'+(s.normal==='Credit'?N(s.bal):'')+'</td></tr>';if(s.normal==='Debit')dr+=s.bal;else cr+=s.bal;});});});
+  types.forEach(function(t){db.accounts.filter(function(a){return a.type===t&&a.isMain;}).forEach(function(m){
+   var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
+   html+='<tr class="tot"><td>'+m.id+'</td><td><strong>'+m.name+'</strong></td><td>'+t+'</td><td></td><td></td></tr>';
+   subs.forEach(function(s){
+    // A sub can itself have children now (e.g. auto-generated customer/
+    // supplier sub-accounts under "Local Customers" -- see
+    // autoCreateContactAccount()); roll its displayed balance up from them
+    // (totals themselves come from a separate flat pass below, not here).
+    var subSubs=db.accounts.filter(function(ss){return ss.pid===s.id;});
+    var sBal=subSubs.length?subSubs.reduce(function(x,y){return x+acctRollupBal(y);},0):s.bal;
+    html+='<tr><td>'+s.id+'</td><td style="padding-left:14pt">'+s.name+'</td><td>'+t+'</td><td class="tr">'+(s.normal==='Debit'?N(sBal):'')+'</td><td class="tr">'+(s.normal==='Credit'?N(sBal):'')+'</td></tr>';
+    subSubs.forEach(function(ss){
+     html+='<tr><td>'+ss.id+'</td><td style="padding-left:28pt">'+ss.name+'</td><td>'+t+'</td><td class="tr">'+(ss.normal==='Debit'?N(ss.bal):'')+'</td><td class="tr">'+(ss.normal==='Credit'?N(ss.bal):'')+'</td></tr>';
+    });
+   });
+  });});
+  // Totals: one flat, dedup-safe pass over every non-main account's own
+  // .bal -- see the matching comment in pTrial() for why (a handful of
+  // legacy COA entries carry both isMain:true and a pid, e.g. "4101", and
+  // would double-count if totalled inside the nested loop above instead).
+  var dr=0,cr=0;
+  db.accounts.filter(function(a){return !a.isMain;}).forEach(function(a){
+   if(a.normal==='Debit')dr+=a.bal||0;else cr+=a.bal||0;
+  });
   html+='<tr class="fin"><td colspan="3">TOTAL</td><td class="tr">'+N(dr)+'</td><td class="tr">'+N(cr)+'</td></tr></tbody></table>';
   printHTML('Trial Balance',html);
  } else if(type==='xlsTrial'){
   var f=rptFrom,t2=rptTo;
-  var types=['Asset','Liability','Equity','Revenue','Expense'],rows=[],dr=0,cr=0;
+  var types=['Asset','Liability','Equity','Revenue','Expense'],rows=[];
   types.forEach(function(tp){
    db.accounts.filter(function(a){return a.type===tp&&a.isMain;}).forEach(function(m){
-    var subs=db.accounts.filter(function(s){return s.pid===m.id;});
-    var mBal=mainBalRange(m.id,f,t2);
+    var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
+    var mBal=accBalRangeRollup(m.id,f,t2);
     rows.push([m.id,m.name,tp,'','']);
     subs.forEach(function(s){
-     var sBal=accBalRange(s.id,f,t2);
+     // See the pdfTrial branch above for why this rolls up through any
+     // children rather than reading s's own (possibly unused) balance,
+     // and why totals themselves come from a separate flat pass below.
+     var subSubs=db.accounts.filter(function(ss){return ss.pid===s.id;});
+     var sBal=accBalRangeRollup(s.id,f,t2);
      var dr2,cr2;
      if(s.normal==='Debit'){if(sBal>=0){dr2=sBal;cr2='';}else{dr2='';cr2=Math.abs(sBal);}}
      else{if(sBal>=0){dr2='';cr2=sBal;}else{dr2=Math.abs(sBal);cr2='';}}
-     rows.push([s.id,s.name,tp,dr2,cr2]);
-     if(s.normal==='Debit'){if(sBal>=0)dr+=sBal;else cr+=Math.abs(sBal);}
-     else{if(sBal>=0)cr+=sBal;else dr+=Math.abs(sBal);}
+     rows.push([s.id,'  '+s.name,tp,dr2,cr2]);
+     subSubs.forEach(function(ss){
+      var ssBal=accBalRange(ss.id,f,t2);
+      var dr3,cr3;
+      if(ss.normal==='Debit'){if(ssBal>=0){dr3=ssBal;cr3='';}else{dr3='';cr3=Math.abs(ssBal);}}
+      else{if(ssBal>=0){dr3='';cr3=ssBal;}else{dr3=Math.abs(ssBal);cr3='';}}
+      rows.push([ss.id,'    '+ss.name,tp,dr3,cr3]);
+     });
     });
     if(!subs.length){
      var dr2,cr2;
      if(m.normal==='Debit'){if(mBal>=0){dr2=mBal;cr2='';}else{dr2='';cr2=Math.abs(mBal);}}
      else{if(mBal>=0){dr2='';cr2=mBal;}else{dr2=Math.abs(mBal);cr2='';}}
      rows[rows.length-1][3]=dr2;rows[rows.length-1][4]=cr2;
-     if(m.normal==='Debit'){if(mBal>=0)dr+=mBal;else cr+=Math.abs(mBal);}
-     else{if(mBal>=0)cr+=mBal;else dr+=Math.abs(mBal);}
     }
    });
+  });
+  // Totals: same flat, dedup-safe pass as pTrial()/pdfTrial() above, using
+  // the date-ranged accBalRange() (this export respects rptFrom/rptTo).
+  var dr=0,cr=0;
+  db.accounts.filter(function(a){return !a.isMain;}).forEach(function(a){
+   var bal=accBalRange(a.id,f,t2);
+   if(a.normal==='Debit'){if(bal>=0)dr+=bal;else cr+=Math.abs(bal);}
+   else{if(bal>=0)cr+=bal;else dr+=Math.abs(bal);}
   });
   exportXLS([[db.company.name],[db.company.address||''],[tr('nav_trial'),'','Date: '+today()],[],['Code','Account','Type','Debit','Credit']].concat(rows).concat([['','TOTAL','',dr,cr]]),'Trial Balance','Trial_Balance_'+today());
  } else if(type==='xlsIncome'){
@@ -6251,7 +6954,7 @@ window.xAction=function(type){
   var aoa=[[db.company.name],[db.company.address||''],[tr('nav_income'),'Date: '+today()],[],['','']];
   aoa.push(['REVENUE','','']);
   db.accounts.filter(function(a){return a.type==='Revenue'&&a.isMain;}).forEach(function(m){
-   var subs=db.accounts.filter(function(s){return s.pid===m.id;});
+   var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
    var bal=subs.length?subs.reduce(function(s,x){return s+accBalRange(x.id,f,t2);},0):accBalRange(m.id,f,t2);
    aoa.push([m.id,m.name,bal]);
    subs.forEach(function(s){aoa.push([s.id,'  '+accN(s),accBalRange(s.id,f,t2)]);});
@@ -6264,7 +6967,7 @@ window.xAction=function(type){
   aoa.push(['']);
   aoa.push(['OPERATING EXPENSES','']);
   db.accounts.filter(function(a){return a.type==='Expense'&&a.isMain&&a.id!=='5000';}).forEach(function(m){
-   var subs=db.accounts.filter(function(s){return s.pid===m.id;});
+   var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
    var bal=subs.length?subs.reduce(function(s,x){return s+accBalRange(x.id,f,t2);},0):accBalRange(m.id,f,t2);
    aoa.push([m.name,bal]);
    subs.forEach(function(s){aoa.push(['  '+accN(s),accBalRange(s.id,f,t2)]);});
@@ -7523,8 +8226,29 @@ function bindEvents(){
    linkedAccId:(document.getElementById('c-acc')||{}).value||''
   };
   var arr=isSup?db.suppliers:db.customers,t=isSup?tSup:tCus;
-  if(t.editId){var obj=arr.find(function(x){return x.id===t.editId;});if(obj){Object.assign(obj,data);if(isSup&&supView&&supView.id===t.editId)supView=obj;else if(!isSup&&cusView&&cusView.id===t.editId)cusView=obj;}}
-  else{var nid=isSup?nextSUP():nextCUS();arr.push(Object.assign({id:nid},data));}
+  if(t.editId){
+   var obj=arr.find(function(x){return x.id===t.editId;});
+   if(obj){
+    Object.assign(obj,data);
+    // Keep an auto-generated sub-ledger account's name in sync with the
+    // contact's own name; a manually-linked account is left untouched.
+    if(obj.linkedAccId){
+     var linkedAcc=db.accounts.find(function(a){return a.id===obj.linkedAccId;});
+     if(linkedAcc&&linkedAcc.autoGen){linkedAcc.name=obj.name;linkedAcc.nameAr=obj.nameAr||'';}
+    }
+    if(isSup&&supView&&supView.id===t.editId)supView=obj;else if(!isSup&&cusView&&cusView.id===t.editId)cusView=obj;
+   }
+  } else {
+   var nid=isSup?nextSUP():nextCUS();
+   var newContact=Object.assign({id:nid},data);
+   // Auto-generate a dedicated sub-ledger account under Local/Foreign
+   // Customers or Suppliers when the user didn't manually pick one.
+   if(!newContact.linkedAccId){
+    var autoId=autoCreateContactAccount(db.accounts,isSup,newContact);
+    if(autoId)newContact.linkedAccId=autoId;
+   }
+   arr.push(newContact);
+  }
   modal=null;save();render();
  });
  // Settings
@@ -7561,6 +8285,10 @@ function bindEvents(){
   reader.readAsDataURL(file);
  });
  on1('btnDelLogo','click',function(){if(confirm('Remove logo?')){db.company.logo='';save();render();}});
+ wireImageUploadField('stampFile','stamp',220,220);
+ wireImageUploadField('signatureFile','signature',280,120);
+ on1('btnDelStamp','click',function(){var isAr=lang==='ar';if(confirm(isAr?'إزالة ختم الشركة؟':'Remove company stamp?')){db.company.stamp='';save();render();}});
+ on1('btnDelSignature','click',function(){var isAr=lang==='ar';if(confirm(isAr?'إزالة توقيع المدير المالي؟':'Remove signature?')){db.company.signature='';save();render();}});
 
  // ── User management handlers ──────────────────────────────
  on1('btnAddUser','click',function(){
@@ -7983,6 +8711,28 @@ function bindEvents(){
    if(info)info.innerHTML='<span style="color:var(--t2)">'+(lang==='ar'?'اكتب لبحث عن حساب...':'Type to search...')+'</span>';
   }
  });
+ // Balance Confirmation Letter's contact search — same resolve-on-input
+ // pattern as #c-acc-search above, but matching against customers AND
+ // suppliers together (unique "CUS-…"/"SUP-…" IDs let one box search both).
+ on('#cb-contact-search','input',function(el){
+  var val=el.value.trim();
+  var hidden=document.getElementById('cb-contact-resolved');
+  var info=document.getElementById('cb-contact-info');
+  var isAr2=lang==='ar';
+  if(!val){if(hidden)hidden.value='';if(info)info.textContent='';return;}
+  var allC=(db.customers||[]).map(function(c){return{id:c.id,name:c.name,nameAr:c.nameAr,isSup:false};})
+   .concat((db.suppliers||[]).map(function(s){return{id:s.id,name:s.name,nameAr:s.nameAr,isSup:true};}));
+  var found=allC.find(function(c){return c.id===val||val.startsWith(c.id+'|')||val.startsWith(c.id+' |');});
+  if(!found)found=allC.find(function(c){return val.indexOf(c.id)>-1;});
+  if(found){
+   if(hidden)hidden.value=found.id;
+   var typeLbl=isAr2?(found.isSup?'مورد':'عميل'):(found.isSup?'Supplier':'Customer');
+   if(info)info.innerHTML='<span style="color:var(--gn)">✅ '+found.id+' - '+(found.name||'')+(found.nameAr?' | '+found.nameAr:'')+' ('+typeLbl+')</span>';
+  } else {
+   if(hidden)hidden.value='';
+   if(info)info.innerHTML='<span style="color:var(--t2)">'+(isAr2?'اكتب للبحث عن عميل أو مورد...':'Type to search a customer or supplier...')+'</span>';
+  }
+ });
 
  // ── Budget Handlers ───────────────────────────────────────
  on('[data-budget-edit]','click',function(el){
@@ -8105,6 +8855,18 @@ function bindEvents(){
   if(act==='editPO'){var po2=(db.purchaseOrders||[]).find(function(p){return p.id===id;});if(po2){tPO=Object.assign({},po2,{editId:po2.id,items:po2.items?po2.items.map(function(i){return Object.assign({},i);}):[]});modal='po';render();}return;}
   if(act==='delPO'){if(id&&confirm('Delete PO '+id+'?')){db.purchaseOrders=(db.purchaseOrders||[]).filter(function(p){return p.id!==id;});saveDb();render();}return;}
   if(act==='printPO'){var po3=(db.purchaseOrders||[]).find(function(p){return p.id===id;});if(po3){var w2=window.open('','_blank');if(w2){var ph='<html><head><meta charset="UTF-8"><style>body{font-family:Arial;padding:20px}table{width:100%;border-collapse:collapse}td,th{border:1px solid #ddd;padding:6px}@media print{button{display:none}}</style></head><body>'+'<h2>Purchase Order: '+po3.id+'</h2>'+'<p>Date: '+po3.date+' | Supplier: '+(po3.supplierName||'—')+' | Status: '+po3.status+'</p>'+'<table><thead><tr><th>Item</th><th>Qty</th><th>Price</th><th>VAT%</th><th>Total</th></tr></thead><tbody>'+(po3.items||[]).map(function(it){return '<tr><td>'+it.desc+'</td><td>'+it.qty+'</td><td>'+N(it.price)+'</td><td>'+it.vat+'%</td><td>'+N(it.qty*it.price)+'</td></tr>';}).join('')+'</tbody></table>'+'<button onclick="window.print()">Print</button></body></html>';w2.document.write(ph);w2.document.close();}}return;}
+  if(act==='selectCo'){
+   if(id&&id!==getActiveCompanyId())switchToCompany(id);
+   else{coSwitcherOpen=false;render();}
+   return;
+  }
+  if(act==='addCo'){
+   var isAr2=lang==='ar';
+   var nm=prompt(isAr2?'اسم الشركة الجديدة:':'New company name:','');
+   if(nm&&nm.trim())addNewCompany(nm.trim());
+   else{coSwitcherOpen=false;render();}
+   return;
+  }
   window.xAction(act);
  });
  on1('poAddRow','click',function(){
@@ -8382,6 +9144,7 @@ window.save=save;
 loadDB().then(function(loaded){
  db=loaded;
  render();
+ upgradeSmallCompanyImages();
  // Restore a trainee's session automatically if Firebase already has one
  // persisted for this browser (so they don't have to log in every single
  // time they open the app — this also doubles as a live re-check: if the
