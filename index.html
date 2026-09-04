@@ -520,6 +520,118 @@ function addNewCompany(name){
  try{localStorage.setItem(coStorageKey(id),JSON.stringify(fresh));}catch(e){}
  switchToCompany(id);
 }
+// ── Trainee cloud sync (accounting-data/<uid>) ───────────────────────────
+// A trainee's actual bookkeeping data (accounts/journals/customers/
+// invoices/...) is mirrored to Firebase Realtime Database under
+// accounting-data/<their Firebase UID> — readable/writable only by that
+// UID (see firebase-rules.json), so it follows them to any device they log
+// into with the same license, with no one else (not even the admin panel)
+// able to see it. This is separate from HAS_CLOUD/fbRef above (an older,
+// still-inert mechanism that used one shared bucket for every device) and
+// from local admin/db.users logins, which stay 100% local exactly as
+// before — only a real trainee (Firebase) session gets cloud-synced.
+function traineeDataRef(uid){return firebase.database().ref('accounting-data/'+uid);}
+function loadTraineeCloudData(uid){
+ return traineeDataRef(uid).once('value').then(function(snap){
+  var val=snap.val();
+  db=(val&&Array.isArray(val.accounts))?normalizeDB(val):normalizeDB(JSON.parse(JSON.stringify(DEF)));
+  window.db=db;
+  render();
+  if(typeof upgradeSmallCompanyImages==='function')upgradeSmallCompanyImages();
+ }).catch(function(){
+  // Offline or a transient Firebase error: keep the trainee working on
+  // whatever's already in memory rather than blocking them; the next
+  // successful save() will sync their changes up once back online.
+  render();
+ });
+}
+// ── Admin (local login) cloud backup ─────────────────────────────────────
+// The local admin/user login (db.users) never goes through Firebase Auth,
+// so it has no uid of its own to key a cloud slot by. To back it up safely
+// anyway — WITHOUT auto-syncing/merging across devices (that risks a
+// "last save wins" data loss if two devices are used at once) — each
+// device silently creates (once) or reuses its own private, invisible
+// Firebase account, and every save() pushes a one-way backup copy of the
+// CURRENT company's data to accounting-data/<that uid>/<companyId> (same
+// path shape and security rules as trainees — a uid can only touch its own
+// subtree). Local data is always the source of truth on every device;
+// the cloud copy is only ever pulled back in when the user explicitly
+// clicks "Restore from Cloud". The generated credential is shown to the
+// user as a short copyable "link code" (see pBackup()) so they can link
+// the SAME cloud identity on another device on purpose, if they choose to.
+var ADMIN_CLOUD_CRED_KEY='ap7_admin_cloud_cred';
+function getAdminCloudCred(){
+ try{var s=localStorage.getItem(ADMIN_CLOUD_CRED_KEY);if(s)return JSON.parse(s);}catch(e){}
+ return null;
+}
+function setAdminCloudCred(cred){try{localStorage.setItem(ADMIN_CLOUD_CRED_KEY,JSON.stringify(cred));}catch(e){}}
+function encodeAdminCloudCode(cred){
+ try{return btoa(cred.email+'|'+cred.password);}catch(e){return '';}
+}
+function decodeAdminCloudCode(code){
+ try{
+  var s=atob(String(code||'').trim());
+  var i=s.indexOf('|');
+  if(i<0)return null;
+  return {email:s.slice(0,i),password:s.slice(i+1)};
+ }catch(e){return null;}
+}
+function getAdminCloudLinkCode(){
+ var cred=getAdminCloudCred();
+ return cred?encodeAdminCloudCode(cred):'';
+}
+function randomStr(n){
+ var chars='abcdefghijklmnopqrstuvwxyz0123456789';
+ var s='';
+ for(var i=0;i<n;i++)s+=chars[Math.floor(Math.random()*chars.length)];
+ return s;
+}
+function ensureAdminCloudAuth(){
+ if(typeof firebase==='undefined'||!firebase.auth)return Promise.reject(new Error('no-firebase'));
+ var auth=firebase.auth();
+ var cred=getAdminCloudCred();
+ if(cred){
+  return auth.signInWithEmailAndPassword(cred.email,cred.password).then(function(c){return c.user.uid;});
+ }
+ var email='admin-'+randomStr(12)+'@mizaniq-admin-backup.app';
+ var password=randomStr(20)+'A1!';
+ return auth.createUserWithEmailAndPassword(email,password).then(function(c){
+  setAdminCloudCred({email:email,password:password});
+  return c.user.uid;
+ });
+}
+// Best-effort, fire-and-forget — never blocks or alters the normal local
+// save() flow, and any failure (offline, etc.) is silently ignored since
+// the local save already succeeded.
+function backupAdminDataToCloud(){
+ if(typeof firebase==='undefined'||!firebase.auth)return;
+ ensureAdminCloudAuth().then(function(uid){
+  return firebase.database().ref('accounting-data/'+uid+'/'+getActiveCompanyId()).set(db);
+ }).catch(function(){});
+}
+function restoreAdminDataFromCloud(){
+ var isAr=lang==='ar';
+ if(typeof firebase==='undefined'||!firebase.auth){alert(isAr?'الاتصال بالسحابة غير متاح حاليًا.':'Cloud connection unavailable right now.');return;}
+ ensureAdminCloudAuth().then(function(uid){
+  return firebase.database().ref('accounting-data/'+uid+'/'+getActiveCompanyId()).once('value').then(function(snap){
+   var val=snap.val();
+   if(!val||!Array.isArray(val.accounts)){
+    alert(isAr?'لا توجد نسخة احتياطية سحابية لهذه الشركة بعد.':'No cloud backup found yet for this company.');
+    return;
+   }
+   if(!confirm(isAr?'سيتم استبدال بيانات هذه الشركة الحالية بالنسخة المحفوظة على السحابة. هل تريد المتابعة؟':'This will replace this company\'s current data with the cloud backup. Continue?')){
+    return;
+   }
+   db=normalizeDB(val);
+   window.db=db;
+   save();
+   render();
+   alert(isAr?'✅ تمت الاستعادة من السحابة بنجاح.':'✅ Restored from cloud successfully.');
+  });
+ }).catch(function(){
+  alert(isAr?'تعذر الاتصال بالسحابة. تأكد من اتصال الإنترنت.':'Could not reach the cloud. Check your internet connection.');
+ });
+}
 var backupReminderChecked=false; // set once per page load — see maybeShowBackupReminder()
 var cbState={contactId:''}; // Balance Confirmation Letter — see pConfirmBalance()
 var rptFrom='',rptTo='',rptLevel='all',rptShowCodes=false,rptLoaded=false; // report filters
@@ -682,14 +794,36 @@ function save(){
  clearTimeout(stimer);
  stimer=setTimeout(function(){
   var el=document.getElementById('sv');
-  // Always save locally as instant backup — under THIS company's own key,
-  // and mirror db.users into the shared global store so logins/permissions
-  // stay identical no matter which company is currently open.
+  // A trainee (Firebase) session: their data lives ONLY in their own
+  // private accounting-data/<uid> node in the cloud — deliberately never
+  // written into this device's local company slots below, so it can never
+  // leak into a different login on a shared computer. See doLogout() and
+  // loadTraineeCloudData() for the matching load-side isolation.
+  if(window.mizanCurrentTrainee&&window.mizanCurrentTrainee.uid){
+   if(el)el.textContent='Saving to cloud...';
+   traineeDataRef(window.mizanCurrentTrainee.uid).set(db).then(function(){
+    lastSave=new Date();
+    var el2=document.getElementById('sv');
+    if(el2)el2.textContent='☁️ Synced '+lastSave.toLocaleTimeString();
+   }).catch(function(){
+    lastSave=new Date();
+    var el3=document.getElementById('sv');
+    if(el3)el3.textContent='⚠️ Save failed — check your connection '+lastSave.toLocaleTimeString();
+   });
+   return;
+  }
+  // Local admin/user session (unchanged): save locally as instant backup
+  // — under THIS company's own key, and mirror db.users into the shared
+  // global store so logins/permissions stay identical no matter which
+  // company is currently open.
   try{
    saveGlobalUsers(db.users);
    localStorage.setItem(coStorageKey(getActiveCompanyId()),JSON.stringify(db));
    localStorage.setItem('ap7',JSON.stringify(db)); // legacy key, kept as an extra safety copy
   }catch(e){}
+  // One-way cloud backup of this admin installation's current company —
+  // never blocks/overrides the local save above. See ensureAdminCloudAuth().
+  backupAdminDataToCloud();
   if(HAS_CLOUD&&fbRef){
    if(el)el.textContent='Saving to cloud...';
    skipNextRemote=true;
@@ -1193,7 +1327,20 @@ var DEFAULT_ADMIN = {id:'admin',username:'admin',password:'admin123',name:'Admin
 function getUsers(){return db.users||[];}
 function getUserPerms(user){if(!user||user.role==='admin')return null;return user.perms||{};}
 function canDo(module,action){var actMap={view:'v',add:'a',edit:'e','delete':'d'};return can(module,actMap[action]||action);}
-function doLogout(){currentUser=null;clearSession();render();}
+function doLogout(){
+ currentUser=null;
+ clearSession();
+ // If this was a trainee (cloud) session, sign out of Firebase too and drop
+ // their cloud data from memory — reload whatever local/admin data this
+ // device has, so it never lingers into a different login on a shared
+ // computer.
+ if(window.mizanCurrentTrainee){
+  window.mizanCurrentTrainee=null;
+  if(window.mizanAuth)window.mizanAuth.signOut().catch(function(){});
+  try{db=loadFromLocalStorage();window.db=db;}catch(e){}
+ }
+ render();
+}
 
 
 
@@ -1518,8 +1665,10 @@ function render(){
        currentUser={id:cred.user.uid,username:prof.username||uv,name:prof.username||uv,role:'user',active:true,perms:{}};
        window.mizanCurrentTrainee={uid:cred.user.uid,licenseKey:prof.licenseKey};
        try{localStorage.setItem('mizan_license',JSON.stringify({key:prof.licenseKey,valid:true,firebaseManaged:true,expiry:lic.expiry||'',activatedAt:new Date().toISOString()}));}catch(e3){}
-       bEl.disabled=false;
-       render();
+       // Load THIS trainee's own private accounting data from the cloud
+       // (accounting-data/<uid>) so it follows them to whichever device
+       // they log into — never the local admin/browser data.
+       return loadTraineeCloudData(cred.user.uid).then(function(){bEl.disabled=false;});
       });
      });
     }).catch(function(err){
@@ -6213,8 +6362,8 @@ function pBackup(){
  h+='<div class="pg"><div class="card" style="max-width:660px">';
  h+='<div style="font-size:13px;color:var(--t2);margin-bottom:16px;line-height:1.8">'
   +(isAr
-   ?'بيانات البرنامج (الحسابات والقيود والفواتير والعملاء...) محفوظة فقط على هذا الجهاز/المتصفح، وليست مرفوعة لأى سيرفر. صدّر نسخة احتياطية بشكل دورى واحفظها فى مكان آمن، حتى لا تفقد بياناتك عند تغيير الجهاز أو عمل فورمات أو مسح بيانات المتصفح.'
-   :'Program data (accounts, journals, invoices, customers...) is stored only on this device/browser, not on any server. Export a backup regularly and keep it somewhere safe, so you don\'t lose your data if you change devices, reformat, or clear browser data.')
+   ?'بيانات البرنامج (الحسابات والقيود والفواتير والعملاء...) محفوظة أساسًا على هذا الجهاز/المتصفح (وتُنسخ احتياطيًا للسحابة تلقائيًا أيضًا — انظر الأسفل). صدّر نسخة احتياطية يدوية بشكل دورى واحفظها فى مكان آمن كطبقة حماية إضافية.'
+   :'Program data (accounts, journals, invoices, customers...) is stored primarily on this device/browser (and is also backed up to the cloud automatically — see below). Still export a manual backup regularly and keep it somewhere safe as an extra layer of protection.')
   +'</div>';
  var lastAt=null;
  try{lastAt=localStorage.getItem('mizan_last_backup_at');}catch(e){}
@@ -6226,7 +6375,29 @@ function pBackup(){
   +'<button class="btn bp" data-action="exportBackup">⬇️ '+(isAr?'تصدير نسخة احتياطية':'Export Backup')+'</button>'
   +'<label class="btn bdr" for="importBackupFile" style="cursor:pointer;margin:0;display:inline-flex;align-items:center">⬆️ '+(isAr?'استيراد نسخة احتياطية':'Import Backup')+'</label>'
   +'<input type="file" id="importBackupFile" accept=".json,application/json" style="display:none">'
-  +'</div></div></div>';
+  +'</div></div>';
+ var linkCode=getAdminCloudLinkCode();
+ h+='<div class="card" style="max-width:660px">'
+  +'<div class="ct">☁️ '+(isAr?'النسخ الاحتياطي السحابي':'Cloud Backup')+'</div>'
+  +'<div style="font-size:13px;color:var(--t2);margin-bottom:16px;line-height:1.8">'
+  +(isAr
+   ?'يقوم البرنامج تلقائيًا برفع نسخة احتياطية من بيانات هذه الشركة إلى السحابة عند كل حفظ. بياناتك المحلية تبقى دائمًا هي المرجع الأساسي على هذا الجهاز — النسخة السحابية تُستعاد يدويًا فقط عند الضغط على الزر أدناه، ولن تستبدل بياناتك تلقائيًا أبدًا.'
+   :'The program automatically uploads a backup of this company\'s data to the cloud on every save. Your local data on this device always stays the source of truth — the cloud copy is only ever pulled back in manually with the button below, never automatically.')
+  +'</div>'
+  +'<div style="margin-bottom:14px">'
+  +'<label style="font-size:12px;font-weight:600;color:var(--t2);display:block;margin-bottom:5px">'+(isAr?'رمز ربط هذا الجهاز بالسحابة (احتفظ به لربط جهاز آخر بنفس بياناتك):':'This device\'s cloud link code (keep it to link another device to the same data):')+'</label>'
+  +'<div style="display:flex;gap:8px">'
+  +'<input id="cloudLinkCode" type="text" readonly value="'+linkCode+'" placeholder="'+(isAr?'سيظهر الرمز بعد أول عملية حفظ':'Appears after the first save')+'" style="flex:1;padding:8px 10px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;font-family:monospace;background:var(--bg);color:var(--tx)">'
+  +'<button class="btn bdr bsm" id="btnCopyCloudCode">📋 '+(isAr?'نسخ':'Copy')+'</button>'
+  +'</div></div>'
+  +'<div style="margin-bottom:14px">'
+  +'<label style="font-size:12px;font-weight:600;color:var(--t2);display:block;margin-bottom:5px">'+(isAr?'ربط هذا الجهاز برمز من جهاز آخر:':'Link this device with a code from another device:')+'</label>'
+  +'<div style="display:flex;gap:8px">'
+  +'<input id="cloudLinkInput" type="text" placeholder="'+(isAr?'الصق الرمز هنا':'Paste code here')+'" style="flex:1;padding:8px 10px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;font-family:monospace">'
+  +'<button class="btn bdr bsm" id="btnLinkCloudCode">🔗 '+(isAr?'ربط':'Link')+'</button>'
+  +'</div></div>'
+  +'<button class="btn bp" id="btnRestoreCloud">☁️⬇️ '+(isAr?'استعادة من السحابة الآن':'Restore from Cloud Now')+'</button>'
+  +'</div></div>';
  return h;
 }
 
@@ -6521,7 +6692,7 @@ window.xAction=function(type){
  // real security rules would now reject anyway.
  if(type==='cancelModal'){modal=null;render();return;}
  if(type==='toggleLang'){setLang(lang==='ar'?'en':'ar');return;}
- if(type==='logout'){currentUser=null;clearSession();render();return;}
+ if(type==='logout'){doLogout();return;}
  if(type==='switchCo'){coSwitcherOpen=!coSwitcherOpen;render();return;}
  if(type==='saveSettings'){
   var name=((document.getElementById('s-name')||{}).value||'').trim();
@@ -8257,6 +8428,28 @@ function bindEvents(){
   if(file)importBackupFile(file);
   e.target.value=''; // allow re-selecting the same file next time
  });
+ on1('btnCopyCloudCode','click',function(){
+  var isAr=lang==='ar';
+  var inp=document.getElementById('cloudLinkCode');
+  var code=inp?inp.value:'';
+  if(!code){alert(isAr?'لا يوجد رمز بعد — احفظ أي تعديل أولًا ثم أعد المحاولة.':'No code yet — save any change first, then try again.');return;}
+  var done=function(){alert(isAr?'✅ تم نسخ الرمز.':'✅ Code copied.');};
+  if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(code).then(done).catch(function(){if(inp){inp.select();document.execCommand('copy');done();}});}
+  else if(inp){inp.select();document.execCommand('copy');done();}
+ });
+ on1('btnLinkCloudCode','click',function(){
+  var isAr=lang==='ar';
+  var inp=document.getElementById('cloudLinkInput');
+  var code=inp?inp.value.trim():'';
+  if(!code)return;
+  var cred=decodeAdminCloudCode(code);
+  if(!cred||!cred.email||!cred.password){alert(isAr?'رمز غير صالح.':'Invalid code.');return;}
+  if(!confirm(isAr?'سيتم ربط هذا الجهاز بنفس هوية النسخ الاحتياطي السحابي لهذا الرمز. متابعة؟':'This device will be linked to the same cloud backup identity as this code. Continue?'))return;
+  setAdminCloudCred(cred);
+  render();
+  alert(isAr?'✅ تم الربط. اضغط "استعادة من السحابة الآن" لجلب البيانات.':'✅ Linked. Click "Restore from Cloud Now" to pull the data.');
+ });
+ on1('btnRestoreCloud','click',function(){restoreAdminDataFromCloud();});
  on1('logoFile','change',function(e){
   var file=e.target.files[0];if(!file)return;
   var reader=new FileReader();
@@ -8810,7 +9003,7 @@ function bindEvents(){
   trainingState.scenarioId=null;
   render();
  });
- on1('btnLogout','click',function(){currentUser=null;clearSession();render();});
+ on1('btnLogout','click',function(){doLogout();});
  on1('btnSaveSettings','click',function(){
   var name=((document.getElementById('s-name')||{}).value||'').trim();
   if(!name){alert('Company name required.');return;}
@@ -9165,7 +9358,7 @@ loadDB().then(function(loaded){
      currentUser={id:fbUser.uid,username:prof.username,name:prof.username,role:'user',active:true,perms:{}};
      window.mizanCurrentTrainee={uid:fbUser.uid,licenseKey:prof.licenseKey};
      try{localStorage.setItem('mizan_license',JSON.stringify({key:prof.licenseKey,valid:true,firebaseManaged:true,expiry:lic.expiry||'',activatedAt:new Date().toISOString()}));}catch(e4){}
-     render();
+     loadTraineeCloudData(fbUser.uid);
     });
    }).catch(function(){});
   });
