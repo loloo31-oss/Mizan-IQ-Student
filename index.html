@@ -399,11 +399,24 @@ var COMP_REG_KEY='ap7_companies';
 var ACTIVE_CO_KEY='ap7_active_company';
 var USERS_KEY='ap7_users_global';
 function coStorageKey(id){return 'ap7_co_'+id;}
+// Trainee (Firebase) sessions keep their company registry in the cloud
+// (accounting-data/<uid>/companies) instead of localStorage, so the same
+// list of companies follows them to any device — see loadTraineeCloudData().
+// window.mizanTraineeCompanies is just an in-memory cache of that cloud
+// value; every write goes straight back to Firebase too.
 function getCompanyRegistry(){
+ if(window.mizanCurrentTrainee&&window.mizanCurrentTrainee.uid)return window.mizanTraineeCompanies||null;
  try{var s=localStorage.getItem(COMP_REG_KEY);if(s){var a=JSON.parse(s);if(Array.isArray(a))return a;}}catch(e){}
  return null;
 }
-function saveCompanyRegistry(list){try{localStorage.setItem(COMP_REG_KEY,JSON.stringify(list));}catch(e){}}
+function saveCompanyRegistry(list){
+ if(window.mizanCurrentTrainee&&window.mizanCurrentTrainee.uid){
+  window.mizanTraineeCompanies=list;
+  try{firebase.database().ref('accounting-data/'+window.mizanCurrentTrainee.uid+'/companies').set(list);}catch(e){}
+  return;
+ }
+ try{localStorage.setItem(COMP_REG_KEY,JSON.stringify(list));}catch(e){}
+}
 function getActiveCompanyId(){try{return localStorage.getItem(ACTIVE_CO_KEY)||'';}catch(e){return '';}}
 function setActiveCompanyId(id){try{localStorage.setItem(ACTIVE_CO_KEY,id);}catch(e){}}
 function getGlobalUsers(){
@@ -500,6 +513,19 @@ function switchToCompany(id){
  view='dashboard';modal=null;
  tAcc={};tJE={};tInv={};tCus={};tSup={};tRcpt={};tPymt={};tCC={};tUser={};
  tFAEdit={};tFA=null;tLocEdit={};
+ // A trainee's companies live only in the cloud (accounting-data/<uid>/<id>)
+ // — fetch this one's data directly rather than going through loadDB(),
+ // which only knows about this device's local company slots.
+ if(window.mizanCurrentTrainee&&window.mizanCurrentTrainee.uid){
+  firebase.database().ref('accounting-data/'+window.mizanCurrentTrainee.uid+'/'+id).once('value').then(function(snap){
+   var val=snap.val();
+   db=(val&&Array.isArray(val.accounts))?normalizeDB(val):normalizeDB(JSON.parse(JSON.stringify(DEF)));
+   window.db=db;
+   render();
+   if(typeof upgradeSmallCompanyImages==='function')upgradeSmallCompanyImages();
+  }).catch(function(){render();});
+  return;
+ }
  loadDB().then(function(loaded){
   db=loaded;
   render();
@@ -507,7 +533,9 @@ function switchToCompany(id){
  });
 }
 // Creates a brand-new, empty company (standard chart of accounts, no
-// transactions) registers it, and switches to it.
+// transactions) registers it, and switches to it. For a trainee session
+// the fresh company's data is written straight to the cloud (their local
+// device never holds a copy of it) instead of localStorage.
 function addNewCompany(name){
  var reg=getCompanyRegistry()||[];
  var id='co'+Date.now();
@@ -515,9 +543,13 @@ function addNewCompany(name){
  saveCompanyRegistry(reg);
  var fresh=normalizeDB(JSON.parse(JSON.stringify(DEF)));
  fresh.company.name=name;
- var gu=getGlobalUsers();
- if(gu)fresh.users=gu; else saveGlobalUsers(fresh.users);
- try{localStorage.setItem(coStorageKey(id),JSON.stringify(fresh));}catch(e){}
+ if(window.mizanCurrentTrainee&&window.mizanCurrentTrainee.uid){
+  try{firebase.database().ref('accounting-data/'+window.mizanCurrentTrainee.uid+'/'+id).set(fresh);}catch(e){}
+ } else {
+  var gu=getGlobalUsers();
+  if(gu)fresh.users=gu; else saveGlobalUsers(fresh.users);
+  try{localStorage.setItem(coStorageKey(id),JSON.stringify(fresh));}catch(e){}
+ }
  switchToCompany(id);
 }
 // ── Trainee cloud sync (accounting-data/<uid>) ───────────────────────────
@@ -530,11 +562,50 @@ function addNewCompany(name){
 // still-inert mechanism that used one shared bucket for every device) and
 // from local admin/db.users logins, which stay 100% local exactly as
 // before — only a real trainee (Firebase) session gets cloud-synced.
-function traineeDataRef(uid){return firebase.database().ref('accounting-data/'+uid);}
+//
+// Multi-company for trainees mirrors the local-admin design (see "Multi-
+// company support" above) but keeps EVERYTHING in the cloud instead of
+// localStorage, so it's device-independent like the rest of trainee sync:
+//   accounting-data/<uid>/companies   → the registry [{id,name}, ...]
+//   accounting-data/<uid>/<companyId> → that company's own full data set
+// getCompanyRegistry()/saveCompanyRegistry()/switchToCompany()/
+// addNewCompany() are already trainee-aware (they branch on
+// window.mizanCurrentTrainee), so the existing company-switcher UI works
+// unchanged for trainees too. Only the "which company am I looking at
+// right now" pointer (getActiveCompanyId()) stays a plain per-device
+// localStorage value — that's just transient UI state, not data, so it
+// doesn't need to follow the trainee across devices.
+function traineeCoRef(uid,id){return firebase.database().ref('accounting-data/'+uid+'/'+id);}
 function loadTraineeCloudData(uid){
- return traineeDataRef(uid).once('value').then(function(snap){
-  var val=snap.val();
-  db=(val&&Array.isArray(val.accounts))?normalizeDB(val):normalizeDB(JSON.parse(JSON.stringify(DEF)));
+ var rootRef=firebase.database().ref('accounting-data/'+uid);
+ return rootRef.once('value').then(function(snap){
+  var root=snap.val()||{};
+  var reg=Array.isArray(root.companies)?root.companies:null;
+  if(reg&&reg.length){
+   window.mizanTraineeCompanies=reg;
+   var activeId=getActiveCompanyId();
+   if(!activeId||!reg.some(function(c){return c.id===activeId;}))activeId=reg[0].id;
+   setActiveCompanyId(activeId);
+   var coVal=root[activeId];
+   db=(coVal&&Array.isArray(coVal.accounts))?normalizeDB(coVal):normalizeDB(JSON.parse(JSON.stringify(DEF)));
+   return null;
+  }
+  // No registry yet: either this trainee's very first login ever, or an
+  // account created before multi-company support existed (their one
+  // company's data sits directly at this same root node, alongside where
+  // "companies" now lives) — migrate it into "Company 1" once, in place.
+  var id='co1';
+  var legacy=Array.isArray(root.accounts)?root:null;
+  var data=legacy?normalizeDB(legacy):normalizeDB(JSON.parse(JSON.stringify(DEF)));
+  var name=(legacy&&legacy.company&&legacy.company.name)||'Company 1';
+  var newReg=[{id:id,name:name}];
+  window.mizanTraineeCompanies=newReg;
+  setActiveCompanyId(id);
+  db=data;
+  return rootRef.child('companies').set(newReg).then(function(){
+   return rootRef.child(id).set(data);
+  });
+ }).then(function(){
   window.db=db;
   render();
   if(typeof upgradeSmallCompanyImages==='function')upgradeSmallCompanyImages();
@@ -795,13 +866,15 @@ function save(){
  stimer=setTimeout(function(){
   var el=document.getElementById('sv');
   // A trainee (Firebase) session: their data lives ONLY in their own
-  // private accounting-data/<uid> node in the cloud — deliberately never
-  // written into this device's local company slots below, so it can never
-  // leak into a different login on a shared computer. See doLogout() and
-  // loadTraineeCloudData() for the matching load-side isolation.
+  // private accounting-data/<uid>/<companyId> node in the cloud —
+  // deliberately never written into this device's local company slots
+  // below, so it can never leak into a different login on a shared
+  // computer. See doLogout() and loadTraineeCloudData() for the matching
+  // load-side isolation, and switchToCompany()/addNewCompany() for how a
+  // trainee's own multi-company list is kept in the cloud alongside it.
   if(window.mizanCurrentTrainee&&window.mizanCurrentTrainee.uid){
    if(el)el.textContent='Saving to cloud...';
-   traineeDataRef(window.mizanCurrentTrainee.uid).set(db).then(function(){
+   traineeCoRef(window.mizanCurrentTrainee.uid,getActiveCompanyId()).set(db).then(function(){
     lastSave=new Date();
     var el2=document.getElementById('sv');
     if(el2)el2.textContent='☁️ Synced '+lastSave.toLocaleTimeString();
@@ -1336,6 +1409,7 @@ function doLogout(){
  // computer.
  if(window.mizanCurrentTrainee){
   window.mizanCurrentTrainee=null;
+  window.mizanTraineeCompanies=null;
   if(window.mizanAuth)window.mizanAuth.signOut().catch(function(){});
   try{db=loadFromLocalStorage();window.db=db;}catch(e){}
  }
@@ -4148,7 +4222,17 @@ function pJournal(){
  // ── Content area ─────────────────────────────────────────
  var content='';
 
- if(jeState.mode==='list'||total===0){
+ // 'new' mode must render the inline entry form even when there are
+ // zero journal entries yet (total===0) — it builds its form purely from
+ // tJE, not from an existing entry, so an empty journal must not force it
+ // back to the "list" branch below. Before this fix, any brand-new
+ // company/trainee (whose journal list starts empty — see the DEF seed
+ // cleanup) could click ➕ New and see... nothing happen: the Save/Cancel
+ // toolbar buttons would appear, but the content area stayed stuck on the
+ // "no entries yet" empty state, since total===0 short-circuited straight
+ // past the new-entry form below regardless of jeState.mode. This was the
+ // actual "adding a journal entry doesn't work" bug for any fresh company.
+ if(jeState.mode==='list'||(total===0&&jeState.mode!=='new')){
   // Show list/grid of all entries with pagination
   var pg=pagerSlice(allJE,'journal');
   content+='<div style="font-size:12px;color:var(--t2);margin-bottom:8px;padding:0 4px">'
@@ -4183,7 +4267,10 @@ function pJournal(){
  } else {
   // ── View/Edit a single entry ────────────────────────────
   var je=allJE[jeState.currentIdx]||allJE[0];
-  if(!je){content='<div class="es">Not found</div>';}
+  // 'new' mode has no existing entry to look up (it's building one from
+  // scratch in tJE below) so a missing je must not be treated as an error
+  // here — only 'view'/'edit' actually need one.
+  if(!je&&jeState.mode!=='new'){content='<div class="es">Not found</div>';}
   else if(jeState.mode==='view'){
    // View mode — read only display
    var tD2=je.lines.reduce(function(s,l){return s+(l.dr||0);},0);
@@ -6702,6 +6789,17 @@ window.xAction=function(type){
   var vc=((document.getElementById('s-vatcustom')||{}).value||'').trim();
   var vs=(document.getElementById('s-vatrate')||{}).value||'15';
   db.company.name=name;
+  // Keep the company-switcher's registry entry (its display name in the
+  // ⇄ dropdown) in sync with a rename here — works the same way for a
+  // local company and a trainee's cloud-stored one, since getCompanyRegistry
+  // /saveCompanyRegistry() already route to the right place for each.
+  (function(){
+   var regNow=getCompanyRegistry(),idNow=getActiveCompanyId(),changed=false;
+   if(regNow&&regNow.length){
+    regNow=regNow.map(function(c){if(c.id===idNow&&c.name!==name){changed=true;return {id:c.id,name:name};}return c;});
+    if(changed)saveCompanyRegistry(regNow);
+   }
+  })();
   db.company.address=((document.getElementById('s-addr')||{}).value||'').trim();
   db.company.cr=((document.getElementById('s-cr')||{}).value||'').trim();
   db.company.phone=((document.getElementById('s-phone')||{}).value||'').trim();
@@ -7454,6 +7552,20 @@ function bindEvents(){
  on('[data-delje]','click',function(el){if(confirm('Delete?')){db.journals=db.journals.filter(function(j){return j.id!==el.dataset.delje;});save();render();}});
  on1('addJELine','click',function(){tJE.lines.push({acc:'',dr:'',cr:''});render();});
  on('[data-rmjl]','click',function(el){tJE.lines.splice(Number(el.dataset.rmjl),1);render();});
+
+ // Date/description must be synced into tJE on every keystroke, not just
+ // read at save time — selecting an account (.jeA change, below) or
+ // adding/removing a line calls render() while the form is still open,
+ // which rebuilds the whole entry from tJE and would otherwise silently
+ // wipe out whatever the user had already typed here (this was the actual
+ // cause of "adding a journal entry doesn't work": type a description,
+ // then pick an account, and the description used to vanish, leaving
+ // nothing for jeSave to read except the "enter a description" error).
+ // (on1 hands its callback the raw Event, not the element — re-querying by
+ // id, like the existing on1('coaSearch','input',...) above does, is the
+ // established pattern here.)
+ on1('j-date','input',function(){var el=document.getElementById('j-date');if(el)tJE.date=el.value;});
+ on1('j-desc','input',function(){var el=document.getElementById('j-desc');if(el)tJE.desc=el.value;});
 
  on('.jeD','input',function(el){tJE.lines[Number(el.dataset.i)].dr=el.value;calcVATLines();jeHint();});
  on('.jeC','input',function(el){tJE.lines[Number(el.dataset.i)].cr=el.value;calcVATLines();jeHint();});
