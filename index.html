@@ -6503,7 +6503,7 @@ function contactDetail(c,isSup){
  [['Bldg.',c.buildingNo||'—'],['Street',c.street||'—'],['District',c.district||'—'],['City',c.city||'—'],['Country',c.country||'—']].forEach(function(r){h+='<div class="rr"><span style="color:var(--t2);font-size:12px">'+r[0]+'</span><span>'+r[1]+'</span></div>';});
  h+='<div style="padding-top:6px;border-top:1px solid var(--bd);font-size:11px;color:var(--t2);">'+(addr||'No address')+'</div></div></div>';
  h+='<div class="card" style="margin-bottom:14px"><div class="ct">🔗 Linked Account</div>';
- if(la)h+='<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><span class="tag">'+la.id+'</span><strong>'+(par?par.name+' / ':'')+la.name+'</strong>'+tbadge(la.type)+'<span class="mn" style="font-size:12px;color:var(--t2)">Bal: '+fmt(la.bal)+'</span><button class="btn bsm bg0" data-gotostmt="'+la.id+'">'+ic('doc')+' Statement</button></div>';
+ if(la)h+='<div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap"><span class="tag">'+la.id+'</span><strong>'+(par?par.name+' / ':'')+la.name+'</strong>'+tbadge(la.type)+'<span class="mn" style="font-size:12px;color:var(--t2)">Bal: '+fmt(accBalRange(la.id))+'</span><button class="btn bsm bg0" data-gotostmt="'+la.id+'">'+ic('doc')+' Statement</button></div>';
  else h+='<span style="color:var(--t3);font-size:13px">No account linked.</span>';
  h+='</div>';
  if(!isSup){
@@ -8343,12 +8343,33 @@ function bindEvents(){
   var sub2=((document.getElementById('v-accsub')||{}).value||'').trim();
   var desc=((document.getElementById('v-desc')||{}).value||'').trim();
   var obj={ref:ref,date:date,amount:amount,desc:desc};
+  // "Counter Account" is optional in the UI, but a receipt/payment against
+  // a customer/supplier is meaningless accounting-wise without one — with
+  // it left blank the money only ever hit the bank side (accTo/accFrom on
+  // the asset account) and never touched the party's own receivable/payable
+  // account, so their balance silently never moved even though the voucher
+  // looked complete. Every customer/supplier already gets an auto-created
+  // linkedAccId, so default the counter account to that whenever a party
+  // was picked and no counter account was chosen explicitly.
+  var isAr2=lang==='ar';
   if(isR){
-   obj.accTo=accMain;if(sub2)obj.accFrom=sub2;obj.clientId=pId;obj.fromName=pName;
+   var counterR=sub2;
+   if(!counterR&&pId){
+    var cusR=db.customers.find(function(x){return x.id===pId;});
+    if(cusR&&cusR.linkedAccId)counterR=cusR.linkedAccId;
+   }
+   if(pId&&!counterR){alert(isAr2?'⚠️ لا يوجد حساب مرتبط بهذا العميل، لذلك لن ينخفض رصيده. الرجاء ربط حساب للعميل أولاً من صفحة العملاء.':'⚠️ This customer has no linked account, so their balance will not decrease. Please link an account for the customer first (Customers page).');}
+   obj.accTo=accMain;if(counterR)obj.accFrom=counterR;obj.clientId=pId;obj.fromName=pName;
    if(tRcpt&&tRcpt.editId){var rv=db.receipts.find(function(x){return x.ref===tRcpt.editId;});if(rv)Object.assign(rv,obj);}
    else db.receipts.push(obj);
   } else {
-   obj.accFrom=accMain;if(sub2)obj.accTo=sub2;obj.supplierId=pId;obj.toName=pName;
+   var counterP=sub2;
+   if(!counterP&&pId){
+    var supP=db.suppliers.find(function(x){return x.id===pId;});
+    if(supP&&supP.linkedAccId)counterP=supP.linkedAccId;
+   }
+   if(pId&&!counterP){alert(isAr2?'⚠️ لا يوجد حساب مرتبط بهذا المورد، لذلك لن ينخفض رصيده. الرجاء ربط حساب للمورد أولاً من صفحة الموردين.':'⚠️ This supplier has no linked account, so their balance will not decrease. Please link an account for the supplier first (Suppliers page).');}
+   obj.accFrom=accMain;if(counterP)obj.accTo=counterP;obj.supplierId=pId;obj.toName=pName;
    if(tPymt&&tPymt.editId){var pv=db.payments.find(function(x){return x.ref===tPymt.editId;});if(pv)Object.assign(pv,obj);}
    else db.payments.push(obj);
   }
@@ -8683,6 +8704,7 @@ function bindEvents(){
  on('.itAccSearch','focus',function(el){
   var drop=document.getElementById(el.id+'-drop');
   if(drop){drop.style.display='block';}
+  el.select();
  });
  on('.itAccSearch','input',function(el){
   var q=el.value.toLowerCase().trim();
@@ -8708,6 +8730,13 @@ function bindEvents(){
   setTimeout(function(){
    var drop=document.getElementById(el.id+'-drop');
    if(drop)drop.style.display='none';
+   // Snap the visible text back to whatever is actually saved in the
+   // hidden id field — if the user typed a search query and clicked
+   // away without picking an option from the list, the box should not
+   // be left showing stray half-typed text next to an unrelated saved id.
+   var hid=document.getElementById(el.id+'-id');
+   var a=hid&&hid.value?db.accounts.find(function(x){return x.id===hid.value;}):null;
+   el.value=a?(a.id+' - '+accN(a)):'';
   },200);
  });
  on('.itAccSearch','keydown',function(el,e){
@@ -8716,8 +8745,12 @@ function bindEvents(){
   if(e.key==='ArrowDown'){e.preventDefault();sel.focus();}
   if(e.key==='Enter'){
    e.preventDefault();
+   // Accept the top visible match, not only when the search narrowed to
+   // exactly one — requiring an exact single match made Enter silently
+   // do nothing for most real searches (e.g. several accounts sharing a
+   // code prefix), which is what made typing feel unresponsive.
    var opts=Array.from(sel.querySelectorAll('option')).filter(function(o){return o.style.display!=='none';});
-   if(opts.length===1){
+   if(opts.length>=1){
     var a=db.accounts.find(function(x){return x.id===opts[0].value;});
     if(a){el.value=a.id+' - '+accN(a);}
     var hid=document.getElementById(el.id+'-id');
