@@ -2524,6 +2524,50 @@ function nextPI(){return 'PI-'+String((db.purchaseInvoices||[]).length+1).padSta
 function nextSI(){return 'SI-'+String((db.salesInvoices2||[]).length+1).padStart(4,'0');}
 function nextItemId(){return 'IT-'+String((db.items||[]).length+1).padStart(3,'0');}
 function itemById(id){return (db.items||[]).find(function(x){return x.id===id;});}
+// ── Credit Note / Debit Note support (invoice-linked returns) ───────────
+// A return is always tied to one specific original, POSTED invoice
+// (origInvId for a sales return, origPiId for a purchase return) rather
+// than being a free-standing manual entry. These helpers find that
+// customer's/supplier's eligible original invoices, and compute how much
+// of a given line is still returnable (original qty minus whatever has
+// already been returned against it in other posted — or the same
+// in-progress draft, which is excluded via excludeId — return documents),
+// so the same units can never be returned twice.
+function postedSalesForCustomer(custId){
+ return (db.salesInvoices2||[]).filter(function(s){return s.customerId===custId&&s.type!=='return'&&s.posted;});
+}
+function returnedQtyAgainstSale(origInvId,itemId,excludeId){
+ return (db.salesInvoices2||[]).filter(function(s){return s.type==='return'&&s.origInvId===origInvId&&s.id!==excludeId;})
+  .reduce(function(sum,r){return sum+(r.lines||[]).filter(function(l){return l.itemId===itemId;}).reduce(function(s2,l){return s2+(l.qty||0);},0);},0);
+}
+function postedPurchasesForSupplier(supId){
+ return (db.purchaseInvoices||[]).filter(function(p){return p.supplierId===supId&&p.type!=='return'&&p.posted;});
+}
+function returnedQtyAgainstPurchase(origPiId,itemId,excludeId){
+ return (db.purchaseInvoices||[]).filter(function(p){return p.type==='return'&&p.origPiId===origPiId&&p.id!==excludeId;})
+  .reduce(function(sum,r){return sum+(r.lines||[]).filter(function(l){return l.itemId===itemId;}).reduce(function(s2,l){return s2+(l.qty||0);},0);},0);
+}
+// Builds the returnable-lines array for a sales return from its original
+// invoice: one row per original line still having returnable qty, capped
+// by what's already been returned elsewhere, defaulting to "return all
+// remaining". excludeId lets an in-progress draft re-derive this without
+// counting its own previous qty as already returned.
+function buildSIReturnLines(origInv,excludeId){
+ if(!origInv)return [];
+ return (origInv.lines||[]).map(function(l){
+  var already=returnedQtyAgainstSale(origInv.id,l.itemId,excludeId);
+  var maxQty=Math.max(0,(l.qty||0)-already);
+  return {itemId:l.itemId,qty:maxQty,price:l.price,vat:l.vat,origQty:l.qty,maxQty:maxQty,costAtSale:l.costAtSale||0};
+ }).filter(function(l){return l.maxQty>0;});
+}
+function buildPIReturnLines(origPi,excludeId){
+ if(!origPi)return [];
+ return (origPi.lines||[]).map(function(l){
+  var already=returnedQtyAgainstPurchase(origPi.id,l.itemId,excludeId);
+  var maxQty=Math.max(0,(l.qty||0)-already);
+  return {itemId:l.itemId,qty:maxQty,cost:l.cost,vat:l.vat,origQty:l.qty,maxQty:maxQty};
+ }).filter(function(l){return l.maxQty>0;});
+}
 function receiveStock(itemId,qty,cost){
  var it=itemById(itemId);if(!it)return;
  var oldQty=it.qty||0;
@@ -3080,7 +3124,7 @@ function mItem(){
 function mPurchaseInvoice(isReturn){
  var pi=tPI;
  var isAr=lang==='ar';
- var title=(isReturn?(isAr?'مرتجع مشتريات':'Purchase Return'):(isAr?'فاتورة مشتريات':'Purchase Invoice'));
+ var title=(isReturn?(isAr?'إشعار مدين (مرتجع مشتريات)':'Debit Note (Purchase Return)'):(isAr?'فاتورة مشتريات':'Purchase Invoice'));
  var sups=db.suppliers||[];
  var pos=(db.purchaseOrders||[]).filter(function(p){return p.status!=='Cancelled';});
 
@@ -3095,33 +3139,66 @@ function mPurchaseInvoice(isReturn){
   +'<div class="fr2">'
   +fld(isAr?'المورد':'Supplier','<select id="pi-sup"><option value="">— Select —</option>'+sups.map(function(s){return '<option value="'+s.id+'"'+(s.id===pi.supplierId?' selected':'')+'>'+s.name+'</option>';}).join('')+'</select>')
   +fld(isAr?'رقم فاتورة المورد':'Supplier Invoice #','<input id="pi-supinv" value="'+(pi.supplierInvNo||'')+'" placeholder="'+(isAr?'رقم فاتورة المورد':'Supplier invoice number')+'">')
-  +'</div>'
-  +fld(isAr?'أمر الشراء المرجعي':'Reference PO','<select id="pi-po" style="width:100%;padding:7px 10px;border:1px solid var(--bd2);border-radius:var(--r);font-size:13px">'+poOpts+'</select>')
   +'</div>';
+ if(!isReturn){
+  body+=fld(isAr?'أمر الشراء المرجعي':'Reference PO','<select id="pi-po" style="width:100%;padding:7px 10px;border:1px solid var(--bd2);border-radius:var(--r);font-size:13px">'+poOpts+'</select>');
+ } else {
+  // Return mode is always tied to one specific original, posted purchase
+  // invoice — see buildPIReturnLines(). Only that supplier's own posted
+  // (non-return) invoices are listed.
+  var origOptsP='<option value="">— '+(isAr?'اختر الفاتورة الأصلية':'Select original invoice')+' —</option>';
+  if(pi.supplierId){
+   origOptsP+=postedPurchasesForSupplier(pi.supplierId).map(function(p){
+    return '<option value="'+p.id+'"'+(p.id===pi.origPiId?' selected':'')+'>'+p.id+' — '+(p.date||'')+' — '+N(p.total||0)+'</option>';
+   }).join('');
+  }
+  body+=fld(isAr?'الفاتورة الأصلية *':'Original Invoice *','<select id="pi-orig"'+(pi.supplierId?'':' disabled')+'>'+origOptsP+'</select>');
+  if(!pi.supplierId){
+   body+='<div class="hint">'+(isAr?'اختر المورد أولاً لعرض فواتيره.':'Select a supplier first to see their invoices.')+'</div>';
+  }
+  body+='<input type="hidden" id="pi-po" value="">';
+ }
+ body+='</div>';
  // Lines
  body+='<div class="ct" style="margin:10px 0 6px">Items</div>';
- // table-layout:fixed prevents a <select> with long option text (item name)
- // from blowing up the column width in auto layout, which was pushing the
- // whole items row out of the modal and making it appear to overlap the header.
- body+='<div class="tw" style="overflow-x:auto"><table style="font-size:12px;width:100%;table-layout:fixed"><thead><tr>'
-  +'<th>Item</th><th style="width:80px">Qty</th><th style="width:110px">Unit Cost</th>'
-  +'<th style="width:70px">VAT%</th><th style="width:100px">Subtotal</th><th style="width:30px"></th>'
-  +'</tr></thead><tbody id="piLines">';
- var lines=pi.lines&&pi.lines.length?pi.lines:[{itemId:'',qty:1,cost:0,vat:15}];
- lines.forEach(function(l,i){
-  body+='<tr id="pil-'+i+'">'
-   +'<td><select class="piItem" data-i="'+i+'" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><option value="">— Select Item —</option>'
-   +db.items.map(function(it){return '<option value="'+it.id+'"'+(it.id===l.itemId?' selected':'')+'>'+it.id+' - '+it.name+'</option>';}).join('')
-   +'</select></td>'
-   +'<td><input type="number" class="piQty" data-i="'+i+'" value="'+(l.qty||1)+'" min="0.01" step="0.01" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"></td>'
-   +'<td><input type="number" class="piCost" data-i="'+i+'" value="'+(l.cost||0)+'" min="0" step="0.01" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"></td>'
-   +'<td><select class="piVat" data-i="'+i+'" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"><option value="0"'+(l.vat===0?' selected':'')+'>0%</option><option value="5"'+(l.vat===5?' selected':'')+'>5%</option><option value="15"'+(l.vat===15||l.vat===undefined?' selected':'')+'>15%</option></select></td>'
-   +'<td class="tr mn piLineTotal" data-i="'+i+'" style="padding:5px">'+N((l.qty||0)*(l.cost||0))+'</td>'
-   +'<td><button class="btn bsm bdr" data-rmpiline="'+i+'">✕</button></td>'
-   +'</tr>';
- });
- body+='</tbody></table></div>';
- body+='<button class="btn" id="piAddLine" style="margin-top:8px">+ '+(isAr?'إضافة بند':'Add Line')+'</button>';
+ if(isReturn&&!pi.origPiId){
+  body+='<div class="es">'+(isAr?'اختر الفاتورة الأصلية أعلاه لعرض بنودها القابلة للإرجاع.':'Select the original invoice above to see its returnable items.')+'</div>';
+ } else {
+  // table-layout:fixed prevents a <select> with long option text (item name)
+  // from blowing up the column width in auto layout, which was pushing the
+  // whole items row out of the modal and making it appear to overlap the header.
+  body+='<div class="tw" style="overflow-x:auto"><table style="font-size:12px;width:100%;table-layout:fixed"><thead><tr>'
+   +'<th>Item</th><th style="width:100px">Qty'+(isReturn?(isAr?' (للإرجاع)':' (to return)'):'')+'</th><th style="width:110px">Unit Cost</th>'
+   +'<th style="width:70px">VAT%</th><th style="width:100px">Subtotal</th><th style="width:30px"></th>'
+   +'</tr></thead><tbody id="piLines">';
+  var lines=pi.lines&&pi.lines.length?pi.lines:(isReturn?[]:[{itemId:'',qty:1,cost:0,vat:15}]);
+  lines.forEach(function(l,i){
+   var it=itemById(l.itemId);
+   var itLabel=l.itemId?(l.itemId+' - '+(it?it.name:'?')):'';
+   body+='<tr id="pil-'+i+'">';
+   if(isReturn){
+    body+='<td><select class="piItem" data-i="'+i+'" disabled style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;background:var(--bg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><option value="'+l.itemId+'" selected>'+itLabel+'</option></select></td>'
+     +'<td><input type="number" class="piQty" data-i="'+i+'" value="'+(l.qty||0)+'" min="0" max="'+(l.maxQty!=null?l.maxQty:l.qty)+'" step="0.01" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px">'
+     +'<div style="font-size:10px;color:var(--t3);margin-top:2px">'+(isAr?'الأصلية':'Orig')+': '+N(l.origQty!=null?l.origQty:l.qty)+' · '+(isAr?'المتاح':'Avail')+': '+N(l.maxQty!=null?l.maxQty:l.qty)+'</div></td>'
+     +'<td><input type="number" class="piCost" data-i="'+i+'" value="'+(l.cost||0)+'" readonly style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;background:var(--bg)"></td>'
+     +'<td><select class="piVat" data-i="'+i+'" disabled style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;background:var(--bg)"><option value="'+(l.vat||0)+'" selected>'+(l.vat||0)+'%</option></select></td>'
+     +'<td class="tr mn piLineTotal" data-i="'+i+'" style="padding:5px">'+N((l.qty||0)*(l.cost||0))+'</td>'
+     +'<td></td>';
+   } else {
+    body+='<td><select class="piItem" data-i="'+i+'" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><option value="">— Select Item —</option>'
+     +db.items.map(function(it2){return '<option value="'+it2.id+'"'+(it2.id===l.itemId?' selected':'')+'>'+it2.id+' - '+it2.name+'</option>';}).join('')
+     +'</select></td>'
+     +'<td><input type="number" class="piQty" data-i="'+i+'" value="'+(l.qty||1)+'" min="0.01" step="0.01" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"></td>'
+     +'<td><input type="number" class="piCost" data-i="'+i+'" value="'+(l.cost||0)+'" min="0" step="0.01" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"></td>'
+     +'<td><select class="piVat" data-i="'+i+'" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"><option value="0"'+(l.vat===0?' selected':'')+'>0%</option><option value="5"'+(l.vat===5?' selected':'')+'>5%</option><option value="15"'+(l.vat===15||l.vat===undefined?' selected':'')+'>15%</option></select></td>'
+     +'<td class="tr mn piLineTotal" data-i="'+i+'" style="padding:5px">'+N((l.qty||0)*(l.cost||0))+'</td>'
+     +'<td><button class="btn bsm bdr" data-rmpiline="'+i+'">✕</button></td>';
+   }
+   body+='</tr>';
+  });
+  body+='</tbody></table></div>';
+  if(!isReturn)body+='<button class="btn" id="piAddLine" style="margin-top:8px">+ '+(isAr?'إضافة بند':'Add Line')+'</button>';
+ }
  body+='<div style="margin-top:12px;padding:12px;background:var(--bg);border-radius:var(--r)">'
   +'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;justify-content:flex-end">'
   +'<span style="font-size:12px;color:var(--t2)">'+(isAr?'الإجمالي قبل الخصم:':'Subtotal:')+'</span>'
@@ -3147,13 +3224,13 @@ function mPurchaseInvoice(isReturn){
   +'</div>'
   +'</div>';
  body+=fld(isAr?'ملاحظات':'Notes','<input id="pi-notes" value="'+(pi.notes||'')+'">');
- return wrap(title,body,'mSavePI',isAr?'حفظ الفاتورة':'Save Invoice');
+ return wrap(title,body,'mSavePI',isAr?(isReturn?'حفظ الإشعار':'حفظ الفاتورة'):'Save Invoice');
 }
 
 function mSalesInvoice(isReturn){
  var si=tSI;
  var isAr=lang==='ar';
- var title=(isReturn?(isAr?'مرتجع مبيعات':'Sales Return'):(isAr?'فاتورة مبيعات':'Sales Invoice'));
+ var title=(isReturn?(isAr?'إشعار دائن (مرتجع مبيعات)':'Credit Note (Sales Return)'):(isAr?'فاتورة مبيعات':'Sales Invoice'));
  var custs=db.customers||[];
  var body='<div class="fr2">'
   +fld(isAr?'رقم الفاتورة':'Ref #','<input id="si-id" value="'+(si.id||nextSI())+'">')
@@ -3162,63 +3239,104 @@ function mSalesInvoice(isReturn){
   +fld('Customer','<select id="si-cus"><option value="">— Select —</option>'+custs.map(function(c){return '<option value="'+c.id+'"'+(c.id===si.customerId?' selected':'')+'>'+c.name+'</option>';}).join('')+'</select>')
   +fld('Ref #','<input id="si-ref" value="'+(si.ref||'')+'">')
   +'</div>';
+ // Return mode is always tied to one specific original, posted invoice —
+ // see buildSIReturnLines(). The Original Invoice picker only lists that
+ // customer's own posted (non-return) invoices.
+ if(isReturn){
+  var origOpts='<option value="">— '+(isAr?'اختر الفاتورة الأصلية':'Select original invoice')+' —</option>';
+  if(si.customerId){
+   origOpts+=postedSalesForCustomer(si.customerId).map(function(s){
+    return '<option value="'+s.id+'"'+(s.id===si.origInvId?' selected':'')+'>'+s.id+' — '+(s.date||'')+' — '+N(s.total||0)+'</option>';
+   }).join('');
+  }
+  body+=fld(isAr?'الفاتورة الأصلية *':'Original Invoice *','<select id="si-orig"'+(si.customerId?'':' disabled')+'>'+origOpts+'</select>');
+  if(!si.customerId){
+   body+='<div class="hint">'+(isAr?'اختر العميل أولاً لعرض فواتيره.':'Select a customer first to see their invoices.')+'</div>';
+  }
+ }
  body+='<div class="ct" style="margin:10px 0 6px">Items</div>';
- // table-layout:fixed prevents a <select> with long option text (item name +
- // price + qty) from blowing up the column width in auto layout, which was
- // pushing the item row out past the modal edge and making it look like the
- // dropdown floats above/behind the ITEMS header instead of sitting in its row.
- body+='<div class="tw" style="overflow-x:auto"><table style="font-size:12px;width:100%;table-layout:fixed"><thead><tr>'
-  +'<th>Item</th><th style="width:80px">Qty</th><th style="width:110px">Unit Price</th>'
-  +'<th style="width:70px">VAT%</th><th style="width:100px">Subtotal</th><th style="width:30px"></th>'
-  +'</tr></thead><tbody id="siLines">';
- var lines=si.lines&&si.lines.length?si.lines:[{itemId:'',qty:1,price:0,vat:15}];
- lines.forEach(function(l,i){
-  body+='<tr id="sil-'+i+'">'
-   +'<td><select class="siItem" data-i="'+i+'" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><option value="">— Select Item —</option>'
-   +db.items.map(function(it){return '<option value="'+it.id+'"'+(it.id===l.itemId?' selected':'')+'>'+it.id+' - '+it.name+(it.salePrice?' ('+N(it.salePrice)+')':'')+' [Qty:'+( it.qty||0).toFixed(0)+']</option>';}).join('')
-   +'</select></td>'
-   +'<td><input type="number" class="siQty" data-i="'+i+'" value="'+(l.qty||1)+'" min="0.01" step="0.01" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"></td>'
-   +'<td><input type="number" class="siPrice" data-i="'+i+'" value="'+(l.price||0)+'" min="0" step="0.01" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"></td>'
-   +'<td><select class="siVat" data-i="'+i+'" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"><option value="0"'+(l.vat===0?' selected':'')+'>0%</option><option value="5"'+(l.vat===5?' selected':'')+'>5%</option><option value="15"'+(l.vat===15||l.vat===undefined?' selected':'')+'>15%</option></select></td>'
-   +'<td class="tr mn siLineTotal" data-i="'+i+'" style="padding:5px">'+N((l.qty||0)*(l.price||0))+'</td>'
-   +'<td><button class="btn bsm bdr" data-rmsiline="'+i+'">✕</button></td>'
-   +'</tr>';
- });
- body+='</tbody></table></div>';
- body+='<button class="btn" id="siAddLine" style="margin-top:8px">+ '+(isAr?'إضافة بند':'Add Line')+'</button>';
- // Customer advance accounts
- var cusAcc=si.customerId?db.customers.find(function(c){return c.id===si.customerId;}):null;
- var advAccs=(db.accounts||[]).filter(function(a){return a.type==='Liability'&&!a.isMain;});
- var advOpts='<option value="">— '+(isAr?'اختر حساب الدفعة المقدمة':'Select Advance Account')+' —</option>'
-  +advAccs.map(function(a){return '<option value="'+a.id+'"'+(a.id===si.advAccId?' selected':'')+'>'+a.id+' - '+accN(a)+'</option>';}).join('');
+ if(isReturn&&!si.origInvId){
+  body+='<div class="es">'+(isAr?'اختر الفاتورة الأصلية أعلاه لعرض بنودها القابلة للإرجاع.':'Select the original invoice above to see its returnable items.')+'</div>';
+ } else {
+  // table-layout:fixed prevents a <select> with long option text (item name +
+  // price + qty) from blowing up the column width in auto layout, which was
+  // pushing the item row out past the modal edge and making it look like the
+  // dropdown floats above/behind the ITEMS header instead of sitting in its row.
+  body+='<div class="tw" style="overflow-x:auto"><table style="font-size:12px;width:100%;table-layout:fixed"><thead><tr>'
+   +'<th>Item</th><th style="width:100px">Qty'+(isReturn?(isAr?' (للإرجاع)':' (to return)'):'')+'</th><th style="width:110px">Unit Price</th>'
+   +'<th style="width:70px">VAT%</th><th style="width:100px">Subtotal</th><th style="width:30px"></th>'
+   +'</tr></thead><tbody id="siLines">';
+  var lines=si.lines&&si.lines.length?si.lines:(isReturn?[]:[{itemId:'',qty:1,price:0,vat:15}]);
+  lines.forEach(function(l,i){
+   var it=itemById(l.itemId);
+   var itLabel=l.itemId?(l.itemId+' - '+(it?it.name:'?')):'';
+   body+='<tr id="sil-'+i+'">';
+   if(isReturn){
+    body+='<td><select class="siItem" data-i="'+i+'" disabled style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;background:var(--bg);overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><option value="'+l.itemId+'" selected>'+itLabel+'</option></select></td>'
+     +'<td><input type="number" class="siQty" data-i="'+i+'" value="'+(l.qty||0)+'" min="0" max="'+(l.maxQty!=null?l.maxQty:l.qty)+'" step="0.01" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px">'
+     +'<div style="font-size:10px;color:var(--t3);margin-top:2px">'+(isAr?'الأصلية':'Orig')+': '+N(l.origQty!=null?l.origQty:l.qty)+' · '+(isAr?'المتاح':'Avail')+': '+N(l.maxQty!=null?l.maxQty:l.qty)+'</div></td>'
+     +'<td><input type="number" class="siPrice" data-i="'+i+'" value="'+(l.price||0)+'" readonly style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;background:var(--bg)"></td>'
+     +'<td><select class="siVat" data-i="'+i+'" disabled style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;background:var(--bg)"><option value="'+(l.vat||0)+'" selected>'+(l.vat||0)+'%</option></select></td>'
+     +'<td class="tr mn siLineTotal" data-i="'+i+'" style="padding:5px">'+N((l.qty||0)*(l.price||0))+'</td>'
+     +'<td></td>';
+   } else {
+    body+='<td><select class="siItem" data-i="'+i+'" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><option value="">— Select Item —</option>'
+     +db.items.map(function(it2){return '<option value="'+it2.id+'"'+(it2.id===l.itemId?' selected':'')+'>'+it2.id+' - '+it2.name+(it2.salePrice?' ('+N(it2.salePrice)+')':'')+' [Qty:'+( it2.qty||0).toFixed(0)+']</option>';}).join('')
+     +'</select></td>'
+     +'<td><input type="number" class="siQty" data-i="'+i+'" value="'+(l.qty||1)+'" min="0.01" step="0.01" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"></td>'
+     +'<td><input type="number" class="siPrice" data-i="'+i+'" value="'+(l.price||0)+'" min="0" step="0.01" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"></td>'
+     +'<td><select class="siVat" data-i="'+i+'" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"><option value="0"'+(l.vat===0?' selected':'')+'>0%</option><option value="5"'+(l.vat===5?' selected':'')+'>5%</option><option value="15"'+(l.vat===15||l.vat===undefined?' selected':'')+'>15%</option></select></td>'
+     +'<td class="tr mn siLineTotal" data-i="'+i+'" style="padding:5px">'+N((l.qty||0)*(l.price||0))+'</td>'
+     +'<td><button class="btn bsm bdr" data-rmsiline="'+i+'">✕</button></td>';
+   }
+   body+='</tr>';
+  });
+  body+='</tbody></table></div>';
+  if(!isReturn)body+='<button class="btn" id="siAddLine" style="margin-top:8px">+ '+(isAr?'إضافة بند':'Add Line')+'</button>';
+ }
+ // Customer advance accounts (sales only — a return never carries an advance deduction)
+ var advOpts='';
+ if(!isReturn){
+  var advAccs=(db.accounts||[]).filter(function(a){return a.type==='Liability'&&!a.isMain;});
+  advOpts='<option value="">— '+(isAr?'اختر حساب الدفعة المقدمة':'Select Advance Account')+' —</option>'
+   +advAccs.map(function(a){return '<option value="'+a.id+'"'+(a.id===si.advAccId?' selected':'')+'>'+a.id+' - '+accN(a)+'</option>';}).join('');
+ }
 
  body+='<div style="margin-top:12px;padding:12px;background:var(--bg);border-radius:var(--r)">'
   +'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;justify-content:flex-end">'
   +'<span style="font-size:12px;color:var(--t2)">'+(isAr?'الإجمالي قبل الخصم:':'Subtotal:')+'</span>'
   +'<span id="siSubtotal" class="mn" style="min-width:100px;text-align:left">0.00</span>'
-  +'</div>'
-  +'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;justify-content:flex-end">'
-  +'<span style="font-size:12px;color:var(--t2)">'+(isAr?'نسبة الخصم %:':'Discount %:')+'</span>'
-  +'<input id="si-discpct" type="number" value="'+(si.discPct||0)+'" min="0" max="100" step="0.01" style="width:80px;padding:4px 8px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;text-align:center">'
-  +'<span style="font-size:12px;color:var(--t2)">'+(isAr?'أو مبلغ الخصم:':'Or Discount Amt:')+'</span>'
-  +'<input id="si-discamt" type="number" value="'+(si.discAmt||0)+'" min="0" step="0.01" style="width:100px;padding:4px 8px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;text-align:center">'
-  +'</div>'
-  +'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;justify-content:flex-end">'
-  +'<span style="font-size:12px;color:var(--t2)">'+(isAr?'خصم الدفعة المقدمة:':'Advance Payment Deduction:')+'</span>'
-  +'<input id="si-advamt" type="number" value="'+(si.advAmt||0)+'" min="0" step="0.01" style="width:110px;padding:4px 8px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;text-align:center">'
-  +'<select id="si-advacc" style="padding:4px 8px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px">'+advOpts+'</select>'
-  +'</div>'
-  +'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;justify-content:flex-end">'
+  +'</div>';
+ if(!isReturn){
+  body+='<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;justify-content:flex-end">'
+   +'<span style="font-size:12px;color:var(--t2)">'+(isAr?'نسبة الخصم %:':'Discount %:')+'</span>'
+   +'<input id="si-discpct" type="number" value="'+(si.discPct||0)+'" min="0" max="100" step="0.01" style="width:80px;padding:4px 8px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;text-align:center">'
+   +'<span style="font-size:12px;color:var(--t2)">'+(isAr?'أو مبلغ الخصم:':'Or Discount Amt:')+'</span>'
+   +'<input id="si-discamt" type="number" value="'+(si.discAmt||0)+'" min="0" step="0.01" style="width:100px;padding:4px 8px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;text-align:center">'
+   +'</div>'
+   +'<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;justify-content:flex-end">'
+   +'<span style="font-size:12px;color:var(--t2)">'+(isAr?'خصم الدفعة المقدمة:':'Advance Payment Deduction:')+'</span>'
+   +'<input id="si-advamt" type="number" value="'+(si.advAmt||0)+'" min="0" step="0.01" style="width:110px;padding:4px 8px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;text-align:center">'
+   +'<select id="si-advacc" style="padding:4px 8px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px">'+advOpts+'</select>'
+   +'</div>';
+ } else {
+  // Hidden zero-value inputs so the shared totals/save code (which reads
+  // these ids unconditionally) keeps working without special-casing return
+  // mode — a return never has a discount or an advance-payment deduction.
+  body+='<input type="hidden" id="si-discpct" value="0"><input type="hidden" id="si-discamt" value="0">'
+   +'<input type="hidden" id="si-advamt" value="0"><input type="hidden" id="si-advacc" value="">';
+ }
+ body+='<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;justify-content:flex-end">'
   +'<span style="font-size:12px;color:var(--t2)">VAT:</span>'
   +'<span id="siVat" class="mn" style="min-width:100px;text-align:left">0.00</span>'
   +'</div>'
   +'<div style="display:flex;align-items:center;gap:10px;border-top:1px solid var(--bd);padding-top:8px;justify-content:flex-end">'
-  +'<strong>'+(isAr?'الصافي المستحق:':'Net Payable:')+'</strong>'
+  +'<strong>'+(isAr?(isReturn?'إجمالي المرتجع:':'الصافي المستحق:'):'Net Payable:')+'</strong>'
   +'<span id="siTotal" class="mn" style="font-size:16px;min-width:100px;text-align:left">0.00</span>'
   +'</div>'
   +'</div>';
  body+=fld(isAr?'ملاحظات':'Notes','<input id="si-notes" value="'+(si.notes||'')+'">');
- return wrap(title,body,'mSaveSI',isAr?'حفظ الفاتورة':'Save Invoice');
+ return wrap(title,body,'mSaveSI',isAr?(isReturn?'حفظ الإشعار':'حفظ الفاتورة'):'Save Invoice');
 }
 
 
@@ -8640,7 +8758,27 @@ function bindEvents(){
   modal=null;save();render();
  });
  on('.piItem','change',function(el){var i=el.dataset.i;var it=(db.items||[]).find(function(x){return x.id===el.value;});if(it){var c=document.querySelector('.piCost[data-i="'+i+'"]');if(c)c.value=it.avgCost||0;}updatePITotals();});
- on('.piQty','input',function(){updatePITotals();});
+ // Return-mode qty inputs carry a max= (the remaining returnable qty) —
+ // clamp typed/spun values to it so a return can never exceed what's left
+ // on the original invoice, even though the number input's own max
+ // attribute only affects the spinner, not typed values.
+ on('.piQty','input',function(el){if(el.max!==''&&el.max!=null){var mx=Number(el.max);if(!isNaN(mx)&&Number(el.value)>mx)el.value=mx;}if(Number(el.value)<0)el.value=0;updatePITotals();});
+ // Purchase Return: Supplier → its posted purchase invoices; then Original
+ // Invoice → rebuild the returnable lines from that invoice (see
+ // buildPIReturnLines()). Only meaningful in return mode; a no-op reset for
+ // a customer change wouldn't make sense for a normal, free-form purchase.
+ on1('pi-sup','change',function(){
+  if(!tPI.isReturn)return;
+  tPI.supplierId=document.getElementById('pi-sup').value;
+  tPI.origPiId='';tPI.lines=[];
+  render();
+ });
+ on1('pi-orig','change',function(){
+  tPI.origPiId=document.getElementById('pi-orig').value;
+  var origPi=(db.purchaseInvoices||[]).find(function(p){return p.id===tPI.origPiId;});
+  tPI.lines=buildPIReturnLines(origPi,tPI.editId);
+  render();
+ });
  on('.piCost','input',function(){updatePITotals();});
  on('.piVat','change',function(){updatePITotals();});
  on('[data-rmpiline]','click',function(el){var tr=document.getElementById('pil-'+el.dataset.rmpiline);if(tr)tr.remove();updatePITotals();});
@@ -8672,6 +8810,7 @@ function bindEvents(){
  });
 
  on1('mSavePI','click',function(){
+  var isAr=lang==='ar';
   var id3=((document.getElementById('pi-id')||{}).value||'').trim()||nextPI();
   var dt3=((document.getElementById('pi-date')||{}).value||today());
   var supId=(document.getElementById('pi-sup')||{}).value||'';
@@ -8680,6 +8819,9 @@ function bindEvents(){
   var poId3=((document.getElementById('pi-po')||{}).value||'').trim();
   var discPct3=Number((document.getElementById('pi-discpct')||{}).value)||0;
   var discAmt3=Number((document.getElementById('pi-discamt')||{}).value)||0;
+  var isRetSave=!!tPI.isReturn;
+  var origPiId3=isRetSave?((document.getElementById('pi-orig')||{}).value||''):'';
+  if(isRetSave&&!origPiId3){alert(isAr?'اختر الفاتورة الأصلية أولاً.':'Select the original invoice first.');return;}
   var lines3=[];
   document.querySelectorAll('.piItem').forEach(function(sel){
    var i4=sel.dataset.i;var itemId=sel.value;if(!itemId)return;
@@ -8690,15 +8832,33 @@ function bindEvents(){
    if(qty4>0)lines3.push({itemId:itemId,qty:qty4,cost:cost4,vat:vat4});
   });
   if(!lines3.length){alert('Add at least one item.');return;}
+  // Defensive server-side re-check: never trust the UI's max= clamp alone —
+  // re-derive the true remaining returnable qty right now and cap to it, in
+  // case another return against the same invoice was posted meanwhile.
+  if(isRetSave){
+   var origPi3=(db.purchaseInvoices||[]).find(function(p){return p.id===origPiId3;});
+   var capped3=false;
+   lines3.forEach(function(l){
+    var origLine=origPi3&&(origPi3.lines||[]).find(function(x){return x.itemId===l.itemId;});
+    var already3=returnedQtyAgainstPurchase(origPiId3,l.itemId,tPI.editId);
+    var maxQ3=origLine?Math.max(0,(origLine.qty||0)-already3):0;
+    if(l.qty>maxQ3){l.qty=maxQ3;capped3=true;}
+   });
+   lines3=lines3.filter(function(l){return l.qty>0;});
+   if(!lines3.length){alert(isAr?'لا توجد كمية متاحة للإرجاع لهذه الأصناف.':'No returnable quantity left for these items.');return;}
+   if(capped3)alert(isAr?'تم تعديل بعض الكميات لتطابق الحد المتاح للإرجاع.':'Some quantities were adjusted down to the remaining returnable amount.');
+  }
   var sub3=lines3.reduce(function(s,l){return s+l.qty*l.cost;},0);
   var vat3raw=lines3.reduce(function(s,l){return s+l.qty*l.cost*l.vat/100;},0);
   var disc3=discPct3>0?(sub3*discPct3/100):discAmt3;
   if(disc3>sub3)disc3=sub3;
   var netSub3=sub3-disc3;
   var vat3=sub3>0?vat3raw*(netSub3/sub3):0;
-  var pi2={id:id3,date:dt3,supplierId:supId,supplierName:supNm,supplierInvNo:supInvNo,poId:poId3,lines:lines3,subtotal:sub3,discPct:discPct3,discAmt:discAmt3,discount:disc3,vat:vat3,total:netSub3+vat3,type:tPI.isReturn?'return':'purchase',posted:false};
+  var pi2={id:id3,date:dt3,supplierId:supId,supplierName:supNm,supplierInvNo:supInvNo,poId:poId3,origPiId:origPiId3,lines:lines3,subtotal:sub3,discPct:discPct3,discAmt:discAmt3,discount:disc3,vat:vat3,total:netSub3+vat3,type:isRetSave?'return':'purchase',posted:false};
   if(!db.purchaseInvoices)db.purchaseInvoices=[];
-  if(!db.purchaseInvoices.find(function(x){return x.id===id3;}))db.purchaseInvoices.push(pi2);
+  var existingPiIdx=db.purchaseInvoices.findIndex(function(x){return x.id===id3;});
+  if(existingPiIdx===-1)db.purchaseInvoices.push(pi2);
+  else if(tPI.editId===id3)db.purchaseInvoices[existingPiIdx]=Object.assign(db.purchaseInvoices[existingPiIdx],pi2);
   // Update PO status to Received if linked
   if(poId3){var po3=(db.purchaseOrders||[]).find(function(p){return p.id===poId3;});if(po3)po3.status='Received';}
   modal=null;save();render();
@@ -8719,16 +8879,39 @@ function bindEvents(){
   pi3.posted=true;save();render();alert('Posted! JE: '+(pi3.jeId||'N/A'));
  });
  on('.siItem','change',function(el){var i2=el.dataset.i;var it2=(db.items||[]).find(function(x){return x.id===el.value;});if(it2){var p2=document.querySelector('.siPrice[data-i="'+i2+'"]');if(p2)p2.value=it2.salePrice||0;}updateSITotals();});
- on('.siQty','input',function(){updateSITotals();});
+ // Return-mode qty inputs carry a max= (the remaining returnable qty) —
+ // clamp typed/spun values to it so a return can never exceed what's left
+ // on the original invoice, even though the number input's own max
+ // attribute only affects the spinner, not typed values.
+ on('.siQty','input',function(el){if(el.max!==''&&el.max!=null){var mx=Number(el.max);if(!isNaN(mx)&&Number(el.value)>mx)el.value=mx;}if(Number(el.value)<0)el.value=0;updateSITotals();});
+ // Sales Return (Credit Note): Customer → its posted sales invoices; then
+ // Original Invoice → rebuild the returnable lines from that invoice (see
+ // buildSIReturnLines()). Only meaningful in return mode.
+ on1('si-cus','change',function(){
+  if(!tSI.isReturn)return;
+  tSI.customerId=document.getElementById('si-cus').value;
+  tSI.origInvId='';tSI.lines=[];
+  render();
+ });
+ on1('si-orig','change',function(){
+  tSI.origInvId=document.getElementById('si-orig').value;
+  var origInv=(db.salesInvoices2||[]).find(function(s){return s.id===tSI.origInvId;});
+  tSI.lines=buildSIReturnLines(origInv,tSI.editId);
+  render();
+ });
  on('.siPrice','input',function(){updateSITotals();});
  on('.siVat','change',function(){updateSITotals();});
  on('[data-rmsiline]','click',function(el){var tr2=document.getElementById('sil-'+el.dataset.rmsiline);if(tr2)tr2.remove();updateSITotals();});
  on1('siAddLine','click',function(){var tb3=document.getElementById('siLines');if(!tb3)return;var i2=tb3.querySelectorAll('tr').length;var tr2=document.createElement('tr');tr2.id='sil-'+i2;tr2.innerHTML='<td><select class="siItem" data-i="'+i2+'" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><option value="">— Item —</option>'+(db.items||[]).map(function(it){return '<option value="'+it.id+'">'+it.id+' - '+it.name+' ['+( it.qty||0).toFixed(0)+']</option>';}).join('')+'</select></td><td><input type="number" class="siQty" data-i="'+i2+'" value="1" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r)"></td><td><input type="number" class="siPrice" data-i="'+i2+'" value="0" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r)"></td><td><select class="siVat" data-i="'+i2+'" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r)"><option>0%</option><option>5%</option><option selected>15%</option></select></td><td class="tr siLineTotal" data-i="'+i2+'" style="padding:5px">0.00</td><td><button class="btn bsm bdr" data-rmsiline="'+i2+'">✕</button></td>';tb3.appendChild(tr2);});
  on1('mSaveSI','click',function(){
+  var isAr=lang==='ar';
   var id5=((document.getElementById('si-id')||{}).value||'').trim()||nextSI();
   var dt5=((document.getElementById('si-date')||{}).value||today());
   var cusId=(document.getElementById('si-cus')||{}).value||'';
   var cusNm=cusId?((db.customers||[]).find(function(c){return c.id===cusId;})||{name:''}).name:'';
+  var isRetSave5=!!tSI.isReturn;
+  var origInvId5=isRetSave5?((document.getElementById('si-orig')||{}).value||''):'';
+  if(isRetSave5&&!origInvId5){alert(isAr?'اختر الفاتورة الأصلية أولاً.':'Select the original invoice first.');return;}
   var lines5=[];
   document.querySelectorAll('.siItem').forEach(function(sel){
    var i6=sel.dataset.i;var itemId5=sel.value;if(!itemId5)return;
@@ -8739,6 +8922,23 @@ function bindEvents(){
    if(qty6>0)lines5.push({itemId:itemId5,qty:qty6,price:price6,vat:vat6});
   });
   if(!lines5.length){alert('Add at least one item.');return;}
+  // Defensive server-side re-check: never trust the UI's max= clamp alone —
+  // re-derive the true remaining returnable qty right now and cap to it, in
+  // case another return against the same invoice was posted meanwhile.
+  if(isRetSave5){
+   var origInv5=(db.salesInvoices2||[]).find(function(s){return s.id===origInvId5;});
+   var capped5=false;
+   lines5.forEach(function(l){
+    var origLine5=origInv5&&(origInv5.lines||[]).find(function(x){return x.itemId===l.itemId;});
+    var already5=returnedQtyAgainstSale(origInvId5,l.itemId,tSI.editId);
+    var maxQ5=origLine5?Math.max(0,(origLine5.qty||0)-already5):0;
+    if(l.qty>maxQ5){l.qty=maxQ5;capped5=true;}
+    if(origLine5){l.costAtSale=origLine5.costAtSale||0;}
+   });
+   lines5=lines5.filter(function(l){return l.qty>0;});
+   if(!lines5.length){alert(isAr?'لا توجد كمية متاحة للإرجاع لهذه الأصناف.':'No returnable quantity left for these items.');return;}
+   if(capped5)alert(isAr?'تم تعديل بعض الكميات لتطابق الحد المتاح للإرجاع.':'Some quantities were adjusted down to the remaining returnable amount.');
+  }
   var sub5=lines5.reduce(function(s,l){return s+l.qty*l.price;},0);
   var vat5raw=lines5.reduce(function(s,l){return s+l.qty*l.price*l.vat/100;},0);
   var discPct5=Number((document.getElementById('si-discpct')||{}).value)||0;
@@ -8750,9 +8950,11 @@ function bindEvents(){
   var netSub5=sub5-disc5;
   var vat5=sub5>0?vat5raw*(netSub5/sub5):0;
   var netTotal5=netSub5+vat5-advAmt5;
-  var si2={id:id5,date:dt5,customerId:cusId,customerName:cusNm,lines:lines5,subtotal:sub5,discPct:discPct5,discAmt:discAmt5,discount:disc5,advAmt:advAmt5,advAccId:advAccId5,vat:vat5,total:netTotal5,type:tSI.isReturn?'return':'sale',posted:false};
+  var si2={id:id5,date:dt5,customerId:cusId,customerName:cusNm,origInvId:origInvId5,lines:lines5,subtotal:sub5,discPct:discPct5,discAmt:discAmt5,discount:disc5,advAmt:advAmt5,advAccId:advAccId5,vat:vat5,total:netTotal5,type:isRetSave5?'return':'sale',posted:false};
   if(!db.salesInvoices2)db.salesInvoices2=[];
-  if(!db.salesInvoices2.find(function(x){return x.id===id5;}))db.salesInvoices2.push(si2);
+  var existingSiIdx=db.salesInvoices2.findIndex(function(x){return x.id===id5;});
+  if(existingSiIdx===-1)db.salesInvoices2.push(si2);
+  else if(tSI.editId===id5)db.salesInvoices2[existingSiIdx]=Object.assign(db.salesInvoices2[existingSiIdx],si2);
   modal=null;save();render();
  });
  on('[data-postsi]','click',function(el){
@@ -9626,6 +9828,7 @@ function bindEvents(){
     // which correctly account for discount and advance payment — do NOT
     // recompute from raw lines here, or discount/advance silently vanish
     // from the posted journal entry even though they show on the invoice.
+    var isRetPost4=cur4.type==='return';
     var sub4=Number(cur4.subtotal)||(cur4.lines||[]).reduce(function(s,l){return s+l.qty*l.price;},0);
     var disc4=Number(cur4.discount)||0;
     var netSub4=sub4-disc4;
@@ -9635,6 +9838,15 @@ function bindEvents(){
     // Find accounts
     var revAcc=db.accounts.find(function(a){return a.type==='Revenue'&&!a.isMain&&(a.name.indexOf('Local Sales')>-1||a.name.indexOf('4101-01')>-1);});
     if(!revAcc)revAcc=db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;})[0];
+    // A Sales Return debits a dedicated contra-revenue account when the COA
+    // has one (Sales Returns & Allowances), rather than debiting the main
+    // Sales revenue account directly — falls back to revAcc if absent.
+    // !a.isMain matters here: the parent header "4102 Sales Returns &
+    // Allowances" also matches the name substring, and .find() would
+    // otherwise return that header (a non-postable rollup account) instead
+    // of its leaf "4102-01 Sales Returns" purely because it appears first
+    // in db.accounts.
+    var srAcc=db.accounts.find(function(a){return !a.isMain&&(a.id==='4102-01'||(a.name&&a.name.toLowerCase().indexOf('sales returns')>-1));});
     var vatAcc=db.accounts.find(function(a){return a.id==='2103-01'||a.name.indexOf('VAT Collected')>-1;});
     var recAcc=db.accounts.find(function(a){return a.id==='1103-01'||a.name.indexOf('Local Customers')>-1;});
     if(!recAcc)recAcc=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&(a.name.indexOf('Receiv')>-1||a.name.indexOf('Customer')>-1);})[0];
@@ -9644,32 +9856,87 @@ function bindEvents(){
     if(!recAcc){alert(isAr4?'لم يتم العثور على حساب الذمم المدينة':'Receivable account not found.');return;}
     var advAcc4=cur4.advAccId?db.accounts.find(function(a){return a.id===cur4.advAccId;}):null;
     if(adv4>0&&!advAcc4){alert(isAr4?'تم تسجيل دفعة مقدمة لكن لم يتم تحديد حساب الدفعات المقدمة':'An advance amount was entered but no advance-payment account was selected.');return;}
-    var jeLines4=[{acc:recAcc.id,dr:tot4,cr:0}];
-    if(adv4>0&&advAcc4)jeLines4.push({acc:advAcc4.id,dr:adv4,cr:0});
-    if(vatAcc&&vat4>0)jeLines4.push({acc:vatAcc.id,dr:0,cr:vat4});
-    jeLines4.push({acc:revAcc.id,dr:0,cr:netSub4});
+    // Cost-basis guard — run BEFORE any mutation (issueStock/journals) so a
+    // cancel here leaves everything untouched. Previously, if an item's
+    // avgCost was still 0 at post time (e.g. its purchase invoice hadn't
+    // been posted yet), the COGS line for it was silently skipped forever
+    // with zero warning: stock still left the shelf, but no COGS entry was
+    // ever created, quietly overstating Net Income. Now we warn up front
+    // and let the user back out to post the purchase first instead.
+    // (Not applicable to a return — its COGS reversal uses costAtSale
+    // recorded on the original invoice's line, not the item's live avgCost.)
+    var noCostItems4=[];
+    if(!isRetPost4){
+     (cur4.lines||[]).forEach(function(l){
+      var it0=itemById(l.itemId);
+      if(it0&&it0.cogsAccId&&it0.invAccId&&!((it0.avgCost||0)>0)){
+       noCostItems4.push(it0.name||it0.id||l.itemId);
+      }
+     });
+    }
+    if(noCostItems4.length){
+     var costWarn=(isAr4
+      ?'تنبيه: الأصناف التالية ليس لها تكلفة مسجّلة بعد (لم تُرحَّل فاتورة شراء لها حتى الآن)، ولن يتم إنشاء أي قيد لتكلفة البضاعة المباعة لها إذا تابعت:\n'
+      :'Warning: the following items have no recorded cost yet (no purchase invoice has been posted for them), so no Cost of Goods Sold entry will be created for them if you continue:\n')
+      +noCostItems4.join('، ')
+      +(isAr4
+       ?'\n\nالأفضل: اضغط إلغاء، ورحّل فاتورة الشراء الخاصة بهذا الصنف أولاً، ثم أعد ترحيل فاتورة المبيعات هذه.\nهل تريد المتابعة على أي حال؟'
+       :'\n\nBetter: click Cancel, post that item\'s purchase invoice first, then re-post this sales invoice.\nContinue anyway?');
+     if(!confirm(costWarn))return;
+    }
+    // Main JE — a return is the mirror image of a sale: it reduces what the
+    // customer owes and reduces recognized revenue, instead of increasing
+    // them (this used to post in the SAME direction as a normal sale, which
+    // silently inflated both revenue and receivables on every return).
+    var jeLines4=[];
+    if(isRetPost4){
+     jeLines4.push({acc:recAcc.id,dr:0,cr:tot4});
+     if(vatAcc&&vat4>0)jeLines4.push({acc:vatAcc.id,dr:vat4,cr:0});
+     jeLines4.push({acc:(srAcc||revAcc).id,dr:netSub4,cr:0});
+    } else {
+     jeLines4.push({acc:recAcc.id,dr:tot4,cr:0});
+     if(adv4>0&&advAcc4)jeLines4.push({acc:advAcc4.id,dr:adv4,cr:0});
+     if(vatAcc&&vat4>0)jeLines4.push({acc:vatAcc.id,dr:0,cr:vat4});
+     jeLines4.push({acc:revAcc.id,dr:0,cr:netSub4});
+    }
     // Cost of Goods Sold — reduce inventory qty/value and book COGS for
     // whichever lines have both an inventory and a COGS account configured
     // on their item; lines missing either mapping are skipped rather than
     // guessed at, same as the item-level accounts are optional elsewhere.
+    // (Lines with zero cost basis were already warned about above.)
+    // A return reverses this instead: Dr Inventory / Cr COGS, using the
+    // exact unit cost recorded on the ORIGINAL sale (costAtSale) — not
+    // today's avgCost, which may have drifted since — and puts the
+    // physical stock back regardless of whether a cost was recorded.
     var cogsLines4=[];
-    if(cur4.type!=='return'){
-     (cur4.lines||[]).forEach(function(l){
-      var it=itemById(l.itemId);
+    (cur4.lines||[]).forEach(function(l){
+     var it=itemById(l.itemId);
+     if(isRetPost4){
+      var unitCostR=l.costAtSale||0;
+      if(it&&it.cogsAccId&&it.invAccId&&unitCostR>0){
+       var lineCogsR=unitCostR*l.qty;
+       cogsLines4.push({acc:it.invAccId,dr:lineCogsR,cr:0});
+       cogsLines4.push({acc:it.cogsAccId,dr:0,cr:lineCogsR});
+      }
+      receiveStock(l.itemId,l.qty,unitCostR>0?unitCostR:(it?it.avgCost||0:0));
+     } else {
       var unitCost=issueStock(l.itemId,l.qty);
+      l.costAtSale=unitCost; // remembered so a later return can reverse the exact same cost
       if(it&&it.cogsAccId&&it.invAccId&&unitCost>0){
        var lineCogs=unitCost*l.qty;
        cogsLines4.push({acc:it.cogsAccId,dr:lineCogs,cr:0});
        cogsLines4.push({acc:it.invAccId,dr:0,cr:lineCogs});
       }
-     });
-    }
-    var je4={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:cur4.date,desc:(isAr4?'فاتورة مبيعات: ':'Sales Invoice: ')+cur4.id+' — '+(cur4.customerName||''),lines:jeLines4};
+     }
+    });
+    var je4={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:cur4.date,desc:(isRetPost4?(isAr4?'مرتجع مبيعات: ':'Sales Return: '):(isAr4?'فاتورة مبيعات: ':'Sales Invoice: '))+cur4.id+' — '+(cur4.customerName||''),lines:jeLines4};
     db.journals.push(je4);
     cur4.posted=true;cur4.jeId=je4.id;
-    if(cogsLines4.length){var jeC4={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:cur4.date,desc:(isAr4?'تكلفة البضاعة المباعة - فاتورة: ':'COGS - Sales Invoice: ')+cur4.id,lines:cogsLines4};db.journals.push(jeC4);cur4.cogsJeId=jeC4.id;}
+    if(cogsLines4.length){var jeC4={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:cur4.date,desc:(isRetPost4?(isAr4?'عكس تكلفة البضاعة - مرتجع: ':'COGS reversal - Sales Return: '):(isAr4?'تكلفة البضاعة المباعة - فاتورة: ':'COGS - Sales Invoice: '))+cur4.id,lines:cogsLines4};db.journals.push(jeC4);cur4.cogsJeId=jeC4.id;}
     save();render();
-    alert('✅ '+(isAr4?'تم ترحيل الفاتورة وإنشاء قيد: ':'Invoice posted, JE created: ')+je4.id);
+    var postMsg='✅ '+(isAr4?'تم ترحيل الفاتورة وإنشاء قيد: ':'Invoice posted, JE created: ')+je4.id;
+    if(noCostItems4.length)postMsg+='\n⚠️ '+(isAr4?'بدون قيد تكلفة بضاعة مباعة للأصناف: ':'No COGS entry created for: ')+noCostItems4.join('، ');
+    alert(postMsg);
    }
    else if(key==='purchases'){
     // Purchase Invoice → Dr. Expense/Inventory (net of discount) + VAT / Cr. Payable
@@ -9677,6 +9944,7 @@ function bindEvents(){
     // already account for a discount) instead of recomputing raw totals,
     // so a discounted purchase invoice doesn't silently post an unbalanced
     // or overstated amount to Payables.
+    var isRetPost5=cur4.type==='return';
     var sub5=Number(cur4.subtotal)||(cur4.lines||[]).reduce(function(s,l){return s+l.qty*l.cost;},0);
     var disc5=Number(cur4.discount)||0;
     var netSub5=sub5-disc5;
@@ -9690,11 +9958,26 @@ function bindEvents(){
     if(cur4.supplierId){var sup5=db.suppliers.find(function(s){return s.id===cur4.supplierId;});if(sup5&&sup5.linkedAccId){var la5=db.accounts.find(function(a){return a.id===sup5.linkedAccId;});if(la5)payAcc5=la5;}}
     if(!invAcc5){alert(isAr4?'لم يتم العثور على حساب المخزون أو المشتريات':'Inventory/Expense account not found.');return;}
     if(!payAcc5){alert(isAr4?'لم يتم العثور على حساب الموردين':'Payable account not found.');return;}
-    if(cur4.type!=='return'){(cur4.lines||[]).forEach(function(l){receiveStock(l.itemId,l.qty,l.cost);});}
-    var jeLines5=[{acc:invAcc5.id,dr:netSub5,cr:0}];
-    if(vatInAcc5&&vat5>0)jeLines5.push({acc:vatInAcc5.id,dr:vat5,cr:0});
-    jeLines5.push({acc:payAcc5.id,dr:0,cr:tot5});
-    var je5={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:cur4.date,desc:(isAr4?'فاتورة مشتريات: ':'Purchase Invoice: ')+cur4.id+' — '+(cur4.supplierName||''),lines:jeLines5};
+    // Inventory quantity: a normal purchase receives stock in; a return
+    // takes the same quantity back out (previously this branch did nothing
+    // at all for a return, silently leaving the returned goods in stock).
+    if(!isRetPost5){(cur4.lines||[]).forEach(function(l){receiveStock(l.itemId,l.qty,l.cost);});}
+    else{(cur4.lines||[]).forEach(function(l){var it=itemById(l.itemId);if(it)it.qty=Math.max(0,(it.qty||0)-l.qty);});}
+    // Main JE — a return is the mirror image of a purchase: it reduces what
+    // we owe the supplier and reduces inventory, instead of increasing them
+    // (this used to post in the SAME direction as a normal purchase, which
+    // silently inflated both inventory and payables on every return).
+    var jeLines5=[];
+    if(isRetPost5){
+     jeLines5.push({acc:payAcc5.id,dr:tot5,cr:0});
+     if(vatInAcc5&&vat5>0)jeLines5.push({acc:vatInAcc5.id,dr:0,cr:vat5});
+     jeLines5.push({acc:invAcc5.id,dr:0,cr:netSub5});
+    } else {
+     jeLines5.push({acc:invAcc5.id,dr:netSub5,cr:0});
+     if(vatInAcc5&&vat5>0)jeLines5.push({acc:vatInAcc5.id,dr:vat5,cr:0});
+     jeLines5.push({acc:payAcc5.id,dr:0,cr:tot5});
+    }
+    var je5={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:cur4.date,desc:(isRetPost5?(isAr4?'مرتجع مشتريات: ':'Purchase Return: '):(isAr4?'فاتورة مشتريات: ':'Purchase Invoice: '))+cur4.id+' — '+(cur4.supplierName||''),lines:jeLines5};
     db.journals.push(je5);
     cur4.posted=true;cur4.jeId=je5.id;
     save();render();
