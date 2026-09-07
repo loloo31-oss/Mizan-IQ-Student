@@ -481,7 +481,7 @@ function loadDB(){
 var view='dashboard',modal=null,invView=null,cusView=null,supView=null;
 var fAcc='',fFrom='',fTo='',stimer=null,lastSave=null;
 var tAcc={},tJE={},tInv={},tCus={},tSup={},tRcpt={},tPymt={},tCC={},tUser={};
-var tFAEdit={},tFA=null,tLocEdit={};
+var tFAEdit={},tFA=null,tLocEdit={},postDepTarget=null;
 var currentUser=null;
 var coSwitcherOpen=false;
 // Renders the small "switch company" popover shown under the ⇄ button in
@@ -2249,11 +2249,44 @@ function calcAccDep(asset,toDate){
 function bookValue(asset,toDate){
  return Math.max(0,(asset.cost||0)-calcAccDep(asset,toDate));
 }
+// Shared by the single-asset "⚙ Post Depreciation" button (asset detail
+// page) and the list page's per-row ⚙ shortcut / bulk "Post Monthly
+// Depreciation (All)" button, so all three post through one identical
+// path instead of the list ever re-deriving its own copy of this math.
+// Returns {ok:true, amount, jeId} on success or {ok:false, reason} — the
+// reason is a translation-ready key, not user-facing text, so each caller
+// can phrase it in its own alert/summary style.
+function postAssetDepreciation(aCalc){
+ if(!aCalc)return {ok:false,reason:'noAsset'};
+ if(!aCalc.depAccId||!aCalc.accDepAccId)return {ok:false,reason:'noAccounts'};
+ var mDep=Math.round(calcAnnualDep(aCalc)/12*100)/100;
+ if(!mDep||mDep<=0)return {ok:false,reason:'noAmount'};
+ var maxDep=(aCalc.cost||0)-(aCalc.salvageValue||0);
+ var posted=aCalc.accDepreciation||0;
+ if(posted>=maxDep)return {ok:false,reason:'fullyDep'};
+ var actualDep=Math.min(mDep,maxDep-posted);
+ var dDesc=(lang==='ar'?'إهلاك شهري: ':'Monthly Dep: ')+aCalc.name;
+ var dJE={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:today(),desc:dDesc,
+  lines:[{acc:aCalc.depAccId,dr:actualDep,cr:0},{acc:aCalc.accDepAccId,dr:0,cr:actualDep}]};
+ db.journals.push(dJE);
+ db.assetTransactions=db.assetTransactions||[];
+ db.assetTransactions.push({id:nextAT(),assetId:aCalc.id,date:today(),type:'Depreciation',amount:actualDep,desc:dDesc,jeId:dJE.id});
+ aCalc.accDepreciation=(aCalc.accDepreciation||0)+actualDep;
+ return {ok:true,amount:actualDep,jeId:dJE.id};
+}
 
 // ── Fixed Assets Pages ────────────────────────────────────────
 function pFixedAssets(){
+ // "Post Depreciation" used to live only on the single-asset detail page
+ // (reached via the eye/view icon below) — someone who only ever opens the
+ // Edit modal (the pencil icon) would never come across it at all, which is
+ // exactly what was reported. Surface it here too: one button that runs it
+ // for every active asset at once, since that's how depreciation is
+ // actually run in practice (once a month, for everything), plus a
+ // per-row ⚙ shortcut for posting a single asset without leaving this list.
  var h=tb('Fixed Assets',
   '<button class="btn bp" data-action="addFA">'+ic('plus')+' New Asset</button>'
+  +'<button class="btn" data-action="postAllDep">⚙ '+(lang==='ar'?'ترحيل إهلاك الشهر لكل الأصول':'Post Monthly Depreciation (All)')+'</button>'
   +'<button class="btn" data-action="pdfFA">'+ic('prt')+' Print</button>'
   +'<button class="btn" data-action="xlsFA">'+ic('dn')+' Excel</button>');
  h+='<div class="pg">';
@@ -2289,6 +2322,7 @@ function pFixedAssets(){
     +'<td style="font-size:12px">'+( a.purchaseDate||'—')+'</td>'
     +'<td><span class="b '+(a.active!==false?'bgn':'bgr')+'">'+(a.active!==false?'Active':'Disposed')+'</span></td>'
     +'<td><div style="display:flex;gap:3px">'
+    +(isFullyDep?'':'<button class="btn bsm bg0" data-postdep="'+a.id+'" title="'+(lang==='ar'?'ترحيل إهلاك هذا الشهر':'Post this month\'s depreciation')+'">⚙</button>')
     +'<button class="btn bsm bg0" data-viewfa="'+a.id+'">'+ic('eye')+'</button>'
     +'<button class="btn bsm bg0" data-editfa="'+a.id+'">'+ic('edit')+'</button>'
     +'<button class="btn bsm bg0 bdr" data-delfa="'+a.id+'">'+ic('del')+'</button>'
@@ -4670,15 +4704,27 @@ function accBalMonth(accId, year, month){
    else bal+=(Number(l.dr)||0)-(Number(l.cr)||0);
   });
  });
+ // accTo is always the debit side of a voucher and accFrom always the
+ // credit side (see the matching note in stmtCalc) — so, like the journal
+ // loop just above, a Revenue/Liability account still needs the sign
+ // flipped: a debit reduces those, it doesn't add to them. The old
+ // unconditional bal+=amt/bal-=amt here was only ever exercised for
+ // Asset/Expense-side accounts in practice (a Payable being paid down via
+ // a receipt/payment counter account was effectively dead until the
+ // voucher-counter-account default was added), which is why it went
+ // unnoticed.
+ var flip3=(a.type==='Revenue'||a.type==='Liability');
  (db.receipts||[]).forEach(function(r){
   if(r.date<from3||r.date>=to3)return;
-  if(r.accTo===accId)bal+=Number(r.amount)||0;
-  if(r.accFrom===accId)bal-=Number(r.amount)||0;
+  var amt3=Number(r.amount)||0;
+  if(r.accTo===accId)bal+=flip3?-amt3:amt3;
+  if(r.accFrom===accId)bal+=flip3?amt3:-amt3;
  });
  (db.payments||[]).forEach(function(r){
   if(r.date<from3||r.date>=to3)return;
-  if(r.accTo===accId)bal+=Number(r.amount)||0;
-  if(r.accFrom===accId)bal-=Number(r.amount)||0;
+  var amt4=Number(r.amount)||0;
+  if(r.accTo===accId)bal+=flip3?-amt4:amt4;
+  if(r.accFrom===accId)bal+=flip3?amt4:-amt4;
  });
  return Math.abs(bal);
 }
@@ -5095,15 +5141,30 @@ function stmtCalc(){
    all.push({date:je.date,ref:je.id,desc:je.desc,dr:dr,cr:cr,delta:isDebitNormal?dr-cr:cr-dr});
   });
  });
+ // accTo/accFrom's dr/cr SIDE is fixed by role, not by the viewed account's
+ // own normal balance type: a voucher always reads as "Dr accTo / Cr
+ // accFrom" (a Receipt debits the deposit account and credits its counter;
+ // a Payment debits its counter — the liability/expense being settled —
+ // and credits the account paid from). Only the running BALANCE (delta)
+ // depends on whether that side increases or decreases THIS account, which
+ // is exactly what isDebitNormal already captures for journal lines above —
+ // so reuse the same dr-cr/cr-dr formula here instead of re-deciding the
+ // dr/cr split from isDebitNormal a second time. The previous version used
+ // isDebitNormal to pick BOTH the column and the delta, which happened to
+ // read right only when the counter account was itself Debit-normal (e.g.
+ // a bank) — the moment the counter was a Credit-normal account (a
+ // supplier's Payable being paid down, a customer's Payable-side account,
+ // etc.) it silently posted the amount into the wrong column even though
+ // the running balance itself still moved the correct direction.
  (db.receipts||[]).forEach(function(r){
   var amt=Number(r.amount)||0;
-  if(r.accTo===selId)all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:isDebitNormal?amt:0,cr:isDebitNormal?0:amt,delta:isDebitNormal?amt:-amt});
-  if(r.accFrom===selId)all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:isDebitNormal?0:amt,cr:isDebitNormal?amt:0,delta:isDebitNormal?-amt:amt});
+  if(r.accTo===selId){var dr=amt,cr=0;all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:dr,cr:cr,delta:isDebitNormal?dr-cr:cr-dr});}
+  if(r.accFrom===selId){var dr2=0,cr2=amt;all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:dr2,cr:cr2,delta:isDebitNormal?dr2-cr2:cr2-dr2});}
  });
  (db.payments||[]).forEach(function(r){
   var amt=Number(r.amount)||0;
-  if(r.accTo===selId)all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:isDebitNormal?amt:0,cr:isDebitNormal?0:amt,delta:isDebitNormal?amt:-amt});
-  if(r.accFrom===selId)all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:isDebitNormal?0:amt,cr:isDebitNormal?amt:0,delta:isDebitNormal?-amt:amt});
+  if(r.accTo===selId){var dr3=amt,cr3=0;all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:dr3,cr:cr3,delta:isDebitNormal?dr3-cr3:cr3-dr3});}
+  if(r.accFrom===selId){var dr4=0,cr4=amt;all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:dr4,cr:cr4,delta:isDebitNormal?dr4-cr4:cr4-dr4});}
  });
  all.sort(function(a,b){return a.date.localeCompare(b.date);});
  var init=acc?(acc.bal||0):0; // the account's own manually-entered Opening Balance
@@ -7373,25 +7434,49 @@ window.xAction=function(type){
   if(type==='calcDep'){
   var aCalc=db.fixedAssets.find(function(x){return x.id===tFA;});
   if(!aCalc){alert(lang==='ar'?'\u0627\u062e\u062a\u0631 \u0627\u0644\u0623\u0635\u0644 \u0623\u0648\u0644\u0627\u064b':'Select asset first');return;}
-  if(!aCalc.depAccId||!aCalc.accDepAccId){
-   alert(lang==='ar'?'\u064a\u062c\u0628 \u062a\u062d\u062f\u064a\u062f \u062d\u0633\u0627\u0628 \u0645\u0635\u0631\u0648\u0641 \u0627\u0644\u0625\u0647\u0644\u0627\u0643 \u0648\u062d\u0633\u0627\u0628 \u0645\u062c\u0645\u0639 \u0627\u0644\u0625\u0647\u0644\u0627\u0643 \u0641\u064a \u0628\u064a\u0627\u0646\u0627\u062a \u0627\u0644\u0623\u0635\u0644':'Set Depreciation Expense Account and Accumulated Depreciation Account on asset first.');
-   return;
+  var r=postAssetDepreciation(aCalc);
+  if(!r.ok){
+   var msgs={noAccounts:lang==='ar'?'\u064a\u062c\u0628 \u062a\u062d\u062f\u064a\u062f \u062d\u0633\u0627\u0628 \u0645\u0635\u0631\u0648\u0641 \u0627\u0644\u0625\u0647\u0644\u0627\u0643 \u0648\u062d\u0633\u0627\u0628 \u0645\u062c\u0645\u0639 \u0627\u0644\u0625\u0647\u0644\u0627\u0643 \u0641\u064a \u0628\u064a\u0627\u0646\u0627\u062a \u0627\u0644\u0623\u0635\u0644':'Set Depreciation Expense Account and Accumulated Depreciation Account on asset first.',
+    noAmount:lang==='ar'?'\u0644\u0627 \u064a\u0648\u062c\u062f \u0625\u0647\u0644\u0627\u0643 \u0644\u062a\u0631\u062d\u064a\u0644\u0647':'No depreciation to post.',
+    fullyDep:lang==='ar'?'\u0627\u0644\u0623\u0635\u0644 \u0645\u0633\u062a\u0647\u0644\u0643 \u0628\u0627\u0644\u0643\u0627\u0645\u0644':'Asset fully depreciated.'};
+   alert(msgs[r.reason]||r.reason);return;
   }
-  var mDep=Math.round(calcAnnualDep(aCalc)/12*100)/100;
-  if(!mDep||mDep<=0){alert(lang==='ar'?'\u0644\u0627 \u064a\u0648\u062c\u062f \u0625\u0647\u0644\u0627\u0643 \u0644\u062a\u0631\u062d\u064a\u0644\u0647':'No depreciation to post.');return;}
-  var maxDep=(aCalc.cost||0)-(aCalc.salvageValue||0);
-  var posted=aCalc.accDepreciation||0;
-  if(posted>=maxDep){alert(lang==='ar'?'\u0627\u0644\u0623\u0635\u0644 \u0645\u0633\u062a\u0647\u0644\u0643 \u0628\u0627\u0644\u0643\u0627\u0645\u0644':'Asset fully depreciated.');return;}
-  var actualDep=Math.min(mDep,maxDep-posted);
-  var dDesc=(lang==='ar'?'\u0625\u0647\u0644\u0627\u0643 \u0634\u0647\u0631\u064a: ':'Monthly Dep: ')+aCalc.name;
-  var dJE={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:today(),desc:dDesc,
-   lines:[{acc:aCalc.depAccId,dr:actualDep,cr:0},{acc:aCalc.accDepAccId,dr:0,cr:actualDep}]};
-  db.journals.push(dJE);
-  db.assetTransactions=db.assetTransactions||[];
-  db.assetTransactions.push({id:nextAT(),assetId:aCalc.id,date:today(),type:'Depreciation',amount:actualDep,desc:dDesc,jeId:dJE.id});
-  aCalc.accDepreciation=(aCalc.accDepreciation||0)+actualDep;
   save();render();
-  alert('\u2705 '+(lang==='ar'?'\u062a\u0645 \u062a\u0631\u062d\u064a\u0644 \u0627\u0644\u0625\u0647\u0644\u0627\u0643: ':'Depreciation posted: ')+N(actualDep)+' | '+dJE.id);return;
+  alert('\u2705 '+(lang==='ar'?'\u062a\u0645 \u062a\u0631\u062d\u064a\u0644 \u0627\u0644\u0625\u0647\u0644\u0627\u0643: ':'Depreciation posted: ')+N(r.amount)+' | '+r.jeId);return;
+ }
+ if(type==='postDepOne'){
+  var aOne=db.fixedAssets.find(function(x){return x.id===postDepTarget;});
+  if(!aOne)return;
+  var rOne=postAssetDepreciation(aOne);
+  if(!rOne.ok){
+   var msgsOne={noAccounts:lang==='ar'?'\u064a\u062c\u0628 \u062a\u062d\u062f\u064a\u062f \u062d\u0633\u0627\u0628 \u0645\u0635\u0631\u0648\u0641 \u0627\u0644\u0625\u0647\u0644\u0627\u0643 \u0648\u062d\u0633\u0627\u0628 \u0645\u062c\u0645\u0639 \u0627\u0644\u0625\u0647\u0644\u0627\u0643 \u0641\u064a \u0628\u064a\u0627\u0646\u0627\u062a \u0627\u0644\u0623\u0635\u0644':'Set Depreciation Expense Account and Accumulated Depreciation Account on asset first.',
+    noAmount:lang==='ar'?'\u0644\u0627 \u064a\u0648\u062c\u062f \u0625\u0647\u0644\u0627\u0643 \u0644\u062a\u0631\u062d\u064a\u0644\u0647':'No depreciation to post.',
+    fullyDep:lang==='ar'?'\u0627\u0644\u0623\u0635\u0644 \u0645\u0633\u062a\u0647\u0644\u0643 \u0628\u0627\u0644\u0643\u0627\u0645\u0644':'Asset fully depreciated.'};
+   alert((aOne.name||aOne.id)+': '+(msgsOne[rOne.reason]||rOne.reason));return;
+  }
+  save();render();
+  alert('\u2705 '+(lang==='ar'?'\u062a\u0645 \u062a\u0631\u062d\u064a\u0644 \u0625\u0647\u0644\u0627\u0643 ':'Depreciation posted for ')+(aOne.name||aOne.id)+': '+N(rOne.amount)+' | '+rOne.jeId);return;
+ }
+ if(type==='postAllDep'){
+  var candidates=(db.fixedAssets||[]).filter(function(x){return x.active!==false;});
+  if(!candidates.length){alert(lang==='ar'?'\u0644\u0627 \u062a\u0648\u062c\u062f \u0623\u0635\u0648\u0644 \u062b\u0627\u0628\u062a\u0629':'No fixed assets.');return;}
+  var ok=lang==='ar'?confirm('\u062a\u0631\u062d\u064a\u0644 \u0625\u0647\u0644\u0627\u0643 \u0647\u0630\u0627 \u0627\u0644\u0634\u0647\u0631 \u0644\u0640 '+candidates.length+' \u0623\u0635\u0644\u061f'):confirm('Post this month\u2019s depreciation for '+candidates.length+' asset(s)?');
+  if(!ok)return;
+  var posted2=[],skipped2=[];
+  candidates.forEach(function(aAll){
+   var rAll=postAssetDepreciation(aAll);
+   if(rAll.ok)posted2.push({name:aAll.name||aAll.id,amount:rAll.amount});
+   else skipped2.push({name:aAll.name||aAll.id,reason:rAll.reason});
+  });
+  save();render();
+  var totalPosted=posted2.reduce(function(s,p){return s+p.amount;},0);
+  var lines2=[];
+  lines2.push((lang==='ar'?'\u2705 \u062a\u0645 \u062a\u0631\u062d\u064a\u0644 \u0627\u0644\u0625\u0647\u0644\u0627\u0643 \u0644\u0640 ':'\u2705 Depreciation posted for ')+posted2.length+(lang==='ar'?' \u0623\u0635\u0644 \u0628\u0625\u062c\u0645\u0627\u0644\u064a ':' asset(s), total ')+N(totalPosted));
+  if(skipped2.length){
+   var reasonLabel=function(r){return r==='noAccounts'?(lang==='ar'?'\u0644\u0627 \u062a\u0648\u062c\u062f \u062d\u0633\u0627\u0628\u0627\u062a \u0645\u0631\u062a\u0628\u0637\u0629':'no linked accounts'):r==='fullyDep'?(lang==='ar'?'\u0645\u0633\u062a\u0647\u0644\u0643 \u0628\u0627\u0644\u0643\u0627\u0645\u0644':'fully depreciated'):(lang==='ar'?'\u0644\u0627 \u064a\u0648\u062c\u062f \u0645\u0628\u0644\u063a':'no amount due');};
+   lines2.push((lang==='ar'?'\u23ed \u062a\u0645 \u062a\u062e\u0637\u064a ':'\u23ed Skipped ')+skipped2.length+(lang==='ar'?': ':': ')+skipped2.map(function(s){return s.name+' ('+reasonLabel(s.reason)+')';}).join(', '));
+  }
+  alert(lines2.join('\n'));return;
  }
  if(type==='printCOA'||type==='xlsCOA'||type==='wordCOA'){
   // Build unified COA rows
@@ -8552,6 +8637,7 @@ function bindEvents(){
   if(a){tFAEdit=Object.assign({},a,{editId:a.id});modal='fa';render();}
  });
  on('[data-viewfa]','click',function(el){tFA=el.dataset.viewfa;view='fixedassets';render();});
+ on('[data-postdep]','click',function(el){postDepTarget=el.dataset.postdep;window.xAction('postDepOne');});
  on('[data-delfa]','click',function(el){
   if(confirm('Delete this asset and all its transactions?')){
    db.fixedAssets=db.fixedAssets.filter(function(a){return a.id!==el.dataset.delfa;});
