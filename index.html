@@ -722,7 +722,13 @@ function accN(a){return (lang==='ar'&&a&&a.nameAr)?a.nameAr:a?a.name:'';}
 // (unused) bal field). An account with no children just returns its own bal.
 function acctRollupBal(a){
  var children=db.accounts.filter(function(x){return x.pid===a.id;});
- if(!children.length)return a.bal||0;
+ // A leaf's LIVE balance is accBalRange(), not the raw .bal field — normal
+ // posting flows (Sales/Purchase invoices, Receipts/Payments, Fixed Asset
+ // depreciation) only ever push journal entries, never touch .bal, so an
+ // account with real activity but no manually-entered Opening Balance sat
+ // at 0 here forever even while every other report (Trial Balance,
+ // Balance Sheet, Account Statement) correctly showed its true balance.
+ if(!children.length)return accBalRange(a.id);
  return children.reduce(function(s,c){return s+acctRollupBal(c);},0);
 }
 function aName(id){var a=db.accounts.find(function(x){return x.id===id;});if(!a)return id;return (lang==='ar'&&a.nameAr)?a.nameAr:a.name;}
@@ -2259,6 +2265,15 @@ function bookValue(asset,toDate){
 function postAssetDepreciation(aCalc){
  if(!aCalc)return {ok:false,reason:'noAsset'};
  if(!aCalc.depAccId||!aCalc.accDepAccId)return {ok:false,reason:'noAccounts'};
+ // Dedup guard: both the per-row ⚙ button and the bulk "Post Monthly
+ // Depreciation (All)" button call this same function with no idempotency
+ // check at all, so clicking either one twice in the same month (or
+ // clicking the per-row button after already using "Post All") pushed a
+ // second full JE for the same period, silently doubling that month's
+ // Depreciation Expense and Accumulated Depreciation. lastDepPeriod
+ // records the last calendar month (YYYY-MM) this asset was posted for.
+ var curPeriod=today().slice(0,7);
+ if(aCalc.lastDepPeriod===curPeriod)return {ok:false,reason:'alreadyPosted'};
  var mDep=Math.round(calcAnnualDep(aCalc)/12*100)/100;
  if(!mDep||mDep<=0)return {ok:false,reason:'noAmount'};
  var maxDep=(aCalc.cost||0)-(aCalc.salvageValue||0);
@@ -2266,12 +2281,19 @@ function postAssetDepreciation(aCalc){
  if(posted>=maxDep)return {ok:false,reason:'fullyDep'};
  var actualDep=Math.min(mDep,maxDep-posted);
  var dDesc=(lang==='ar'?'إهلاك شهري: ':'Monthly Dep: ')+aCalc.name;
+ // Tag the expense line with the asset's own Cost Center (if one is set)
+ // so its depreciation actually reaches the Cost Center Report — Fixed
+ // Assets had no cost-center field at all before, so their depreciation
+ // was structurally invisible to that report no matter how it was posted.
+ var depLine={acc:aCalc.depAccId,dr:actualDep,cr:0};
+ if(aCalc.costCenterId)depLine.cc=aCalc.costCenterId;
  var dJE={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:today(),desc:dDesc,
-  lines:[{acc:aCalc.depAccId,dr:actualDep,cr:0},{acc:aCalc.accDepAccId,dr:0,cr:actualDep}]};
+  lines:[depLine,{acc:aCalc.accDepAccId,dr:0,cr:actualDep}]};
  db.journals.push(dJE);
  db.assetTransactions=db.assetTransactions||[];
  db.assetTransactions.push({id:nextAT(),assetId:aCalc.id,date:today(),type:'Depreciation',amount:actualDep,desc:dDesc,jeId:dJE.id});
  aCalc.accDepreciation=(aCalc.accDepreciation||0)+actualDep;
+ aCalc.lastDepPeriod=curPeriod;
  return {ok:true,amount:actualDep,jeId:dJE.id};
 }
 
@@ -2492,6 +2514,7 @@ function mFA(){
   +faAccFld('Depreciation Expense * \u2014 \u0645\u0635\u0631\u0648\u0641 \u0627\u0644\u0625\u0647\u0644\u0627\u0643','fa-depacc',a.depAccId,depAccs)
   +'</div>'
   +faAccFld('Acc. Depreciation Account * \u2014 \u0645\u062C\u0645\u0639 \u0627\u0644\u0625\u0647\u0644\u0627\u0643','fa-accdep',a.accDepAccId,liabAccs)
+  +fld('Cost Center \u2014 \u0645\u0631\u0643\u0632 \u0627\u0644\u062A\u0643\u0644\u0641\u0629','<select id="fa-cc"><option value="">\u2014 None \u2014</option>'+db.costCenters.filter(function(c){return c.active;}).map(function(c){return '<option value="'+c.id+'"'+(c.id===a.costCenterId?' selected':'')+'>'+c.id+' '+c.name+'</option>';}).join('')+'</select>')
   +'<div class="fl"><label>Description</label><textarea id="fa-desc" rows="2" style="width:100%;resize:vertical">'+(a.desc||'')+'</textarea></div>';
  return wrap((isNew?'New Fixed Asset':'Edit Asset: '+a.name),body,'mSaveFA','Save Asset');
 }
@@ -2620,27 +2643,19 @@ function issueStock(itemId,qty){
 function pItems(){
  var h=tb('Inventory Items','<button class="btn bp" data-action="addItem">'+ic('plus')+' New Item</button><button class="btn" data-action="xlsStock">'+ic('dn')+' Excel</button>');
  h+='<div class="pg">';
- // Recalculate all items from invoices
- (db.items||[]).forEach(function(it){
-  var bq=0,ac=0;
-  (db.purchaseInvoices||[]).forEach(function(pi){
-   if(!pi.posted)return;
-   pi.lines.forEach(function(l){
-    if(l.itemId!==it.id)return;
-    if(pi.type==='return'){bq=Math.max(0,bq-l.qty);}
-    else{var ov=bq*ac;var nv=l.qty*(l.cost||0);bq+=l.qty;ac=bq>0?(ov+nv)/bq:l.cost||0;}
-   });
-  });
-  (db.salesInvoices2||[]).forEach(function(si){
-   if(!si.posted)return;
-   si.lines.forEach(function(l){
-    if(l.itemId!==it.id)return;
-    if(si.type==='return')bq+=l.qty;else bq=Math.max(0,bq-l.qty);
-   });
-  });
-  // Keep manual qty if no invoice data
-  if(bq===0&&(it.qty||0)>0){/* keep existing qty */}else{it.qty=bq;it.avgCost=ac;}
- });
+ // qty/avgCost are NOT recomputed here anymore. They used to be replayed
+ // from scratch on every render by walking db.purchaseInvoices/
+ // salesInvoices2 in ARRAY order (assumed chronological, which isn't
+ // guaranteed) with a simplified weighted-average that — unlike the real
+ // posting code — never re-weighted avgCost on a purchase return and
+ // never used a sale return's actual costAtSale. After a stock-out +
+ // repurchase-at-a-different-cost + return sequence this replay could
+ // land on a different avgCost than the one the live postings (receiveStock/
+ // issueStock, and the purchase-return re-weighting) had already computed
+ // correctly — and then this function OVERWROTE it.avgCost with its own
+ // (wrong) figure on every single render, permanently contaminating every
+ // posting after that. it.qty/it.avgCost are already maintained
+ // incrementally and correctly by every posting action, so trust them.
  var totalVal=(db.items||[]).reduce(function(s,it){return s+(it.qty||0)*(it.avgCost||0);},0);
  h+='<div class="mets">'
   +'<div class="met"><div class="mlab">Total Items</div><div class="mv">'+(db.items||[]).length+'</div></div>'
@@ -3221,7 +3236,9 @@ function mPurchaseInvoice(isReturn){
    } else {
     body+='<td><select class="piItem" data-i="'+i+'" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><option value="">— Select Item —</option>'
      +db.items.map(function(it2){return '<option value="'+it2.id+'"'+(it2.id===l.itemId?' selected':'')+'>'+it2.id+' - '+it2.name+'</option>';}).join('')
-     +'</select></td>'
+     +'</select>'
+     +(!l.itemId&&l.poDesc?'<div style="font-size:10px;color:var(--am);margin-top:2px">'+(isAr?'من أمر الشراء: ':'From PO: ')+l.poDesc+'</div>':'')
+     +'</td>'
      +'<td><input type="number" class="piQty" data-i="'+i+'" value="'+(l.qty||1)+'" min="0.01" step="0.01" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"></td>'
      +'<td><input type="number" class="piCost" data-i="'+i+'" value="'+(l.cost||0)+'" min="0" step="0.01" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"></td>'
      +'<td><select class="piVat" data-i="'+i+'" style="width:100%;padding:5px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"><option value="0"'+(l.vat===0?' selected':'')+'>0%</option><option value="5"'+(l.vat===5?' selected':'')+'>5%</option><option value="15"'+(l.vat===15||l.vat===undefined?' selected':'')+'>15%</option></select></td>'
@@ -4283,7 +4300,7 @@ function pCOA(){
   var mains=db.accounts.filter(function(a){return a.type===t&&a.isMain;});
   var stand=db.accounts.filter(function(a){return a.type===t&&!a.isMain&&!a.pid;});
   if(!mains.length&&!stand.length)return;
-  var tot=db.accounts.filter(function(a){return a.type===t&&!a.isMain;}).reduce(function(s,a){return s+a.bal;},0);
+  var tot=db.accounts.filter(function(a){return a.type===t&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id);},0);
   h+='<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><div class="ct" style="margin:0">'+t+'</div><span class="mn" style="font-size:12px;font-weight:700;color:var(--t2)">'+N(tot)+'</span></div>';
   h+='<div class="tw"><table><thead><tr><th style="width:26px"></th><th>Code</th><th>Account</th><th>Level</th><th>Normal</th><th class="tr">Balance</th></tr></thead><tbody>';
   mains.forEach(function(m){
@@ -4316,7 +4333,7 @@ function pCOA(){
      h+='<td style="padding-left:44px"><div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap"><span style="color:var(--t3)">&#x2514;</span>'+accN(g)+(g.autoGen?' <span class="b" style="font-size:9px;opacity:.7">'+(lang==='ar'?'تلقائي':'auto')+'</span>':'')+'<button class="btn bsm bg0" data-editacc="'+g.id+'">'+ic('edit')+'</button><button class="btn bsm bg0 bdr" data-delacc="'+g.id+'">'+ic('del')+'</button></div>'+rl(g.id)+'</td>';
      h+='<td><span class="b" style="font-size:10px">Sub</span></td>';
      h+='<td><span class="b '+(g.normal==='Debit'?'bbl':'bgn')+'">'+g.normal+'</span></td>';
-     h+='<td class="tr mn">'+N(g.bal)+'</td>';
+     h+='<td class="tr mn">'+N(accBalRange(g.id))+'</td>';
      h+='</tr>';
     });}
    });}
@@ -4325,7 +4342,7 @@ function pCOA(){
    h+='<tr><td></td><td><span class="tag">'+a.id+'</span></td><td><div style="display:flex;align-items:center;gap:4px;flex-wrap:wrap">'+a.name+'<button class="btn bsm bg0" data-editacc="'+a.id+'">'+ic('edit')+'</button><button class="btn bsm bg0 bdr" data-delacc="'+a.id+'">'+ic('del')+'</button></div>'+rl(a.id)+'</td>';
    h+='<td><span class="b bgr" style="font-size:10px">Standalone</span></td>';
    h+='<td><span class="b '+(a.normal==='Debit'?'bbl':'bgn')+'">'+a.normal+'</span></td>';
-   h+='<td class="tr mn">'+N(a.bal)+'</td>';
+   h+='<td class="tr mn">'+N(accBalRange(a.id))+'</td>';
    h+='</tr>';
   });
   h+='</tbody></table></div></div>';
@@ -4695,38 +4712,42 @@ function accBalMonth(accId, year, month){
  var a=db.accounts.find(function(x){return x.id===accId;});
  if(!a)return 0;
  var bal=0;
+ // Sign convention keyed on the account's own `.normal` side, exactly like
+ // accBalRange()/acctDelta() — NOT `.type`. This app lets `.type` and
+ // `.normal` disagree on purpose for a contra account (e.g. this app's own
+ // "Sales Returns", type:'Revenue' but normal:'Debit'; "Purchase Returns",
+ // type:'Expense' but normal:'Credit'), and Budget vs Actual builds a
+ // budget line for every non-main Revenue/Expense account with no filter
+ // excluding contra ones. Branching on `.type` here (as this used to)
+ // silently sign-flipped exactly those accounts' monthly actuals.
+ var isDebitNormal3=a.normal==='Debit';
  db.journals.forEach(function(je){
   if(je.date<from3)return;
   if(je.date>=to3)return;
   (je.lines||[]).forEach(function(l){
    if(l.acc!==accId)return;
-   if(a.type==='Revenue'||a.type==='Liability')bal+=(Number(l.cr)||0)-(Number(l.dr)||0);
-   else bal+=(Number(l.dr)||0)-(Number(l.cr)||0);
+   if(isDebitNormal3)bal+=(Number(l.dr)||0)-(Number(l.cr)||0);
+   else bal+=(Number(l.cr)||0)-(Number(l.dr)||0);
   });
  });
  // accTo is always the debit side of a voucher and accFrom always the
- // credit side (see the matching note in stmtCalc) — so, like the journal
- // loop just above, a Revenue/Liability account still needs the sign
- // flipped: a debit reduces those, it doesn't add to them. The old
- // unconditional bal+=amt/bal-=amt here was only ever exercised for
- // Asset/Expense-side accounts in practice (a Payable being paid down via
- // a receipt/payment counter account was effectively dead until the
- // voucher-counter-account default was added), which is why it went
- // unnoticed.
- var flip3=(a.type==='Revenue'||a.type==='Liability');
+ // credit side (see the matching note in stmtCalc).
  (db.receipts||[]).forEach(function(r){
   if(r.date<from3||r.date>=to3)return;
   var amt3=Number(r.amount)||0;
-  if(r.accTo===accId)bal+=flip3?-amt3:amt3;
-  if(r.accFrom===accId)bal+=flip3?amt3:-amt3;
+  if(r.accTo===accId)bal+=isDebitNormal3?amt3:-amt3;
+  if(r.accFrom===accId)bal+=isDebitNormal3?-amt3:amt3;
  });
  (db.payments||[]).forEach(function(r){
   if(r.date<from3||r.date>=to3)return;
   var amt4=Number(r.amount)||0;
-  if(r.accTo===accId)bal+=flip3?-amt4:amt4;
-  if(r.accFrom===accId)bal+=flip3?amt4:-amt4;
+  if(r.accTo===accId)bal+=isDebitNormal3?amt4:-amt4;
+  if(r.accFrom===accId)bal+=isDebitNormal3?-amt4:amt4;
  });
- return Math.abs(bal);
+ // No Math.abs() here: a genuine negative month (e.g. returns exceeding
+ // new sales) is meaningful for a budget-vs-actual comparison and should
+ // stay visible, not get silently laundered into a positive "actual".
+ return bal;
 }
 
 function accBalRange(accId,from2,to2){
@@ -4759,9 +4780,7 @@ function accBalRange(accId,from2,to2){
  return bal;
 }
 function mainBalRange(mainId,from2,to2){
- var subs=db.accounts.filter(function(s){return s.pid===mainId;});
- if(!subs.length)return accBalRange(mainId,from2,to2);
- return subs.reduce(function(s,x){return s+accBalRange(x.id,from2,to2);},0);
+ return accBalRangeRollup(mainId,from2,to2);
 }
 // Like acctRollupBal() but date-range aware (for Trial Balance): an account
 // with no children is computed directly from its postings via
@@ -4780,10 +4799,30 @@ function mainBalRange(mainId,from2,to2){
 // customer sub-account, throwing off Assets = Liabilities + Equity by
 // exactly the invoice amount even though the underlying journal entry
 // was perfectly balanced.
-function accBalRangeRollup(accId,from2,to2){
+// dispNormal is the balance side ('Debit'/'Credit') the CALLER is displaying
+// this rollup under — it defaults to the account's own normal side on the
+// initial call, then threads down unchanged through every descendant. This
+// matters because a contra account nested under a parent of the opposite
+// normal side (e.g. Credit-normal "Accumulated Dep." under a Debit-normal
+// "PP&E" parent, or Debit-normal "Sales Returns" under a Credit-normal
+// "Operating Revenues" parent — both true of this app's own default chart
+// of accounts) must be SUBTRACTED, not added, once it's rolled up into its
+// parent's column. Before this fix every descendant was summed with a flat
+// "+" regardless of its own normal side, so e.g. Dr Buildings 100,000 plus
+// Cr Accumulated Dep. 20,000 rolled up to a PP&E total of 120,000 instead
+// of the correct net book value of 80,000 — and, on the Income
+// Statement/Balance Sheet side, a Sales Return or Purchase Return (posted,
+// by design, to a contra account of the opposite normal side) was ADDED to
+// Revenue/COGS instead of subtracted, which could even throw the Balance
+// Sheet's own Assets = Liabilities + Equity check out of balance.
+function accBalRangeRollup(accId,from2,to2,dispNormal){
+ var a=db.accounts.find(function(x){return x.id===accId;});
+ dispNormal=dispNormal||(a&&a.normal);
+ var own=accBalRange(accId,from2,to2);
+ var signed=(a&&a.normal!==dispNormal)?-own:own;
  var kids=db.accounts.filter(function(c){return c.pid===accId;});
- if(!kids.length)return accBalRange(accId,from2,to2);
- return accBalRange(accId,from2,to2)+kids.reduce(function(s,k){return s+accBalRangeRollup(k.id,from2,to2);},0);
+ if(!kids.length)return signed;
+ return signed+kids.reduce(function(s,k){return s+accBalRangeRollup(k.id,from2,to2,dispNormal);},0);
 }
 
 function updatePITotals(){
@@ -4949,12 +4988,31 @@ function pTrial(){
  return h+'</tbody></table></div></div></div>';
 }
 
+// Sums a leaf account's own-normal-signed balance onto its TYPE's total,
+// flipping the sign for a contra account (e.g. Debit-normal "Sales
+// Returns"/"Sales Discounts" nested under Revenue, Credit-normal "Purchase
+// Returns" nested under Expense — both real accounts in this app's default
+// chart of accounts, both posted to by the built-in Sales/Purchase Return
+// feature). Without this, a return was being ADDED to Revenue/COGS instead
+// of subtracted, which could double the apparent swing from any return
+// (e.g. a 200 sales return overstated Net Income by 400, not just failing
+// to reduce it) — see the matching fix in pBalance()'s leafBal.
+function typeSignedLeafBal(a,type,f,t){
+ var b=accBalRange(a.id,f,t);
+ var expNorm=(type==='Asset'||type==='Expense')?'Debit':'Credit';
+ return a.normal!==expNorm?-Math.abs(b):b;
+}
 function incData(){
  var f=rptFrom,t=rptTo;
- var rev=db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,f,t);},0);
- var exp=db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,f,t);},0);
- var cogs=db.accounts.find(function(a){return a.id==='5000';});
- var ca=cogs?(cogs.isMain?mainBalRange('5000',f,t):accBalRange('5000',f,t)):0;
+ var rev=db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Revenue',f,t);},0);
+ var exp=db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Expense',f,t);},0);
+ // COGS lives at '51' ("Cost of Goods Sold (COGS)") in this app's chart of
+ // accounts — '5000' matches no account at all here, which silently made
+ // Gross Profit always equal Total Revenue (ca stayed 0) and left the real
+ // COGS main folded into "Operating Expenses" below instead of being
+ // carved out of it, out of the box.
+ var cogs=db.accounts.find(function(a){return a.id==='51';});
+ var ca=cogs?accBalRangeRollup('51',f,t):0;
  return{rev:rev,exp:exp,ca:ca,gp:rev-ca,ni:rev-exp,oe:exp-ca};
 }
 function pIncome(){
@@ -4971,12 +5029,12 @@ function pIncome(){
  h+='<div class="card" style="max-width:560px"><div class="rh">Revenue</div>';
  db.accounts.filter(function(a){return a.type==='Revenue'&&a.isMain;}).forEach(function(m){
   var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
-  var bal=subs.reduce(function(s,x){return s+accBalRange(x.id,f,t);},0);
-  if(!subs.length)bal=accBalRange(m.id,f,t);
+  var bal=subs.reduce(function(s,x){return s+typeSignedLeafBal(x,'Revenue',f,t);},0);
+  if(!subs.length)bal=typeSignedLeafBal(m,'Revenue',f,t);
   var mCode=rptShowCodes?'<span class="tag" style="font-size:10px;margin-inline-end:4px">'+m.id+'</span>':'';
   h+='<div class="rr"><strong>'+mCode+accN(m)+'</strong><span class="mn">'+N(bal)+'</span></div>';
   subs.forEach(function(s){
-   var sb=accBalRange(s.id,f,t);
+   var sb=typeSignedLeafBal(s,'Revenue',f,t);
    var sCode=rptShowCodes?'<span class="tag" style="font-size:10px;margin-inline-end:4px">'+s.id+'</span>':'';
    h+='<div class="rr ind"><span style="color:var(--t2)">'+sCode+accN(s)+'</span><span class="mn">'+N(sb)+'</span></div>';
   });
@@ -4985,14 +5043,14 @@ function pIncome(){
  h+='<div class="rh">COGS</div><div class="rr ind"><span>Cost of Goods Sold</span><span class="mn">('+N(d.ca)+')</span></div>';
  h+='<div class="rt"><span>Gross Profit</span><span class="mn">'+N(d.gp)+'</span></div>';
  h+='<div class="rh">Operating Expenses</div>';
- db.accounts.filter(function(a){return a.type==='Expense'&&a.isMain&&a.id!=='5000';}).forEach(function(m){
+ db.accounts.filter(function(a){return a.type==='Expense'&&a.isMain&&a.id!=='51';}).forEach(function(m){
   var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
-  var bal=subs.reduce(function(s,x){return s+accBalRange(x.id,f,t);},0);
-  if(!subs.length)bal=accBalRange(m.id,f,t);
+  var bal=subs.reduce(function(s,x){return s+typeSignedLeafBal(x,'Expense',f,t);},0);
+  if(!subs.length)bal=typeSignedLeafBal(m,'Expense',f,t);
   var mCode=rptShowCodes?'<span class="tag" style="font-size:10px;margin-inline-end:4px">'+m.id+'</span>':'';
   h+='<div class="rr"><strong>'+mCode+accN(m)+'</strong><span class="mn">('+N(bal)+')</span></div>';
   subs.forEach(function(s){
-   var sb=accBalRange(s.id,f,t);
+   var sb=typeSignedLeafBal(s,'Expense',f,t);
    var sCode=rptShowCodes?'<span class="tag" style="font-size:10px;margin-inline-end:4px">'+s.id+'</span>':'';
    h+='<div class="rr ind"><span style="color:var(--t2)">'+sCode+accN(s)+'</span><span class="mn">('+N(sb)+')</span></div>';
   });
@@ -5016,7 +5074,18 @@ function bsRows(mains,f,t){
   function leafBal(a){
    var kids=db.accounts.filter(function(c){return c.pid===a.id;});
    var own=accBalRange(a.id,f,t);
-   var ownSigned=a.normal==='Credit'&&a.type==='Asset'?-Math.abs(own):own;
+   // Contra accounts must SUBTRACT from their type's total, not add — not
+   // just contra-ASSETS (Accumulated Depreciation, Allowance for Doubtful
+   // Accounts): a Debit-normal "Sales Returns" nested under Credit-normal
+   // Revenue, a Credit-normal "Purchase Returns" nested under Debit-normal
+   // Expense, or a Debit-normal "Proposed Dividends" nested under
+   // Credit-normal Equity are exactly as real in this app's own default
+   // chart of accounts and posting flows (the built-in Sales/Purchase
+   // Return feature posts to them by design). The old Asset-only check
+   // added every one of those straight into the total instead, which could
+   // even throw off this very page's own Assets=Liabilities+Equity check.
+   var expNorm=(a.type==='Asset'||a.type==='Expense')?'Debit':'Credit';
+   var ownSigned=a.normal!==expNorm?-Math.abs(own):own;
    if(!kids.length)return ownSigned;
    return ownSigned+kids.reduce(function(s,k){return s+leafBal(k);},0);
   }
@@ -5078,7 +5147,12 @@ function pBalance(){
   function getLeafBal(acc){
    var kids=db.accounts.filter(function(c){return c.pid===acc.id;});
    var b=accBalRange(acc.id,f,t);
-   var own=acc.normal==='Credit'&&type==='Asset'?-Math.abs(b):b;
+   // See the matching comment in bsRows()'s leafBal — contra accounts
+   // (a Debit-normal Sales Returns under Revenue, a Credit-normal Purchase
+   // Returns under Expense, a Debit-normal Proposed Dividends under
+   // Equity, not just contra-Assets) must subtract, not add.
+   var expNorm=(type==='Asset'||type==='Expense')?'Debit':'Credit';
+   var own=acc.normal!==expNorm?-Math.abs(b):b;
    if(!kids.length)return own;
    return own+kids.reduce(function(s,k){return s+getLeafBal(k);},0);
   }
@@ -5254,7 +5328,53 @@ function agingCalc(ents,getItems){
  tots.forEach(function(v){h+='<td class="tr mn">'+N(v)+'</td>';});
  return h+'<td class="tr mn">'+N(grand)+'</td><td></td></tr></tbody></table></div></div>';
 }
-function pAgingAR(){var h=tb(tr('nav_agingar')+')','<button class="btn" data-action="xlsAR">'+ic('dn')+' Excel</button><button class="btn" data-action="pdfAR">'+ic('prt')+' PDF</button>');return h+'<div class="pg">'+agingCalc(db.customers,function(c){return db.invoices.filter(function(i){return (i.clientId===c.id||i.client===c.name)&&!i.paid;});})+'</div>';}
+// Symmetric to apOutstandingItems() below. AR Aging used to read ONLY the
+// dead legacy "Tax Invoice" screen (db.invoices), filtered by a manual
+// !i.paid flag completely disconnected from db.receipts — a real Sales
+// Invoice (db.salesInvoices2, the screen actually used and posted to the
+// ledger) never showed up here at all, and a partial receipt against a
+// legacy invoice did nothing to reduce what this report showed.
+function arOutstandingItems(c){
+ var out=[];
+ // Real Sales Invoices post to db.journals (debiting the customer's AR
+ // account), so net them against journal credits (returns/adjustments)
+ // plus db.receipts FIFO, exactly like apOutstandingItems — with debit/
+ // credit and accTo/accFrom flipped, since AR is an Asset/Debit-normal
+ // account (increases on debit) while AP is Liability/Credit-normal
+ // (increases on credit), and per this app's own Receipt/Payment
+ // convention accFrom is always the credit side of the implied entry, so
+ // a customer's payment (which credits/reduces their AR) is netted via
+ // r.accFrom, not r.accTo.
+ if(c.linkedAccId){
+  var debts=[];
+  db.journals.forEach(function(je){je.lines.forEach(function(l){if(l.acc===c.linkedAccId&&l.dr>0)debts.push({date:je.date,amount:l.dr});});});
+  debts.sort(function(a,b){return a.date.localeCompare(b.date);});
+  var reduced=0;
+  db.journals.forEach(function(je){je.lines.forEach(function(l){if(l.acc===c.linkedAccId&&l.cr>0)reduced+=l.cr;});});
+  (db.receipts||[]).forEach(function(r){if(r.accFrom===c.linkedAccId)reduced+=Number(r.amount)||0;});
+  for(var i=0;i<debts.length&&reduced>0.001;i++){
+   var d=debts[i];
+   if(reduced>=d.amount){reduced-=d.amount;d.amount=0;}
+   else{d.amount-=reduced;reduced=0;}
+  }
+  debts.forEach(function(d){if(d.amount>0.001)out.push(d);});
+ }
+ // The legacy Tax Invoice screen now posts a real JE on save too (see
+ // mSaveInv), so any invoice with a jeId is already counted via the
+ // ledger-based scan above — including it again here would double-count
+ // it. Only an invoice saved before that fix (or one whose posting failed
+ // for lack of a Receivable/Revenue account) has no jeId, so its own
+ // "paid" checkbox is the only signal that exists for it; keep it as a
+ // separate, un-netted item so it doesn't silently disappear from Aging AR.
+ (db.invoices||[]).forEach(function(i){
+  if(i.paid||i.jeId)return;
+  if(!((i.clientId&&i.clientId===c.id)||i.client===c.name))return;
+  var amt=Number(i.amount)||(i.items||[]).reduce(function(s,it){return s+(it.qty||0)*(it.rate||0)*(1+(it.vat||0)/100);},0);
+  if(amt>0.001)out.push({date:i.date,amount:amt});
+ });
+ return out;
+}
+function pAgingAR(){var h=tb(tr('nav_agingar')+')','<button class="btn" data-action="xlsAR">'+ic('dn')+' Excel</button><button class="btn" data-action="pdfAR">'+ic('prt')+' PDF</button>');return h+'<div class="pg">'+agingCalc(db.customers,arOutstandingItems)+'</div>';}
 // Outstanding (still-unpaid) invoice-like credits to a supplier's linked
 // payable account, oldest-first, with any payments/debit corrections
 // against that same account netted off FIFO (oldest invoice gets paid
@@ -5999,6 +6119,53 @@ function pBoardDash(){
  return h+'</div>';
 }
 
+// Shared by pZakat() (screen) and the xlsZakat/pdfZakat export — previously
+// each reimplemented this from scratch and had drifted apart: the export's
+// long-term-liability filter was missing the "قرض"/"loan" keywords the
+// screen matches, and the export never subtracted Long-term Investments at
+// all, so the two could print materially different Zakat Due figures for
+// the same data. One function now, called from both places, so they can't
+// disagree again.
+function zakatCalc(f,t){
+ function sumType(type){
+  return db.accounts.filter(function(a){return a.type===type&&!a.isMain;})
+   .reduce(function(s,a){return s+accBalRange(a.id,'',t);},0);
+ }
+ var totalEquity=sumType('Equity');
+ var netIncome=(function(){
+  var r=db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Revenue',f,t);},0);
+  var x=db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Expense',f,t);},0);
+  return r-x;
+ })();
+ var totalAssets=sumType('Asset');
+ var totalLiab=sumType('Liability');
+ // Fixed Assets (net of depreciation). "fa.accumulated" is not a real
+ // field on a Fixed Asset (the posted depreciation total is tracked as
+ // "accDepreciation" everywhere else — mFA, postAssetDepreciation,
+ // mSaveAT); reading it always evaluated to fa.cost-0, i.e. gross cost,
+ // silently ignoring every month of depreciation ever posted and
+ // understating the Zakat base (and therefore the Zakat due) by the full
+ // accumulated-depreciation amount.
+ var fixedAssetsNet=db.fixedAssets?db.fixedAssets.reduce(function(s,fa){
+  var netVal=fa.cost-(fa.accDepreciation||0);
+  return s+(netVal>0?netVal:0);
+ },0):0;
+ var cash=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&(a.name.toLowerCase().indexOf('cash')>-1||a.name.indexOf('نقد')>-1||a.name.indexOf('صندوق')>-1||a.name.indexOf('بنك')>-1||a.name.toLowerCase().indexOf('bank')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
+ var receivables=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&(a.name.indexOf('عميل')>-1||a.name.indexOf('مدين')>-1||a.name.toLowerCase().indexOf('receiv')>-1||a.name.toLowerCase().indexOf('customer')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
+ var inventory=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&(a.name.indexOf('مخزون')>-1||a.name.indexOf('بضاعة')>-1||a.name.toLowerCase().indexOf('inventor')>-1||a.name.toLowerCase().indexOf('stock')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
+ var longTermLiab=db.accounts.filter(function(a){return a.type==='Liability'&&!a.isMain&&(a.name.indexOf('طويل')>-1||a.name.toLowerCase().indexOf('long')>-1||a.name.indexOf('قرض')>-1||a.name.toLowerCase().indexOf('loan')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
+ var longTermInv=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&((a.name.indexOf('استثمار')>-1&&a.name.indexOf('طويل')>-1)||(a.name.toLowerCase().indexOf('invest')>-1&&a.name.toLowerCase().indexOf('long')>-1));}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
+ // ZATCA Method: Zakat Base = (Equity + Net Income + Long-term liabilities) - Fixed Assets - Long-term investments
+ var zakatBase=Math.max(0,(totalEquity+netIncome+longTermLiab)-fixedAssetsNet-longTermInv);
+ var currentLiab=totalLiab-longTermLiab;
+ var currentAssets=totalAssets-fixedAssetsNet;
+ var zakatDue=zakatBase*0.025;
+ var nisab=19550; // approx 85g gold × ~230 SAR/g
+ return {totalEquity:totalEquity,netIncome:netIncome,totalAssets:totalAssets,totalLiab:totalLiab,
+  fixedAssetsNet:fixedAssetsNet,cash:cash,receivables:receivables,inventory:inventory,
+  longTermLiab:longTermLiab,longTermInv:longTermInv,currentLiab:currentLiab,currentAssets:currentAssets,
+  zakatBase:zakatBase,zakatDue:zakatDue,nisab:nisab,aboveNisab:zakatBase>=nisab};
+}
 function pZakat(){
  var isAr=lang==='ar';
  var h=tb(isAr?'احتساب الزكاة':'Zakat Calculation',
@@ -6016,76 +6183,13 @@ function pZakat(){
   +'<button class="btn bp" id="btnCalcZakat" style="margin-top:8px">⚖️ '+(isAr?'احتساب الوعاء الزكوي':'Calculate Zakat Base')+'</button>'
   +'</div>';
 
- // Helper: get account balance by type
  var f=rptFrom||today().slice(0,4)+'-01-01';
  var t=rptTo||today();
-
- function sumType(type){
-  return db.accounts.filter(function(a){return a.type===type&&!a.isMain;})
-   .reduce(function(s,a){return s+accBalRange(a.id,'',t);},0);
- }
- function sumAccs(ids){
-  return ids.reduce(function(s,id){
-   return s+accBalRange(id,'',t);
-  },0);
- }
-
- // ── ZATCA Zakat Base Calculation (Saudi Method) ────────────
- // الوعاء الزكوي = حقوق الملكية + الديون طويلة الأجل - الأصول الثابتة الصافية - الاستثمارات طويلة الأجل
-
- var totalEquity=sumType('Equity');
- var netIncome=(function(){
-  var r=db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,f,t);},0);
-  var x=db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,f,t);},0);
-  return r-x;
- })();
-
- // Assets breakdown
- var totalAssets=sumType('Asset');
- var totalLiab=sumType('Liability');
-
- // Fixed Assets (net of depreciation)
- var fixedAssetsNet=db.fixedAssets?db.fixedAssets.reduce(function(s,fa){
-  var netVal=fa.cost-(fa.accumulated||0);
-  return s+(netVal>0?netVal:0);
- },0):0;
-
- // Current Assets components
- var cash=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&(a.name.toLowerCase().indexOf('cash')>-1||a.name.indexOf('نقد')>-1||a.name.indexOf('صندوق')>-1||a.name.indexOf('بنك')>-1||a.name.toLowerCase().indexOf('bank')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
-
- var receivables=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&(a.name.indexOf('عميل')>-1||a.name.indexOf('مدين')>-1||a.name.toLowerCase().indexOf('receiv')>-1||a.name.toLowerCase().indexOf('customer')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
-
- var inventory=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&(a.name.indexOf('مخزون')>-1||a.name.indexOf('بضاعة')>-1||a.name.toLowerCase().indexOf('inventor')>-1||a.name.toLowerCase().indexOf('stock')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
-
- // Long-term liabilities
- var longTermLiab=db.accounts.filter(function(a){return a.type==='Liability'&&!a.isMain&&(a.name.indexOf('طويل')>-1||a.name.toLowerCase().indexOf('long')>-1||a.name.indexOf('قرض')>-1||a.name.toLowerCase().indexOf('loan')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
-
- // Long-term investments — the comment on the line below has always said
- // this should be deducted, but no account search + subtraction was ever
- // actually implemented, so it silently stayed at 0 (overstating the Zakat
- // base whenever the company holds any long-term investments).
- var longTermInv=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&((a.name.indexOf('استثمار')>-1&&a.name.indexOf('طويل')>-1)||(a.name.toLowerCase().indexOf('invest')>-1&&a.name.toLowerCase().indexOf('long')>-1));}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
-
- // ZATCA Method: Zakat Base = (Equity + Long-term liabilities) - Fixed Assets - Long-term investments
- var zakatBase_method1 = (totalEquity+netIncome+longTermLiab) - fixedAssetsNet - longTermInv;
- if(zakatBase_method1<0)zakatBase_method1=0;
-
- // Alternative (Asset-based): Current Assets - Current Liabilities
- var currentLiab=totalLiab-longTermLiab;
- var currentAssets=totalAssets-fixedAssetsNet;
- var zakatBase_method2 = currentAssets-currentLiab;
- if(zakatBase_method2<0)zakatBase_method2=0;
-
- // Use method1 (ZATCA standard)
- var zakatBase = zakatBase_method1;
-
- // Zakat rate = 2.5% (ربع العشر)
- var zakatRate = 0.025;
- var zakatDue = zakatBase * zakatRate;
-
- // Nisab (threshold) — approx 85g gold × gold price (~230 SAR/g) = ~19,550 SAR
- var nisab = 19550;
- var aboveNisab = zakatBase >= nisab;
+ var z=zakatCalc(f,t);
+ var totalEquity=z.totalEquity,netIncome=z.netIncome,fixedAssetsNet=z.fixedAssetsNet,
+  cash=z.cash,receivables=z.receivables,inventory=z.inventory,longTermLiab=z.longTermLiab,
+  currentAssets=z.currentAssets,zakatBase=z.zakatBase,zakatDue=z.zakatDue,
+  nisab=z.nisab,aboveNisab=z.aboveNisab;
 
  // ── Display ──────────────────────────────────────────────────
  h+='<div class="card" style="margin-bottom:14px;border:2px solid #185FA510">'
@@ -7256,32 +7360,50 @@ window.xAction=function(type){
   exportXLS(aoa5,'Budget',bud4.name||'Budget');return;
  }
  if(type==='xlsZakat'||type==='pdfZakat'){
+  // Both branches now call the SAME zakatCalc() the on-screen pZakat() page
+  // uses, so the export can no longer drift from the screen (it previously
+  // missed the قرض/loan keywords, omitted the Long-term Investments
+  // deduction entirely, and read a non-existent fa.accumulated field —
+  // see zakatCalc's own comments for the full history of each bug).
   var isAr3=lang==='ar';
   var t3=rptTo||today();
   var f3=rptFrom||today().slice(0,4)+'-01-01';
-  function sumT(tp){return db.accounts.filter(function(a){return a.type===tp&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,'',t3);},0);}
-  var eq3=sumT('Equity');
-  var r3=db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,f3,t3);},0);
-  var x3=db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,f3,t3);},0);
-  var ni3=r3-x3;
-  var ltl3=db.accounts.filter(function(a){return a.type==='Liability'&&!a.isMain&&(a.name.indexOf('طويل')>-1||a.name.toLowerCase().indexOf('long')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t3));},0);
-  var fa3=db.fixedAssets?db.fixedAssets.reduce(function(s,fa){return s+Math.max(0,fa.cost-(fa.accumulated||0));},0):0;
-  var base3=Math.max(0,eq3+ni3+ltl3-fa3);
-  var due3=base3*0.025;
-  var aoa4=[
-   [isAr3?'تقرير احتساب الزكاة':'Zakat Calculation Report'],
-   [db.company.name||''],[isAr3?'الفترة:':'Period:',f3+' - '+t3],[],
-   [isAr3?'البيان':'Item',isAr3?'المبلغ (ر.س)':'Amount (SAR)'],
-   [isAr3?'حقوق الملكية':'Total Equity',eq3],
-   [isAr3?'صافي الدخل':'Net Income',ni3],
-   [isAr3?'الديون طويلة الأجل':'Long-term Liabilities',ltl3],
-   [isAr3?'(-) الأصول الثابتة الصافية':'(-) Net Fixed Assets',-fa3],
-   [''],
-   [isAr3?'الوعاء الزكوي':'ZAKAT BASE',base3],
-   [isAr3?'نسبة الزكاة':'Zakat Rate','2.5%'],
-   [isAr3?'الزكاة المستحقة':'ZAKAT DUE',due3],
+  var z3=zakatCalc(f3,t3);
+  if(type==='xlsZakat'){
+   var aoa4=[
+    [isAr3?'تقرير احتساب الزكاة':'Zakat Calculation Report'],
+    [db.company.name||''],[isAr3?'الفترة:':'Period:',f3+' - '+t3],[],
+    [isAr3?'البيان':'Item',isAr3?'المبلغ (ر.س)':'Amount (SAR)'],
+    [isAr3?'حقوق الملكية':'Total Equity',z3.totalEquity],
+    [isAr3?'صافي الدخل':'Net Income',z3.netIncome],
+    [isAr3?'الديون طويلة الأجل':'Long-term Liabilities',z3.longTermLiab],
+    [isAr3?'(-) الأصول الثابتة الصافية':'(-) Net Fixed Assets',-z3.fixedAssetsNet],
+    [isAr3?'(-) الاستثمارات طويلة الأجل':'(-) Long-term Investments',-z3.longTermInv],
+    [''],
+    [isAr3?'الوعاء الزكوي':'ZAKAT BASE',z3.zakatBase],
+    [isAr3?'نسبة الزكاة':'Zakat Rate','2.5%'],
+    [isAr3?'الزكاة المستحقة':'ZAKAT DUE',z3.zakatDue],
+   ];
+   exportXLS(aoa4,'Zakat','Zakat_'+t3.slice(0,4));
+   return;
+  }
+  // pdfZakat: previously funneled into the same exportXLS() call above, so
+  // clicking "PDF" silently downloaded an .xlsx file instead of a PDF.
+  var zRows=[
+   [isAr3?'حقوق الملكية':'Total Equity',z3.totalEquity],
+   [isAr3?'صافي الدخل':'Net Income',z3.netIncome],
+   [isAr3?'الديون طويلة الأجل':'Long-term Liabilities',z3.longTermLiab],
+   [isAr3?'(-) الأصول الثابتة الصافية':'(-) Net Fixed Assets',-z3.fixedAssetsNet],
+   [isAr3?'(-) الاستثمارات طويلة الأجل':'(-) Long-term Investments',-z3.longTermInv],
   ];
-  exportXLS(aoa4,'Zakat','Zakat_'+t3.slice(0,4));
+  var zHtml='<table><tbody>'
+   +'<tr><th colspan="2">'+(isAr3?'تقرير احتساب الزكاة':'Zakat Calculation Report')+' — '+f3+' - '+t3+'</th></tr>'
+   +zRows.map(function(r){return '<tr><td>'+r[0]+'</td><td class="tr">'+N(r[1])+'</td></tr>';}).join('')
+   +'<tr class="tot"><td>'+(isAr3?'الوعاء الزكوي':'ZAKAT BASE')+'</td><td class="tr">'+N(z3.zakatBase)+'</td></tr>'
+   +'<tr><td>'+(isAr3?'نسبة الزكاة':'Zakat Rate')+'</td><td class="tr">2.5%</td></tr>'
+   +'<tr class="fin"><td>'+(isAr3?'الزكاة المستحقة':'ZAKAT DUE')+'</td><td class="tr">'+N(z3.zakatDue)+'</td></tr>'
+   +'</tbody></table>';
+  printHTML(isAr3?'تقرير احتساب الزكاة':'Zakat Calculation Report',zHtml);
   return;
  }
  if(type==='xlsWorkCap'||type==='pdfWorkCap'){
@@ -7438,7 +7560,8 @@ window.xAction=function(type){
   if(!r.ok){
    var msgs={noAccounts:lang==='ar'?'\u064a\u062c\u0628 \u062a\u062d\u062f\u064a\u062f \u062d\u0633\u0627\u0628 \u0645\u0635\u0631\u0648\u0641 \u0627\u0644\u0625\u0647\u0644\u0627\u0643 \u0648\u062d\u0633\u0627\u0628 \u0645\u062c\u0645\u0639 \u0627\u0644\u0625\u0647\u0644\u0627\u0643 \u0641\u064a \u0628\u064a\u0627\u0646\u0627\u062a \u0627\u0644\u0623\u0635\u0644':'Set Depreciation Expense Account and Accumulated Depreciation Account on asset first.',
     noAmount:lang==='ar'?'\u0644\u0627 \u064a\u0648\u062c\u062f \u0625\u0647\u0644\u0627\u0643 \u0644\u062a\u0631\u062d\u064a\u0644\u0647':'No depreciation to post.',
-    fullyDep:lang==='ar'?'\u0627\u0644\u0623\u0635\u0644 \u0645\u0633\u062a\u0647\u0644\u0643 \u0628\u0627\u0644\u0643\u0627\u0645\u0644':'Asset fully depreciated.'};
+    fullyDep:lang==='ar'?'\u0627\u0644\u0623\u0635\u0644 \u0645\u0633\u062a\u0647\u0644\u0643 \u0628\u0627\u0644\u0643\u0627\u0645\u0644':'Asset fully depreciated.',
+    alreadyPosted:lang==='ar'?'\u062a\u0645 \u062a\u0631\u062d\u064a\u0644 \u0625\u0647\u0644\u0627\u0643 \u0647\u0630\u0627 \u0627\u0644\u0634\u0647\u0631 \u0644\u0647\u0630\u0627 \u0627\u0644\u0623\u0635\u0644 \u0645\u0633\u0628\u0642\u0627\u064b':'Depreciation for this month was already posted for this asset.'};
    alert(msgs[r.reason]||r.reason);return;
   }
   save();render();
@@ -7451,7 +7574,8 @@ window.xAction=function(type){
   if(!rOne.ok){
    var msgsOne={noAccounts:lang==='ar'?'\u064a\u062c\u0628 \u062a\u062d\u062f\u064a\u062f \u062d\u0633\u0627\u0628 \u0645\u0635\u0631\u0648\u0641 \u0627\u0644\u0625\u0647\u0644\u0627\u0643 \u0648\u062d\u0633\u0627\u0628 \u0645\u062c\u0645\u0639 \u0627\u0644\u0625\u0647\u0644\u0627\u0643 \u0641\u064a \u0628\u064a\u0627\u0646\u0627\u062a \u0627\u0644\u0623\u0635\u0644':'Set Depreciation Expense Account and Accumulated Depreciation Account on asset first.',
     noAmount:lang==='ar'?'\u0644\u0627 \u064a\u0648\u062c\u062f \u0625\u0647\u0644\u0627\u0643 \u0644\u062a\u0631\u062d\u064a\u0644\u0647':'No depreciation to post.',
-    fullyDep:lang==='ar'?'\u0627\u0644\u0623\u0635\u0644 \u0645\u0633\u062a\u0647\u0644\u0643 \u0628\u0627\u0644\u0643\u0627\u0645\u0644':'Asset fully depreciated.'};
+    fullyDep:lang==='ar'?'\u0627\u0644\u0623\u0635\u0644 \u0645\u0633\u062a\u0647\u0644\u0643 \u0628\u0627\u0644\u0643\u0627\u0645\u0644':'Asset fully depreciated.',
+    alreadyPosted:lang==='ar'?'\u062a\u0645 \u062a\u0631\u062d\u064a\u0644 \u0625\u0647\u0644\u0627\u0643 \u0647\u0630\u0627 \u0627\u0644\u0634\u0647\u0631 \u0644\u0647\u0630\u0627 \u0627\u0644\u0623\u0635\u0644 \u0645\u0633\u0628\u0642\u0627\u064b':'Depreciation for this month was already posted for this asset.'};
    alert((aOne.name||aOne.id)+': '+(msgsOne[rOne.reason]||rOne.reason));return;
   }
   save();render();
@@ -7473,7 +7597,7 @@ window.xAction=function(type){
   var lines2=[];
   lines2.push((lang==='ar'?'\u2705 \u062a\u0645 \u062a\u0631\u062d\u064a\u0644 \u0627\u0644\u0625\u0647\u0644\u0627\u0643 \u0644\u0640 ':'\u2705 Depreciation posted for ')+posted2.length+(lang==='ar'?' \u0623\u0635\u0644 \u0628\u0625\u062c\u0645\u0627\u0644\u064a ':' asset(s), total ')+N(totalPosted));
   if(skipped2.length){
-   var reasonLabel=function(r){return r==='noAccounts'?(lang==='ar'?'\u0644\u0627 \u062a\u0648\u062c\u062f \u062d\u0633\u0627\u0628\u0627\u062a \u0645\u0631\u062a\u0628\u0637\u0629':'no linked accounts'):r==='fullyDep'?(lang==='ar'?'\u0645\u0633\u062a\u0647\u0644\u0643 \u0628\u0627\u0644\u0643\u0627\u0645\u0644':'fully depreciated'):(lang==='ar'?'\u0644\u0627 \u064a\u0648\u062c\u062f \u0645\u0628\u0644\u063a':'no amount due');};
+   var reasonLabel=function(r){return r==='noAccounts'?(lang==='ar'?'\u0644\u0627 \u062a\u0648\u062c\u062f \u062d\u0633\u0627\u0628\u0627\u062a \u0645\u0631\u062a\u0628\u0637\u0629':'no linked accounts'):r==='fullyDep'?(lang==='ar'?'\u0645\u0633\u062a\u0647\u0644\u0643 \u0628\u0627\u0644\u0643\u0627\u0645\u0644':'fully depreciated'):r==='alreadyPosted'?(lang==='ar'?'\u062a\u0645 \u062a\u0631\u062d\u064a\u0644\u0647 \u0647\u0630\u0627 \u0627\u0644\u0634\u0647\u0631 \u0645\u0633\u0628\u0642\u0627\u064b':'already posted this month'):(lang==='ar'?'\u0644\u0627 \u064a\u0648\u062c\u062f \u0645\u0628\u0644\u063a':'no amount due');};
    lines2.push((lang==='ar'?'\u23ed \u062a\u0645 \u062a\u062e\u0637\u064a ':'\u23ed Skipped ')+skipped2.length+(lang==='ar'?': ':': ')+skipped2.map(function(s){return s.name+' ('+reasonLabel(s.reason)+')';}).join(', '));
   }
   alert(lines2.join('\n'));return;
@@ -7483,16 +7607,22 @@ window.xAction=function(type){
   var coaRows=[];
   var types=['Asset','Liability','Equity','Revenue','Expense'];
   types.forEach(function(t){
+   // Every balance here is acctRollupBal() (accBalRange-based, live), not
+   // the raw .bal field — see the matching fix/comment on acctRollupBal()
+   // and pCOA(): .bal sits stale at 0 forever for any account whose real
+   // activity came through journals/receipts/payments, which made these
+   // exports permanently disagree with the on-screen Chart of Accounts and
+   // every other report (Trial Balance, Balance Sheet) built on the data.
    db.accounts.filter(function(a){return a.type===t&&a.isMain&&!a.pid;}).forEach(function(m){
     var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
-    var bal=subs.length?subs.reduce(function(s,x){return s+x.bal;},0):m.bal;
+    var bal=subs.length?subs.reduce(function(s,x){return s+acctRollupBal(x);},0):acctRollupBal(m);
     coaRows.push({id:m.id,name:m.name,nameAr:m.nameAr||'',type:t,level:'Main',normal:m.normal,bal:bal,indent:0,isMain:true});
     subs.forEach(function(s){
      var subSubs=db.accounts.filter(function(ss){return ss.pid===s.id;});
-     var sBal=subSubs.length?subSubs.reduce(function(x,y){return x+y.bal;},0):s.bal;
+     var sBal=acctRollupBal(s);
      coaRows.push({id:s.id,name:s.name,nameAr:s.nameAr||'',type:t,level:subSubs.length?'Sub-Main':'Sub',normal:s.normal,bal:sBal,indent:1,isMain:false});
      subSubs.forEach(function(ss){
-      coaRows.push({id:ss.id,name:ss.name,nameAr:ss.nameAr||'',type:t,level:'Sub-Sub',normal:ss.normal,bal:ss.bal,indent:2,isMain:false});
+      coaRows.push({id:ss.id,name:ss.name,nameAr:ss.nameAr||'',type:t,level:'Sub-Sub',normal:ss.normal,bal:acctRollupBal(ss),indent:2,isMain:false});
      });
     });
    });
@@ -7650,9 +7780,9 @@ window.xAction=function(type){
   aoa.push(['REVENUE','','']);
   db.accounts.filter(function(a){return a.type==='Revenue'&&a.isMain;}).forEach(function(m){
    var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
-   var bal=subs.length?subs.reduce(function(s,x){return s+accBalRange(x.id,f,t2);},0):accBalRange(m.id,f,t2);
+   var bal=subs.length?subs.reduce(function(s,x){return s+typeSignedLeafBal(x,'Revenue',f,t2);},0):typeSignedLeafBal(m,'Revenue',f,t2);
    aoa.push([m.id,m.name,bal]);
-   subs.forEach(function(s){aoa.push([s.id,'  '+accN(s),accBalRange(s.id,f,t2)]);});
+   subs.forEach(function(s){aoa.push([s.id,'  '+accN(s),typeSignedLeafBal(s,'Revenue',f,t2)]);});
   });
   aoa.push(['','Total Revenue',d.rev]);
   aoa.push(['']);
@@ -7661,11 +7791,11 @@ window.xAction=function(type){
   aoa.push(['Gross Profit',d.gp]);
   aoa.push(['']);
   aoa.push(['OPERATING EXPENSES','']);
-  db.accounts.filter(function(a){return a.type==='Expense'&&a.isMain&&a.id!=='5000';}).forEach(function(m){
+  db.accounts.filter(function(a){return a.type==='Expense'&&a.isMain&&a.id!=='51';}).forEach(function(m){
    var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
-   var bal=subs.length?subs.reduce(function(s,x){return s+accBalRange(x.id,f,t2);},0):accBalRange(m.id,f,t2);
+   var bal=subs.length?subs.reduce(function(s,x){return s+typeSignedLeafBal(x,'Expense',f,t2);},0):typeSignedLeafBal(m,'Expense',f,t2);
    aoa.push([m.name,bal]);
-   subs.forEach(function(s){aoa.push(['  '+accN(s),accBalRange(s.id,f,t2)]);});
+   subs.forEach(function(s){aoa.push(['  '+accN(s),typeSignedLeafBal(s,'Expense',f,t2)]);});
   });
   aoa.push(['Total Operating Expenses',d.oe]);
   aoa.push(['']);
@@ -7674,9 +7804,16 @@ window.xAction=function(type){
  } else if(type==='pdfIncome'){
   var f=rptFrom,t2=rptTo;
   var d=incData(),html='<table><tbody><tr><th colspan="2">REVENUE</th></tr>';
-  db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).forEach(function(a){var b=accBalRange(a.id,f,t2);html+='<tr><td style="padding-left:14pt">'+accN(a)+'</td><td class="tr">'+N(b)+'</td></tr>';});
-  html+='<tr class="tot"><td>Total Revenue</td><td class="tr">'+N(d.rev)+'</td></tr><tr class="tot"><td>Gross Profit</td><td class="tr">'+N(d.gp)+'</td></tr><tr><th colspan="2">EXPENSES</th></tr>';
-  db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;}).forEach(function(a){var b=accBalRange(a.id,f,t2);html+='<tr><td style="padding-left:14pt">'+accN(a)+'</td><td class="tr">('+N(b)+')</td></tr>';});
+  db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).forEach(function(a){var b=typeSignedLeafBal(a,'Revenue',f,t2);html+='<tr><td style="padding-left:14pt">'+accN(a)+'</td><td class="tr">'+N(b)+'</td></tr>';});
+  html+='<tr class="tot"><td>Total Revenue</td><td class="tr">'+N(d.rev)+'</td></tr>';
+  html+='<tr><td>Cost of Goods Sold</td><td class="tr">('+N(d.ca)+')</td></tr>';
+  html+='<tr class="tot"><td>Gross Profit</td><td class="tr">'+N(d.gp)+'</td></tr><tr><th colspan="2">OPERATING EXPENSES</th></tr>';
+  // Exclude the COGS main ('51') and its own leaves here — they're already
+  // carved out above as "Cost of Goods Sold"; listing them again under
+  // Operating Expenses (as this used to, with no exclusion at all) doesn't
+  // change the final Net Income total but makes the same cost appear
+  // twice in the printed breakdown.
+  db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain&&a.pid!=='51'&&a.id!=='51';}).forEach(function(a){var b=typeSignedLeafBal(a,'Expense',f,t2);html+='<tr><td style="padding-left:14pt">'+accN(a)+'</td><td class="tr">('+N(b)+')</td></tr>';});
   html+='<tr class="fin"><td>NET INCOME</td><td class="tr">'+N(d.ni)+'</td></tr></tbody></table>';
   printHTML('Income Statement',html);
  } else if(type==='xlsBalance'){
@@ -7691,7 +7828,10 @@ window.xAction=function(type){
    // had even one auto-created customer sub-account (see accBalRangeRollup).
    var kids=db.accounts.filter(function(c){return c.pid===acc.id;});
    var b=accBalRange(acc.id,f,t2);
-   var own=acc.normal==='Credit'&&tp==='Asset'?-Math.abs(b):b;
+   // Contra accounts subtract from their type's total (not just
+   // contra-Assets — see the matching comment in pBalance()'s leafBal).
+   var expNorm=(tp==='Asset'||tp==='Expense')?'Debit':'Credit';
+   var own=acc.normal!==expNorm?-Math.abs(b):b;
    if(!kids.length)return own;
    return own+kids.reduce(function(s,k){return s+xlsLeafBal2(k,tp);},0);
   }
@@ -7747,7 +7887,10 @@ window.xAction=function(type){
    // direct postings, not just its children's rollup (see accBalRangeRollup).
    var kids=db.accounts.filter(function(c){return c.pid===acc.id;});
    var b=accBalRange(acc.id,f,t2);
-   var own=acc.normal==='Credit'&&tp==='Asset'?-Math.abs(b):b;
+   // Contra accounts subtract from their type's total (not just
+   // contra-Assets — see the matching comment in pBalance()'s leafBal).
+   var expNorm=(tp==='Asset'||tp==='Expense')?'Debit':'Credit';
+   var own=acc.normal!==expNorm?-Math.abs(b):b;
    if(!kids.length)return own;
    return own+kids.reduce(function(s,k){return s+pdfLeafBal(k,tp);},0);
   }
@@ -7878,10 +8021,7 @@ window.xAction=function(type){
   var isAR=type==='xlsAR'||type==='pdfAR';
   var label=isAR?'AR Aging (Receivables)':'AP Aging (Payables)';
   var ents2=isAR?db.customers:db.suppliers;
-  var data=agingData(ents2,function(e){
-   if(isAR)return db.invoices.filter(function(v){return (v.clientId===e.id||v.client===e.name)&&!v.paid;});
-   return apOutstandingItems(e);
-  });
+  var data=agingData(ents2,isAR?arOutstandingItems:apOutstandingItems);
   if(type==='xlsAR'||type==='xlsAP'){
    var aoa3=[[db.company.name],[label],['Date: '+today()],[]];
    aoa3.push(['Name','Account','Current','1-30 days','31-60 days','61-90 days','90+ days','Total']);
@@ -8010,7 +8150,24 @@ function bindEvents(){
   var je=db.journals.find(function(j){return j.id===el.dataset.printje;});
   printOneJE(je);
  });
- on('[data-delje]','click',function(el){if(confirm('Delete?')){db.journals=db.journals.filter(function(j){return j.id!==el.dataset.delje;});save();render();}});
+ on('[data-delje]','click',function(el){
+  if(confirm('Delete?')){
+   var jeIdDel=el.dataset.delje;
+   db.journals=db.journals.filter(function(j){return j.id!==jeIdDel;});
+   // Deleting a JE used to leave every invoice/asset-transaction that
+   // referenced it (jeId/cogsJeId) pointing at nothing — the invoice still
+   // showed "Posted" with a JE number that no longer existed anywhere.
+   // Unlink and revert those back to Draft so they can be re-posted.
+   (db.salesInvoices2||[]).forEach(function(si){
+    if(si.jeId===jeIdDel){si.jeId=null;si.posted=false;}
+    if(si.cogsJeId===jeIdDel)si.cogsJeId=null;
+   });
+   (db.purchaseInvoices||[]).forEach(function(pi){if(pi.jeId===jeIdDel){pi.jeId=null;pi.posted=false;}});
+   (db.invoices||[]).forEach(function(i){if(i.jeId===jeIdDel)i.jeId=null;});
+   (db.assetTransactions||[]).forEach(function(t){if(t.jeId===jeIdDel)t.jeId=null;});
+   save();render();
+  }
+ });
  on1('addJELine','click',function(){tJE.lines.push({acc:'',dr:'',cr:''});render();});
  on('[data-rmjl]','click',function(el){tJE.lines.splice(Number(el.dataset.rmjl),1);render();});
 
@@ -8168,6 +8325,19 @@ function bindEvents(){
   if(!je)return;
   if(!confirm((lang==='ar'?'حذف القيد ':'Delete entry ')+je.id+'?'))return;
   db.journals=db.journals.filter(function(j){return j.id!==je.id;});
+  // This is the actual reachable "Delete" action for a journal entry (the
+  // [data-delje] handler elsewhere is unreachable dead code). Deleting a
+  // JE used to leave every invoice/asset-transaction that referenced it
+  // (jeId/cogsJeId) pointing at nothing — the invoice still showed
+  // "Posted" with a JE number that no longer existed anywhere. Unlink and
+  // revert those back to Draft so they can be re-posted.
+  (db.salesInvoices2||[]).forEach(function(si){
+   if(si.jeId===je.id){si.jeId=null;si.posted=false;}
+   if(si.cogsJeId===je.id)si.cogsJeId=null;
+  });
+  (db.purchaseInvoices||[]).forEach(function(pi){if(pi.jeId===je.id){pi.jeId=null;pi.posted=false;}});
+  (db.invoices||[]).forEach(function(i){if(i.jeId===je.id)i.jeId=null;});
+  (db.assetTransactions||[]).forEach(function(t){if(t.jeId===je.id)t.jeId=null;});
   if(jeState.currentIdx>=db.journals.length)jeState.currentIdx=Math.max(0,db.journals.length-1);
   if(db.journals.length===0)jeState.mode='list';
   save();render();
@@ -8267,7 +8437,14 @@ function bindEvents(){
  // Invoice
  on1('btnAddInv','click',function(){tInv={editId:null,client:'',clientId:'',date:today(),vatNo:'',items:[{desc:'',qty:1,rate:'',vat:vatR()}]};modal='inv';render();});
  on('[data-viewinv]','click',function(el){invView=db.invoices.find(function(i){return i.id===el.dataset.viewinv;});view='invoice';render();});
- on('[data-delinv]','click',function(el){if(confirm('Delete?')){db.invoices=db.invoices.filter(function(i){return i.id!==el.dataset.delinv;});save();render();}});
+ on('[data-delinv]','click',function(el){
+  if(confirm('Delete?')){
+   var invDel=db.invoices.find(function(i){return i.id===el.dataset.delinv;});
+   if(invDel&&invDel.jeId)db.journals=db.journals.filter(function(j){return j.id!==invDel.jeId;});
+   db.invoices=db.invoices.filter(function(i){return i.id!==el.dataset.delinv;});
+   save();render();
+  }
+ });
  on('[data-paidinv]','click',function(el){var inv=db.invoices.find(function(i){return i.id===el.dataset.paidinv;});if(inv){inv.paid=!inv.paid;save();render();}});
  on1('btnBackInv','click',function(){invView=null;render();});
  on1('btnPrintJE','click',function(){window.xAction('printJE');});
@@ -8390,6 +8567,7 @@ function bindEvents(){
   if(!date){alert('Enter date.');return;}
   var vatNo=((document.getElementById('inv-vatno')||{}).value||'').trim();
   var items=tInv.items.map(function(i){return{desc:i.desc,qty:Number(i.qty)||1,rate:Number(i.rate)||0,vat:Number(i.vat)||vatR()};});
+  var invForPost;
   if(tInv.editId){
    var inv2=db.invoices.find(function(x){return x.id===tInv.editId;});
    if(inv2){
@@ -8398,13 +8576,50 @@ function bindEvents(){
    var invPhone2=((document.getElementById('inv-phone')||{}).value||'').trim();
    inv2.date=date;inv2.client=clientName;inv2.clientId=clientId;inv2.vatNo=vatNo;inv2.items=items;
    inv2.notes=invNotes2;inv2.clientAddr=invAddr2;inv2.clientPhone=invPhone2;
+   invForPost=inv2;
   }
    if(invView&&invView.id===tInv.editId)invView=db.invoices.find(function(x){return x.id===tInv.editId;});
   } else {
    var invNotes=((document.getElementById('inv-notes')||{}).value||'').trim();
   var invAddr=((document.getElementById('inv-addr')||{}).value||'').trim();
   var invPhone=((document.getElementById('inv-phone')||{}).value||'').trim();
-  db.invoices.push({id:nextINV(),date:date,client:clientName,clientId:clientId,vatNo:vatNo,items:items,paid:false,notes:invNotes,clientAddr:invAddr,clientPhone:invPhone});
+  invForPost={id:nextINV(),date:date,client:clientName,clientId:clientId,vatNo:vatNo,items:items,paid:false,notes:invNotes,clientAddr:invAddr,clientPhone:invPhone};
+  db.invoices.push(invForPost);
+  }
+  // This legacy "Tax Invoice" screen never posted anything to db.journals
+  // at all — it never showed up in Trial Balance, Balance Sheet, Income
+  // Statement, or (before this session's fix) the corrected Aging AR, even
+  // though it was a fully reachable, actively-used way to bill a customer.
+  // Post/re-post a real JE for it now, same as the Sales Invoices screen:
+  // Dr Receivable (customer's own linked account if set, else the generic
+  // Receivable account) / Cr Revenue (net of VAT) + Cr VAT Collected.
+  // Re-saving an already-posted invoice UPDATES its existing JE in place
+  // (by id) rather than creating a duplicate, so edits stay in sync with
+  // the ledger instead of leaving a stale first-version JE behind.
+  if(invForPost){
+   var subI=items.reduce(function(s,i){return s+i.qty*i.rate;},0);
+   var vatI=items.reduce(function(s,i){return s+i.qty*i.rate*(i.vat||0)/100;},0);
+   var totI=subI+vatI;
+   var recAccI=db.accounts.find(function(a){return a.id==='1103-01'||a.name.indexOf('Local Customers')>-1;});
+   if(!recAccI)recAccI=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&(a.name.indexOf('Receiv')>-1||a.name.indexOf('Customer')>-1);})[0];
+   if(clientId){var cusI=db.customers.find(function(x){return x.id===clientId;});if(cusI&&cusI.linkedAccId){var laI=db.accounts.find(function(a){return a.id===cusI.linkedAccId;});if(laI)recAccI=laI;}}
+   var revAccI=db.accounts.find(function(a){return a.type==='Revenue'&&!a.isMain&&(a.name.indexOf('Local Sales')>-1||a.name.indexOf('4101-01')>-1);});
+   if(!revAccI)revAccI=db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;})[0];
+   var vatAccI=db.accounts.find(function(a){return a.id==='2103-01'||a.name.indexOf('VAT Collected')>-1;});
+   if(recAccI&&revAccI&&totI>0){
+    var jeLinesI=[{acc:recAccI.id,dr:totI,cr:0}];
+    if(vatAccI&&vatI>0)jeLinesI.push({acc:vatAccI.id,dr:0,cr:vatI});
+    jeLinesI.push({acc:revAccI.id,dr:0,cr:subI});
+    var jeDescI=(lang==='ar'?'فاتورة ضريبية: ':'Tax Invoice: ')+invForPost.id+' — '+clientName;
+    if(invForPost.jeId&&db.journals.some(function(j){return j.id===invForPost.jeId;})){
+     var existJeI=db.journals.find(function(j){return j.id===invForPost.jeId;});
+     existJeI.date=date;existJeI.desc=jeDescI;existJeI.lines=jeLinesI;
+    } else {
+     var jeI={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:date,desc:jeDescI,lines:jeLinesI};
+     db.journals.push(jeI);
+     invForPost.jeId=jeI.id;
+    }
+   }
   }
   modal=null;save();render();
  });
@@ -8639,9 +8854,19 @@ function bindEvents(){
  on('[data-viewfa]','click',function(el){tFA=el.dataset.viewfa;view='fixedassets';render();});
  on('[data-postdep]','click',function(el){postDepTarget=el.dataset.postdep;window.xAction('postDepOne');});
  on('[data-delfa]','click',function(el){
-  if(confirm('Delete this asset and all its transactions?')){
-   db.fixedAssets=db.fixedAssets.filter(function(a){return a.id!==el.dataset.delfa;});
-   db.assetTransactions=db.assetTransactions.filter(function(t){return t.assetId!==el.dataset.delfa;});
+  var faId=el.dataset.delfa;
+  // Every depreciation/disposal transaction this asset ever had posted a
+  // real JE (jeId). Deleting only fixedAssets+assetTransactions left every
+  // one of those JEs behind forever — Depreciation Expense, Accumulated
+  // Depreciation, and the Asset/Cash/Gain-Loss accounts a disposal touched
+  // stayed permanently misstated with no fixed asset left to justify them.
+  var relatedJeIds=(db.assetTransactions||[]).filter(function(t){return t.assetId===faId&&t.jeId;}).map(function(t){return t.jeId;});
+  var msg='Delete this asset and all its transactions?';
+  if(relatedJeIds.length)msg+=' This will also remove '+relatedJeIds.length+' related journal entry(ies) ('+relatedJeIds.join(', ')+') from the ledger.';
+  if(confirm(msg)){
+   db.fixedAssets=db.fixedAssets.filter(function(a){return a.id!==faId;});
+   db.assetTransactions=db.assetTransactions.filter(function(t){return t.assetId!==faId;});
+   if(relatedJeIds.length)db.journals=db.journals.filter(function(j){return relatedJeIds.indexOf(j.id)===-1;});
    save();render();
   }
  });
@@ -8659,18 +8884,27 @@ function bindEvents(){
   var accDepAccId2=((document.getElementById('fa-accdep-id')||{}).value||((document.getElementById('fa-accdep')||{}).value)||'').trim();
   var cat2=(document.getElementById('fa-cat')||{}).value||'Equipment';
   var locId2=(document.getElementById('fa-loc')||{}).value||'';
+  var ccId2=(document.getElementById('fa-cc')||{}).value||'';
   var desc2=((document.getElementById('fa-desc')||{}).value||'').trim();
   if(!id2||!name2||!cost2||!pDate){alert('Fill all required fields (Code, Name, Cost, Date).');return;}
   if(!assetAccId2||!depAccId2||!accDepAccId2){alert('Please link all three accounting accounts.');return;}
   var obj2={id:id2,name:name2,cost:cost2,usefulLife:life2,salvageValue:salvage2,purchaseDate:pDate,
    assetAccId:assetAccId2,depAccId:depAccId2,accDepAccId:accDepAccId2,
-   category:cat2,locationId:locId2,desc:desc2,active:true,accDepreciation:0};
+   category:cat2,locationId:locId2,costCenterId:ccId2,desc:desc2,active:true};
   if(tFAEdit.editId){
+   // "accDepreciation:0" used to be baked into obj2 unconditionally, so
+   // Object.assign below reset an asset's ENTIRE posted depreciation
+   // history to zero on every edit — even just fixing a typo in its name
+   // silently wiped out months of real depreciation postings and inflated
+   // its book value back to full cost. Only a brand-new asset starts at 0;
+   // an edit must never touch accDepreciation (postAssetDepreciation/
+   // mSaveAT own that field exclusively).
    var ix=db.fixedAssets.findIndex(function(x){return x.id===tFAEdit.editId;});
    if(ix!==-1)db.fixedAssets[ix]=Object.assign(db.fixedAssets[ix],obj2);
    modal=null;save();render();
   } else {
    if(db.fixedAssets.find(function(x){return x.id===id2;})){alert('Asset code already exists.');return;}
+   obj2.accDepreciation=0;
    db.fixedAssets.push(obj2);
    tFA=id2;
    modal=null;save();render();
@@ -8693,7 +8927,20 @@ function bindEvents(){
   var je3={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:adate,desc:txn2.desc,lines:[]};
   if(atype==='Depreciation'){
    if(!a2.depAccId||!a2.accDepAccId){alert('Set depreciation accounts on asset first.');return;}
-   je3.lines=[{acc:a2.depAccId,dr:aamt,cr:0},{acc:a2.accDepAccId,dr:0,cr:aamt}];
+   // Unlike postAssetDepreciation() (the ⚙ button / "Post All"), this manual
+   // entry had NO cap against cost-salvageValue — a typo here could push
+   // accDepreciation past the asset's depreciable base with no warning.
+   var maxDep2=(a2.cost||0)-(a2.salvageValue||0);
+   var posted2=a2.accDepreciation||0;
+   if(posted2>=maxDep2){alert('Asset is already fully depreciated — no further depreciation can be posted.');return;}
+   if(aamt>maxDep2-posted2){
+    if(!confirm('Amount exceeds the remaining depreciable value ('+N(maxDep2-posted2)+'). Post the capped amount instead?'))return;
+    aamt=maxDep2-posted2;
+    txn2.amount=aamt;
+   }
+   var depLine2={acc:a2.depAccId,dr:aamt,cr:0};
+   if(a2.costCenterId)depLine2.cc=a2.costCenterId;
+   je3.lines=[depLine2,{acc:a2.accDepAccId,dr:0,cr:aamt}];
    a2.accDepreciation=(a2.accDepreciation||0)+aamt;
    // Do NOT also add aamt onto these accounts' raw .bal here. Every report
    // in this app (Trial Balance, Balance Sheet, Account Statement, …) reads
@@ -8733,9 +8980,36 @@ function bindEvents(){
     alert((lang==='ar'?'تحذير: قيد الاستبعاد غير متوازن (لم يتم العثور على حساب أرباح/خسائر الاستبعاد أو حساب النقدية المناسب). الفرق: ':'Warning: the disposal entry is unbalanced (no suitable Gain/Loss or Cash account was found). Difference: ')+N(Math.abs(drTot3-crTot3)));
    }
    a2.active=false;
+  } else if(atype==='Addition'||atype==='Maintenance'){
+   // Both types fell through with je3.lines left empty — no JE was ever
+   // created for them despite the modal's own text promising "A journal
+   // entry will be automatically created for this transaction". Money
+   // spent on the asset (a capitalized addition, or a repair/maintenance
+   // cost) went completely unrecorded in the ledger.
+   var cashAcc4=db.accounts.find(function(x){return x.type==='Asset'&&!x.isMain&&x.name&&(x.name.toLowerCase().indexOf('cash')!==-1||x.name.toLowerCase().indexOf('bank')!==-1);});
+   if(atype==='Addition'){
+    if(a2.assetAccId&&cashAcc4){
+     je3.lines=[{acc:a2.assetAccId,dr:aamt,cr:0},{acc:cashAcc4.id,dr:0,cr:aamt}];
+     a2.cost=(a2.cost||0)+aamt; // capitalized: increases the asset's depreciable cost
+    }
+   } else {
+    var maintAcc=db.accounts.find(function(x){return x.type==='Expense'&&x.name&&(x.name.toLowerCase().indexOf('maint')!==-1||x.name.indexOf('صيانة')!==-1||x.name.toLowerCase().indexOf('repair')!==-1);});
+    if(!maintAcc)maintAcc=db.accounts.find(function(x){return x.type==='Expense'&&!x.isMain;});
+    if(maintAcc&&cashAcc4){
+     var maintLine={acc:maintAcc.id,dr:aamt,cr:0};
+     if(a2.costCenterId)maintLine.cc=a2.costCenterId;
+     je3.lines=[maintLine,{acc:cashAcc4.id,dr:0,cr:aamt}];
+    }
+   }
+   if(!je3.lines.length){
+    alert((lang==='ar'?'تحذير: لم يتم العثور على الحسابات المناسبة (الأصل/الصيانة أو النقدية) — تم تسجيل العملية بدون قيد محاسبي. يجب إضافة القيد يدوياً.':'Warning: no suitable accounts were found (asset/maintenance or cash) — the transaction was logged without a journal entry. You will need to add the entry manually.'));
+   }
   }
-  if(je3.lines.length)db.journals.push(je3);
-  txn2.jeId=je3.id;
+  // Only attach jeId when a JE was actually pushed — Addition/Maintenance
+  // (and any other type whose account auto-detection fails above) can
+  // legitimately have no journal entry, and previously got a fake jeId
+  // pointing at a JE object that was never added to db.journals.
+  if(je3.lines.length){db.journals.push(je3);txn2.jeId=je3.id;}
   db.assetTransactions.push(txn2);
   modal=null;save();render();
  });
@@ -8897,6 +9171,32 @@ function bindEvents(){
   var origPi=(db.purchaseInvoices||[]).find(function(p){return p.id===tPI.origPiId;});
   tPI.lines=buildPIReturnLines(origPi,tPI.editId);
   render();
+ });
+ // Selecting a Reference PO used to do nothing but remember the id — the
+ // PO's own items were never copied in, so the user had to re-type every
+ // line by hand, and worse, saving flipped that PO's status straight to
+ // "Received" even if the invoice's items didn't match it at all. PO lines
+ // are free-text (desc/qty/price), not linked to a real inventory item id,
+ // so an exact-name match against db.items is attempted per line; anything
+ // that can't be matched confidently is left for the user to pick, with
+ // the PO's own description shown as a hint instead of guessing wrong.
+ on1('pi-po','change',function(){
+  if(tPI.isReturn)return;
+  var poId=document.getElementById('pi-po').value;
+  tPI.poId=poId;
+  if(!poId){render();return;}
+  var po=(db.purchaseOrders||[]).find(function(p){return p.id===poId;});
+  if(!po||!(po.items||[]).length){render();return;}
+  var hasRealLine=(tPI.lines||[]).some(function(l){return l.itemId;});
+  if(hasRealLine){render();return;} // don't clobber items the user already picked
+  tPI.lines=po.items.map(function(pi2){
+   var nameNorm=(pi2.desc||'').trim().toLowerCase();
+   var matched=nameNorm?db.items.find(function(it){return (it.name||'').trim().toLowerCase()===nameNorm;}):null;
+   return {itemId:matched?matched.id:'',qty:pi2.qty||1,cost:pi2.price||0,vat:pi2.vat!=null?pi2.vat:15,poDesc:pi2.desc||''};
+  });
+  var unmatched=tPI.lines.filter(function(l){return !l.itemId;}).length;
+  render();
+  if(unmatched)alert(lang==='ar'?'تم نسخ '+tPI.lines.length+' بند من أمر الشراء، لكن '+unmatched+' منها لم يُطابَق تلقائياً مع صنف في المخزون — الرجاء اختيار الصنف الصحيح لكل بند يدوياً.':'Copied '+tPI.lines.length+' line(s) from the PO, but '+unmatched+' could not be auto-matched to an inventory item — please pick the correct item for those lines manually.');
  });
  on('.piCost','input',function(){updatePITotals();});
  on('.piVat','change',function(){updatePITotals();});
@@ -9109,8 +9409,28 @@ function bindEvents(){
   var el=document.getElementById(id);
   if(el)el.addEventListener('input',function(){updateSITotals();});
  });
- on('[data-delpi]','click',function(el){if(confirm('Delete?')){db.purchaseInvoices=(db.purchaseInvoices||[]).filter(function(x){return x.id!==el.dataset.delpi;});save();render();}});
- on('[data-delsi]','click',function(el){if(confirm('Delete?')){db.salesInvoices2=(db.salesInvoices2||[]).filter(function(x){return x.id!==el.dataset.delsi;});save();render();}});
+ on('[data-delpi]','click',function(el){
+  if(confirm('Delete?')){
+   var piDel=(db.purchaseInvoices||[]).find(function(x){return x.id===el.dataset.delpi;});
+   // Previously left this invoice's own JE (from posting) permanently in
+   // the ledger with nothing left to justify it — Inventory/Payables stayed
+   // misstated forever with no purchase invoice behind the entry.
+   if(piDel&&piDel.jeId)db.journals=db.journals.filter(function(j){return j.id!==piDel.jeId;});
+   db.purchaseInvoices=(db.purchaseInvoices||[]).filter(function(x){return x.id!==el.dataset.delpi;});
+   save();render();
+  }
+ });
+ on('[data-delsi]','click',function(el){
+  if(confirm('Delete?')){
+   var siDel=(db.salesInvoices2||[]).find(function(x){return x.id===el.dataset.delsi;});
+   if(siDel){
+    var jeIds=[siDel.jeId,siDel.cogsJeId].filter(Boolean);
+    if(jeIds.length)db.journals=db.journals.filter(function(j){return jeIds.indexOf(j.id)===-1;});
+   }
+   db.salesInvoices2=(db.salesInvoices2||[]).filter(function(x){return x.id!==el.dataset.delsi;});
+   save();render();
+  }
+ });
 
  on1('btnApplyStock','click',function(){stockFrom=(document.getElementById('stockFrom')||{}).value||'';stockTo=(document.getElementById('stockTo')||{}).value||'';render();});
  on1('btnClearStock','click',function(){stockFrom='';stockTo='';render();});
@@ -9378,9 +9698,18 @@ function bindEvents(){
    var method=(document.getElementById('aicash-method')||{}).value||'indirect';
    var journals=db.journals.filter(function(j){return(!f||j.date>=f)&&(!t2||j.date<=t2);}).map(function(j){return{date:j.date,desc:j.desc,lines:j.lines};});
    var accs=db.accounts.map(function(a){return{id:a.id,name:a.name,type:a.type,normal:a.normal};});
+   // Receipt/Payment vouchers are how most cash activity in this app is
+   // actually recorded day-to-day (see accBalRange, which treats them as
+   // full posting sources alongside db.journals) — they were never
+   // serialized into this prompt at all, so a company that mainly uses
+   // vouchers instead of manual journal entries gave the AI no real
+   // cash-movement signal to build the statement from.
+   var receiptsCF=(db.receipts||[]).filter(function(r){return(!f||r.date>=f)&&(!t2||r.date<=t2);}).map(function(r){return{date:r.date,desc:r.desc,amount:r.amount,accTo:r.accTo,accFrom:r.accFrom};});
+   var paymentsCF=(db.payments||[]).filter(function(p){return(!f||p.date>=f)&&(!t2||p.date<=t2);}).map(function(p){return{date:p.date,desc:p.desc,amount:p.amount,accTo:p.accTo,accFrom:p.accFrom};});
+   var voucherNote=lang==='ar'?'\n\nملاحظة: في سندات القبض/الصرف، accTo هو دائماً الطرف المدين وaccFrom هو دائماً الطرف الدائن للقيد الضمني.':'\n\nNote: in receipts/payments, accTo is always the debit side and accFrom is always the credit side of the implied entry.';
    var prompt=lang==='ar'?
-    'أعد قائمة التدفقات النقدية بالطريقة '+(method==='indirect'?'غير المباشرة':'المباشرة')+' للشركة: '+db.company.name+'\n\nالقيود اليومية:\n'+JSON.stringify(journals,null,2)+'\n\ndليل الحسابات:\n'+JSON.stringify(accs)+'\n\nالمطلوب:\n1. التدفقات النقدية من الأنشطة التشغيلية\n2. التدفقات النقدية من الأنشطة الاستثمارية\n3. التدفقات النقدية من الأنشطة التمويلية\n4. صافي التدفق النقدي والرصيد الختامي\n5. تحليل ومؤشرات التدفق النقدي':
-    'Prepare Cash Flow Statement ('+(method==='indirect'?'Indirect':'Direct')+' Method) for: '+db.company.name+'\n\nJournal Entries:\n'+JSON.stringify(journals,null,2)+'\n\nChart of Accounts:\n'+JSON.stringify(accs)+'\n\nRequired:\n1. Cash flows from Operating Activities\n2. Cash flows from Investing Activities\n3. Cash flows from Financing Activities\n4. Net cash flow and closing balance\n5. Cash flow analysis and indicators';
+    'أعد قائمة التدفقات النقدية بالطريقة '+(method==='indirect'?'غير المباشرة':'المباشرة')+' للشركة: '+db.company.name+'\n\nالقيود اليومية:\n'+JSON.stringify(journals,null,2)+'\n\nسندات القبض:\n'+JSON.stringify(receiptsCF,null,2)+'\n\nسندات الصرف:\n'+JSON.stringify(paymentsCF,null,2)+voucherNote+'\n\ndليل الحسابات:\n'+JSON.stringify(accs)+'\n\nالمطلوب:\n1. التدفقات النقدية من الأنشطة التشغيلية\n2. التدفقات النقدية من الأنشطة الاستثمارية\n3. التدفقات النقدية من الأنشطة التمويلية\n4. صافي التدفق النقدي والرصيد الختامي\n5. تحليل ومؤشرات التدفق النقدي':
+    'Prepare Cash Flow Statement ('+(method==='indirect'?'Indirect':'Direct')+' Method) for: '+db.company.name+'\n\nJournal Entries:\n'+JSON.stringify(journals,null,2)+'\n\nReceipt Vouchers:\n'+JSON.stringify(receiptsCF,null,2)+'\n\nPayment Vouchers:\n'+JSON.stringify(paymentsCF,null,2)+voucherNote+'\n\nChart of Accounts:\n'+JSON.stringify(accs)+'\n\nRequired:\n1. Cash flows from Operating Activities\n2. Cash flows from Investing Activities\n3. Cash flows from Financing Activities\n4. Net cash flow and closing balance\n5. Cash flow analysis and indicators';
    aiCashState.result=await callAI(prompt);
   }catch(e){aiCashState.result='Error: '+e.message;}
   aiCashState.loading=false;render();
@@ -9412,10 +9741,17 @@ function bindEvents(){
   aiForecastState.loading=true;render();
   try{
    var period=parseInt((document.getElementById('aifc-period')||{}).value||'12');
-   var rev=db.journals.reduce(function(s,j){j.lines.forEach(function(l){var a=db.accounts.find(function(ac){return ac.id===l.acc;});if(a&&a.type==='Revenue')s+=(l.cr||0);});return s;},0);
-   var xp=db.journals.reduce(function(s,j){j.lines.forEach(function(l){var a=db.accounts.find(function(ac){return ac.id===l.acc;});if(a&&a.type==='Expense')s+=(l.dr||0);});return s;},0);
-   var assets=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain;}).reduce(function(s,a){return s+(a.bal||0);},0);
-   var liab=db.accounts.filter(function(a){return a.type==='Liability'&&!a.isMain;}).reduce(function(s,a){return s+(a.bal||0);},0);
+   // Previously: rev/xp summed raw journal-line cr/dr only (ignoring
+   // Receipt/Payment vouchers entirely, and never subtracting contra
+   // accounts like Sales/Purchase Returns), while assets/liab read the
+   // raw, often-stale .bal field (which never reflects normal posting
+   // activity — see accBalRange's own doc comment). All four now use the
+   // same contra-aware, all-postings-inclusive helper the other reports use.
+   var asOf=today();
+   var rev=db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Revenue','',asOf);},0);
+   var xp=db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Expense','',asOf);},0);
+   var assets=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain;}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Asset','',asOf);},0);
+   var liab=db.accounts.filter(function(a){return a.type==='Liability'&&!a.isMain;}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Liability','',asOf);},0);
    var data={company:db.company.name,currency:db.company.currency||'SAR',revenue:rev,expenses:xp,netIncome:rev-xp,assets:assets,liabilities:liab,forecastMonths:period,type:aiForecastState.type};
    var cur2=db.company.currency||'SAR';
    var typeNamesAr={sales:'تنبؤ المبيعات',bankruptcy:'تحليل مخاطر الإفلاس — Altman Z-Score',cashflow:'تنبؤ التدفق النقدي',budget:'الميزانية التقديرية'};
@@ -10016,7 +10352,27 @@ function bindEvents(){
      jeLines4.push({acc:recAcc.id,dr:tot4,cr:0});
      if(adv4>0&&advAcc4)jeLines4.push({acc:advAcc4.id,dr:adv4,cr:0});
      if(vatAcc&&vat4>0)jeLines4.push({acc:vatAcc.id,dr:0,cr:vat4});
-     jeLines4.push({acc:revAcc.id,dr:0,cr:netSub4});
+     // Group the revenue credit by each item's own designated Revenue
+     // account (item.revAccId) instead of crediting the invoice's entire
+     // net revenue to a single account — item-level overrides were already
+     // honored on the COGS lines below but silently ignored here, so an
+     // invoice mixing e.g. "Product Sales" and "Service Revenue" items
+     // always posted the whole thing to just one of them. The discount is
+     // spread proportionally across accounts by each one's share of the
+     // pre-discount subtotal, so the credited total still equals netSub4.
+     var revByAcc4={};
+     (cur4.lines||[]).forEach(function(l){
+      var it2=itemById(l.itemId);
+      var accId2=(it2&&it2.revAccId)?it2.revAccId:revAcc.id;
+      revByAcc4[accId2]=(revByAcc4[accId2]||0)+l.qty*l.price;
+     });
+     var discRatio4=sub4>0?netSub4/sub4:1;
+     var revAccIds4=Object.keys(revByAcc4);
+     if(revAccIds4.length){
+      revAccIds4.forEach(function(accId2){jeLines4.push({acc:accId2,dr:0,cr:revByAcc4[accId2]*discRatio4});});
+     } else {
+      jeLines4.push({acc:revAcc.id,dr:0,cr:netSub4});
+     }
     }
     // Cost of Goods Sold — reduce inventory qty/value and book COGS for
     // whichever lines have both an inventory and a COGS account configured
@@ -10081,7 +10437,22 @@ function bindEvents(){
     // takes the same quantity back out (previously this branch did nothing
     // at all for a return, silently leaving the returned goods in stock).
     if(!isRetPost5){(cur4.lines||[]).forEach(function(l){receiveStock(l.itemId,l.qty,l.cost);});}
-    else{(cur4.lines||[]).forEach(function(l){var it=itemById(l.itemId);if(it)it.qty=Math.max(0,(it.qty||0)-l.qty);});}
+    else{(cur4.lines||[]).forEach(function(l){
+     var it=itemById(l.itemId);if(!it)return;
+     // Only qty was ever reduced here — the item's carried avgCost was left
+     // untouched, so after multiple purchases at different costs plus a
+     // partial return, the item's book value and the ledger's Inventory
+     // account (credited using THIS return's own unit cost, netSub5 above)
+     // permanently diverge from each other. Re-derive avgCost the same way
+     // a normal weighted-average purchase would: remove this return's own
+     // value from the item's total carried value, then re-divide by the
+     // remaining qty.
+     var totalVal=(it.qty||0)*(it.avgCost||0);
+     var newQty=Math.max(0,(it.qty||0)-l.qty);
+     var removedVal=l.qty*(l.cost||it.avgCost||0);
+     it.qty=newQty;
+     it.avgCost=newQty>0?Math.max(0,(totalVal-removedVal)/newQty):0;
+    });}
     // Main JE — a return is the mirror image of a purchase: it reduces what
     // we owe the supplier and reduces inventory, instead of increasing them
     // (this used to post in the SAME direction as a normal purchase, which
@@ -10092,7 +10463,27 @@ function bindEvents(){
      if(vatInAcc5&&vat5>0)jeLines5.push({acc:vatInAcc5.id,dr:0,cr:vat5});
      jeLines5.push({acc:invAcc5.id,dr:0,cr:netSub5});
     } else {
-     jeLines5.push({acc:invAcc5.id,dr:netSub5,cr:0});
+     // Group the Inventory/Expense debit by each item's own designated
+     // account (item.invAccId) instead of debiting the invoice's entire
+     // net cost to a single account — item-level overrides were already
+     // honored on the COGS lines elsewhere but silently ignored here, so a
+     // purchase mixing items tracked in different inventory/expense
+     // accounts always posted the whole thing to just one of them. The
+     // discount is spread proportionally by each account's share of the
+     // pre-discount subtotal, so the debited total still equals netSub5.
+     var invByAcc5={};
+     (cur4.lines||[]).forEach(function(l){
+      var it3=itemById(l.itemId);
+      var accId3=(it3&&it3.invAccId)?it3.invAccId:invAcc5.id;
+      invByAcc5[accId3]=(invByAcc5[accId3]||0)+l.qty*l.cost;
+     });
+     var discRatio5=sub5>0?netSub5/sub5:1;
+     var invAccIds5=Object.keys(invByAcc5);
+     if(invAccIds5.length){
+      invAccIds5.forEach(function(accId3){jeLines5.push({acc:accId3,dr:invByAcc5[accId3]*discRatio5,cr:0});});
+     } else {
+      jeLines5.push({acc:invAcc5.id,dr:netSub5,cr:0});
+     }
      if(vatInAcc5&&vat5>0)jeLines5.push({acc:vatInAcc5.id,dr:vat5,cr:0});
      jeLines5.push({acc:payAcc5.id,dr:0,cr:tot5});
     }
@@ -10106,9 +10497,22 @@ function bindEvents(){
   else if(action==='delete'){
    var cur5=items[st.idx];if(!cur5)return;
    if(!confirm('Delete '+cur5.id+'?'))return;
+   // This is the real, reachable delete action for Sales/Purchase Invoices
+   // (the [data-delpi]/[data-delsi] handlers elsewhere are unreachable dead
+   // code). Deleting a posted invoice used to leave its own JE (and, for a
+   // Sales Invoice, its separate COGS JE) permanently in the ledger with no
+   // invoice left to justify it — Inventory/Payables/Receivables stayed
+   // misstated forever.
    if(key==='po')db.purchaseOrders=(db.purchaseOrders||[]).filter(function(x){return x.id!==cur5.id;});
-   else if(key==='purchases')db.purchaseInvoices=(db.purchaseInvoices||[]).filter(function(x){return x.id!==cur5.id;});
-   else if(key==='sales2')db.salesInvoices2=(db.salesInvoices2||[]).filter(function(x){return x.id!==cur5.id;});
+   else if(key==='purchases'){
+    if(cur5.jeId)db.journals=db.journals.filter(function(j){return j.id!==cur5.jeId;});
+    db.purchaseInvoices=(db.purchaseInvoices||[]).filter(function(x){return x.id!==cur5.id;});
+   }
+   else if(key==='sales2'){
+    var jeIdsDel=[cur5.jeId,cur5.cogsJeId].filter(Boolean);
+    if(jeIdsDel.length)db.journals=db.journals.filter(function(j){return jeIdsDel.indexOf(j.id)===-1;});
+    db.salesInvoices2=(db.salesInvoices2||[]).filter(function(x){return x.id!==cur5.id;});
+   }
    else if(key==='receipt')db.receipts=(db.receipts||[]).filter(function(x){return x.ref!==cur5.ref;});
    else if(key==='payment')db.payments=(db.payments||[]).filter(function(x){return x.ref!==cur5.ref;});
    st.idx=Math.max(0,st.idx-1);st.mode='list';save();
@@ -10137,7 +10541,11 @@ function bindEvents(){
  on('[data-editje]','click',function(el){
   var je=db.journals.find(function(j){return j.id===el.dataset.editje;});
   if(!je)return;
-  tJE={editId:je.id,date:je.date,desc:je.desc,lines:je.lines.map(function(l){return{acc:l.acc,dr:l.dr,cr:l.cr};})};
+  // Was {acc,dr,cr} only — silently dropped each line's cost-center (.cc)
+  // and VAT (.vat) tags on save even if the user only touched the
+  // description and never edited a line row. Object.assign preserves
+  // every field the line already had (matching the jeEdit handler above).
+  tJE={editId:je.id,date:je.date,desc:je.desc,lines:je.lines.map(function(l){return Object.assign({},l);})};
   modal='je';render();
  });
 
