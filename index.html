@@ -1059,6 +1059,20 @@ function printHTML(title,body){
  if(w){w.document.write(html);w.document.close();}
  else{var blob=new Blob([html],{type:'text/html'});var u=URL.createObjectURL(blob);window.open(u,'_blank');setTimeout(function(){URL.revokeObjectURL(u);},8000);}
 }
+// Shared "Signature / Stamp" sign-off block for printed financial documents
+// (currently: the Account Statement — see the pdfStmt branch). Reuses the
+// same uploaded Company Stamp / Financial Manager Signature images as the
+// Balance Confirmation Letter (Settings › Company Stamp / Financial Manager
+// Signature), falling back to a blank line for a physical signature when
+// nothing has been uploaded, with the same onerror fallback for a stored
+// image that turns out to be unusable.
+function sigStampFooterHtml(){
+ var co=db.company;
+ var blank='.....................................';
+ var sigImg=co.signature?'<span><img src="'+co.signature+'" style="height:26px;max-width:75px;object-fit:contain;display:inline-block;vertical-align:middle" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'inline\'"><span style="display:none">'+blank+'</span></span>':blank;
+ var stampImg=co.stamp?'<span><img src="'+co.stamp+'" style="height:34px;max-width:55px;object-fit:contain;display:inline-block;vertical-align:middle" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'inline\'"><span style="display:none">'+blank+'</span></span>':blank;
+ return '<div style="margin-top:26pt;display:flex;justify-content:space-between;font-size:9pt"><div><strong>Prepared by:</strong> '+blank+'</div><div><strong>Signature:</strong> '+sigImg+'</div><div><strong>Stamp:</strong> '+stampImg+'</div></div>';
+}
 
 // ── Balance Confirmation Letter ───────────────────────────────
 // (Contacts › Balance Confirmation Letter — see pConfirmBalance() further
@@ -7933,6 +7947,7 @@ window.xAction=function(type){
    html+='<tr class="tot"><td colspan="5">Opening Balance</td><td class="tr">'+N(d.open)+'</td></tr>';
    d.rows.forEach(function(r){html+='<tr><td>'+r.date+'</td><td>'+r.ref+'</td><td>'+r.desc+'</td><td class="tr">'+(r.dr?N(r.dr):'')+'</td><td class="tr">'+(r.cr?N(r.cr):'')+'</td><td class="tr" style="font-weight:700">'+N(r.bal)+'</td></tr>';});
    html+='<tr class="fin"><td colspan="5">Closing Balance</td><td class="tr">'+N(d.close)+'</td></tr></tbody></table>';
+   html+=sigStampFooterHtml();
    printHTML('Account Statement',html);
   }
  } else if(type==='xlsCC'||type==='pdfCC'){
@@ -8189,58 +8204,20 @@ function bindEvents(){
  on('.jeC','input',function(el){tJE.lines[Number(el.dataset.i)].cr=el.value;calcVATLines();jeHint();});
  on('.jeCC','change',function(el){tJE.lines[Number(el.dataset.i)].cc=el.value;});
 
- // VAT auto-calculation
+ // VAT auto-calculation — the line's own dr/cr amount is the FULL invoice
+ // total (VAT-inclusive); selecting a % here just tags the line so
+ // jeExpandVATLines() can extract the VAT portion FROM it at save time and
+ // post it straight to the VAT account. No extra editable line is added to
+ // the grid here — see jeHint() for the live preview shown instead, and the
+ // big comment above jeVatBreakdown() for the full rationale.
  on('.jeVAT','change',function(el){
   var i=Number(el.dataset.i);
   var vatRate=Number(el.value)||0;
   tJE.lines[i].vat=vatRate||undefined;
-  if(!vatRate){render();return;}
-
-  // ── VAT Account Logic ──────────────────────────────────────
-  // Expense (DR line)  → VAT Input Tax  → DEBIT  (recoverable/reclaimable)
-  // Revenue (CR line)  → VAT Payable    → CREDIT (collected from customer)
-  var drVal=Number(tJE.lines[i].dr)||0;
-  var crVal=Number(tJE.lines[i].cr)||0;
-  var baseAmt=drVal||crVal;
-  if(!baseAmt){render();return;}
-
-  var vatAmt=Math.round(baseAmt*vatRate/100*100)/100;
-
-  var isExpense=drVal>0;  // Debit line = expense = VAT Input
-  var isRevenue=crVal>0;  // Credit line = revenue = VAT Output/Payable
-
-  // Find appropriate VAT account
-  var vatAccId;
-  if(isExpense){
-   // VAT Input Tax — look for VAT receivable/input account, fallback to VAT Payable
-   var vatInputAcc=db.accounts.find(function(a){
-    var n=a.name.toLowerCase();
-    return n.indexOf('vat input')!==-1||n.indexOf('vat receivable')!==-1||n.indexOf('vat refundable')!==-1;
-   });
-   vatAccId=vatInputAcc?vatInputAcc.id:'2002'; // fallback: reduce VAT Payable
-  } else {
-   // VAT Output / Payable — collected from customer
-   var vatPayableAcc=db.accounts.find(function(a){
-    var n=a.name.toLowerCase();
-    return n.indexOf('vat payable')!==-1||n.indexOf('vat output')!==-1||(n.indexOf('vat')!==-1&&a.type==='Liability');
-   });
-   vatAccId=vatPayableAcc?vatPayableAcc.id:'2002';
-  }
-
-  // Remove any existing VAT lines for this index
+  // Clean up any old-format auto-VAT line that a legacy entry (created
+  // before this scheme existed) may still be carrying for this index.
   tJE.lines=tJE.lines.filter(function(l){return !l.isVatLine||l.vatFor!==i;});
-
-  // Add VAT line with CORRECT debit/credit
-  var vatLine={acc:vatAccId,dr:0,cr:0,isVatLine:true,vatFor:i};
-  if(isExpense){
-   vatLine.dr=vatAmt;  // Expense → VAT Input DEBIT (company pays VAT)
-  } else {
-   vatLine.cr=vatAmt;  // Revenue → VAT Payable CREDIT (company collects VAT)
-  }
-  tJE.lines.push(vatLine);
-
   render();
-  // Restore focus
   setTimeout(function(){jeHint();},50);
  });
 
@@ -8316,7 +8293,7 @@ function bindEvents(){
   var allJE=db.journals.slice().reverse();
   var je=allJE[jeState.currentIdx];
   if(!je)return;
-  tJE={editId:je.id,date:je.date,desc:je.desc,lines:je.lines.map(function(l){return Object.assign({},l);})};
+  tJE={editId:je.id,date:je.date,desc:je.desc,lines:jeCollapseVATLines(je.lines)};
   jeState.mode='edit';render();
  });
  on1('jeDelete','click',function(){
@@ -8389,12 +8366,16 @@ function bindEvents(){
   var tD3=lines2.reduce(function(s,l){return s+(l.dr||0);},0);
   var tC3=lines2.reduce(function(s,l){return s+(l.cr||0);},0);
   if(Math.abs(tD3-tC3)>0.01){if(!confirm((lang==='ar'?'القيد غير متوازن. فرق: ':'Unbalanced entry. Diff: ')+N(Math.abs(tD3-tC3))+'. '+(lang==='ar'?'هل تريد الحفظ؟':'Save anyway?')))return;}
+  // lines2 holds the gross (VAT-inclusive) amounts exactly as typed —
+  // jeExpandVATLines() extracts each VAT-tagged line's tax portion and
+  // posts it to the VAT account, which is what actually gets saved.
+  var linesToSave=jeExpandVATLines(lines2);
   if(tJE.editId){
    var idx3=db.journals.findIndex(function(j){return j.id===tJE.editId;});
-   if(idx3>=0){db.journals[idx3].date=date2;db.journals[idx3].desc=desc2;db.journals[idx3].lines=lines2;}
+   if(idx3>=0){db.journals[idx3].date=date2;db.journals[idx3].desc=desc2;db.journals[idx3].lines=linesToSave;}
   } else {
    var newId='JE'+String(db.journals.length+1).padStart(3,'0');
-   db.journals.push({id:newId,date:date2,desc:desc2,lines:lines2});
+   db.journals.push({id:newId,date:date2,desc:desc2,lines:linesToSave});
    // Navigate to new entry
    jeState.currentIdx=0;
   }
@@ -10585,6 +10566,91 @@ function bindEvents(){
  });
 }
 
+// ── Journal Entry VAT handling ───────────────────────────────────────────
+// The manual Journal Entry line is typed and shown at its FULL, VAT-
+// inclusive (gross) amount — e.g. a 160,000 SAR purchase paid in full — so
+// what the user sees always matches the real invoice/payment total on both
+// the debit and credit sides. Picking a VAT% on a line does NOT add tax on
+// top of that (that would overstate the transaction) and does NOT add a
+// second, manually-editable line to the on-screen grid (see mJE()) — it
+// only tags the line with `.vat`, and jeExpandVATLines() below extracts the
+// VAT portion FROM the gross amount at save time, posting it straight to
+// the matching VAT account while the remaining net amount stays on the
+// original account — so the entry the user built (e.g. 160,000 = 160,000)
+// keeps balancing exactly, and the VAT split only shows up in the actual
+// posted ledger lines, never as extra clutter in the editing form.
+function jeVatBreakdown(grossAmt,vatRate,isExpense){
+ var vatAmt=Math.round((grossAmt-grossAmt/(1+vatRate/100))*100)/100;
+ var netAmt=grossAmt-vatAmt; // exact complement of the rounded vatAmt, so net+vat===gross precisely
+ var vatAccId;
+ if(isExpense){
+  // Expense/asset (DR line) → VAT Input Tax, recoverable — DEBIT
+  var vatInputAcc=db.accounts.find(function(a){
+   var n=a.name.toLowerCase();
+   return n.indexOf('vat input')!==-1||n.indexOf('vat receivable')!==-1||n.indexOf('vat refundable')!==-1;
+  });
+  vatAccId=vatInputAcc?vatInputAcc.id:'2002';
+ } else {
+  // Revenue (CR line) → VAT Payable/Output, collected — CREDIT
+  var vatPayableAcc=db.accounts.find(function(a){
+   var n=a.name.toLowerCase();
+   return n.indexOf('vat payable')!==-1||n.indexOf('vat output')!==-1||(n.indexOf('vat')!==-1&&a.type==='Liability');
+  });
+  vatAccId=vatPayableAcc?vatPayableAcc.id:'2002';
+ }
+ return {vatAmt:vatAmt,netAmt:netAmt,vatAccId:vatAccId};
+}
+// Turns the gross-amount lines the user actually typed/saw in the form into
+// the lines that get posted to db.journals: any line carrying a `.vat` rate
+// is split into its net amount (same account) + the VAT amount (posted to
+// the VAT account), both tagged with a shared `vatGroup` id so
+// jeCollapseVATLines() can merge them back into one gross line when the
+// entry is reopened for editing. A line with no `.vat` passes through as-is.
+function jeExpandVATLines(lines){
+ var out=[],grp=0;
+ lines.forEach(function(l){
+  var vatRate=Number(l.vat)||0;
+  var amt=Number(l.dr)||Number(l.cr)||0;
+  if(!vatRate||!amt){out.push(l);return;}
+  var isExpense=Number(l.dr)>0;
+  var bd=jeVatBreakdown(amt,vatRate,isExpense);
+  var g='v'+(grp++);
+  var mainLine={acc:l.acc,dr:0,cr:0,vat:vatRate,vatGroup:g};
+  if(l.cc)mainLine.cc=l.cc;
+  if(isExpense)mainLine.dr=bd.netAmt;else mainLine.cr=bd.netAmt;
+  var vatLine={acc:bd.vatAccId,dr:0,cr:0,isVatLine:true,vatGroup:g};
+  if(isExpense)vatLine.dr=bd.vatAmt;else vatLine.cr=bd.vatAmt;
+  out.push(mainLine,vatLine);
+ });
+ return out;
+}
+// Reverses jeExpandVATLines() when a saved entry is reopened for editing —
+// merges each {main line, VAT partner} pair sharing a vatGroup back into a
+// single gross-amount line with its VAT% selected, so the edit form looks
+// exactly like it did when first created instead of exposing the posted
+// 3-line ledger split. Lines with no vatGroup (ordinary lines, or legacy
+// entries from before this scheme existed) pass through unchanged.
+function jeCollapseVATLines(lines){
+ var byGroup={};
+ lines.forEach(function(l){if(l.vatGroup!==undefined){(byGroup[l.vatGroup]=byGroup[l.vatGroup]||[]).push(l);}});
+ var used={},out=[];
+ lines.forEach(function(l){
+  if(l.vatGroup===undefined){out.push(Object.assign({},l));return;}
+  if(used[l.vatGroup])return; // this group's merged line was already emitted
+  var pair=byGroup[l.vatGroup];
+  used[l.vatGroup]=true;
+  if(pair.length!==2){pair.forEach(function(x){out.push(Object.assign({},x));});return;} // malformed — leave as-is
+  var main=pair.find(function(x){return !x.isVatLine;});
+  var vatL=pair.find(function(x){return x.isVatLine;});
+  if(!main||!vatL){pair.forEach(function(x){out.push(Object.assign({},x));});return;}
+  var merged=Object.assign({},main);
+  merged.dr=(Number(main.dr)||0)+(Number(vatL.dr)||0);
+  merged.cr=(Number(main.cr)||0)+(Number(vatL.cr)||0);
+  delete merged.vatGroup;
+  out.push(merged);
+ });
+ return out;
+}
 function calcVATLines(){
  // Called when Debit/Credit changes - update VAT line amounts
  tJE.lines.forEach(function(l,i){
@@ -10606,7 +10672,29 @@ function jeHint(){
  var tD=tJE.lines.reduce(function(s,l){return s+Number(l.dr||0);},0);
  var tC=tJE.lines.reduce(function(s,l){return s+Number(l.cr||0);},0);
  var el=document.getElementById('jeHint');if(!el)return;
- var diff=Math.abs(tD-tC);el.textContent=diff<0.01?'Debits = Credits':'Difference: '+N(diff);el.style.color=diff<0.01?'var(--gn)':'var(--am)';
+ var isAr=lang==='ar';
+ var diff=Math.abs(tD-tC);
+ var msg=diff<0.01?(isAr?'مدين = دائن':'Debits = Credits'):((isAr?'الفرق: ':'Difference: ')+N(diff));
+ var color=diff<0.01?'var(--gn)':'var(--am)';
+ // Live preview of what jeExpandVATLines() will actually post for each
+ // VAT-tagged line — the amount typed stays the full gross total; only
+ // this preview note shows the net/VAT split that lands in the ledger.
+ var vatNotes=[];
+ tJE.lines.forEach(function(l){
+  var vatRate=Number(l.vat)||0;
+  var amt=Number(l.dr)||Number(l.cr)||0;
+  if(!vatRate||!amt)return;
+  var isExpense=Number(l.dr)>0;
+  var bd=jeVatBreakdown(amt,vatRate,isExpense);
+  var vAcc=db.accounts.find(function(a){return a.id===bd.vatAccId;});
+  var vName=vAcc?vAcc.name:bd.vatAccId;
+  var mName=aName(l.acc)||l.acc;
+  vatNotes.push(isAr
+   ?('🧾 ضريبة '+vatRate+'% من '+N(amt)+': سيُرحّل '+N(bd.vatAmt)+' تلقائياً إلى «'+vName+'»، والباقي '+N(bd.netAmt)+' إلى «'+mName+'»')
+   :('🧾 '+vatRate+'% VAT within '+N(amt)+': '+N(bd.vatAmt)+' auto-posts to "'+vName+'", net '+N(bd.netAmt)+' to "'+mName+'"'));
+ });
+ el.innerHTML=msg+(vatNotes.length?'<div style="margin-top:4px;color:var(--t2)">'+vatNotes.join('<br>')+'</div>':'');
+ el.style.color=color;
 }
 
 // Show loading state immediately
