@@ -10096,6 +10096,17 @@ function bindEvents(){
   var vs=(document.getElementById('s-vatrate')||{}).value||'15';
   db.company.name=name;db.company.address=((document.getElementById('s-addr')||{}).value||'').trim();db.company.cr=((document.getElementById('s-cr')||{}).value||'').trim();db.company.phone=((document.getElementById('s-phone')||{}).value||'').trim();db.company.email=((document.getElementById('s-email')||{}).value||'').trim();db.company.vatNo=((document.getElementById('s-vat')||{}).value||'').trim();
   db.company.vatRate=vc?Number(vc):Number(vs);db.company.currency=cc||cs||'SAR';
+  // Keep the company-switcher's registry label in sync with the name just
+  // saved here — otherwise the switcher list keeps showing whatever name
+  // this company had when it was first created (e.g. the seed default
+  // "AccountPro LLC") forever, even after the user renames it in Settings,
+  // which looks exactly like a second, phantom company in the switcher.
+  var regSync=getCompanyRegistry();
+  if(regSync&&regSync.length){
+   var activeIdSync=getActiveCompanyId();
+   var entrySync=regSync.find(function(c){return c.id===activeIdSync;});
+   if(entrySync&&entrySync.name!==name){entrySync.name=name;saveCompanyRegistry(regSync);}
+  }
   save();render();
  });
  on1('btnPrintCOA','click',function(){window.xAction('printCOA');});
