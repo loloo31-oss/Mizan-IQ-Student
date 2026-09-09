@@ -364,8 +364,27 @@ function normalizeDB(d){
  d.customers.concat(d.suppliers).forEach(function(c){
   if(c.linkedAccId)linkCount[c.linkedAccId]=(linkCount[c.linkedAccId]||0)+1;
  });
+ // The bucket/group accounts contactParentAccId() hands new contacts off
+ // to (Local/Foreign Customers, Local/Foreign Suppliers, or their bare
+ // parent fallback) never count as a contact's OWN account, even when this
+ // contact is currently the only one pointing at it. Without this, the
+ // very FIRST customer or supplier ever linked directly to one of these
+ // (e.g. picked "1103-01 Local Customers" itself from the optional Search
+ // Account override instead of leaving it blank) looked "already fine" —
+ // no sibling sub-account existed yet to flag it as shared, and linkCount
+ // was only 1 — so it silently kept sharing the group account forever
+ // instead of getting its own numbered sub-ledger line like every contact
+ // added afterward. That's exactly what left one customer showing no
+ // account number of its own on the Chart of Accounts while suppliers
+ // (added with the field left blank) each got one.
+ var bucketAccIds={};
+ [[false,'Saudi Arabia'],[false,'Other'],[true,'Saudi Arabia'],[true,'Other']].forEach(function(p){
+  var pid=contactParentAccId(d.accounts,p[0],p[1]);
+  if(pid)bucketAccIds[pid]=true;
+ });
  function hasOwnLeafAcc(linkedId){
   if(!linkedId)return false;
+  if(bucketAccIds[linkedId])return false;
   var acc=d.accounts.find(function(a){return a.id===linkedId;});
   if(!acc)return false;
   if(acc.isMain)return false;
