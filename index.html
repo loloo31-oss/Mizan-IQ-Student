@@ -972,6 +972,36 @@ function on1(id,evt,fn){
  // Also store for modal re-render recovery
  if(evt==='click')window['__handler_'+id]=fn;
 }
+// Finds the tight bounding box of "real content" already drawn onto a
+// canvas — everything that isn't transparent and isn't near-white paper
+// background — so a stamp/signature that was photographed or scanned with
+// a lot of surrounding blank paper doesn't get treated as if that blank
+// space were part of the mark. This is what actually kept some uploads
+// looking like a barely-visible dot even though the raw photo was plenty
+// large in pixels (e.g. an 800x600 phone photo of a small ink stamp): the
+// fit/scale logic below sized the WHOLE canvas to the target box, so the
+// real mark — a small fraction of that canvas — came out tiny inside it.
+// Returns null when no real content is found (a fully blank/transparent
+// image) or when it isn't feasible to read pixels back out.
+function findContentBBox(ctx,w,h){
+ var data;
+ try{data=ctx.getImageData(0,0,w,h).data;}catch(e){return null;}
+ var minX=w,minY=h,maxX=-1,maxY=-1;
+ for(var y=0;y<h;y++){
+  var row=y*w*4;
+  for(var x=0;x<w;x++){
+   var i=row+x*4;
+   var a=data[i+3];
+   if(a<10)continue; // transparent
+   var r=data[i],g=data[i+1],b=data[i+2];
+   if(r>245&&g>245&&b>245)continue; // near-white paper background
+   if(x<minX)minX=x;if(x>maxX)maxX=x;
+   if(y<minY)minY=y;if(y>maxY)maxY=y;
+  }
+ }
+ if(maxX<0)return null;
+ return {minX:minX,minY:minY,maxX:maxX,maxY:maxY};
+}
 // Shared by the Company Stamp / Financial Manager Signature uploads in
 // pSettings() — same resize-then-store-as-base64 approach as the existing
 // Company Logo upload (on1('logoFile',...) below), just parameterized so it
@@ -984,25 +1014,35 @@ function wireImageUploadField(inputId,dbField,maxW,maxH){
    var img=new Image();
    img.onload=function(){
     var w=img.width,h=img.height;
-    // Scale to FIT the maxW x maxH box, preserving aspect ratio -- in
-    // EITHER direction. The original code only ever scaled a source image
-    // DOWN when it exceeded the box; a small source (a tightly-cropped
-    // stamp or signature photo, e.g. 40x30px) was stored at its own tiny
-    // original size unchanged. That's what actually made stamps/signatures
-    // look "missing": the real image WAS there, just a few pixels across
-    // inside a much larger container everywhere it's displayed (Settings
-    // preview, the Balance Confirmation Letter) -- easy to mistake for a
-    // blank space or a rendering failure. Scaling up small sources too
-    // (capped at a sane 8x so a truly tiny/low-quality source doesn't blow
-    // up into an unusably blurry mess) keeps every upload a consistent,
-    // clearly-visible size.
-    var scale=Math.min(maxW/w,maxH/h,8);
-    w=Math.max(1,Math.round(w*scale));
-    h=Math.max(1,Math.round(h*scale));
+    // Draw at natural size first so findContentBBox() can locate the real
+    // mark and crop away any blank padding around it before fitting to the
+    // target box — see the comment on findContentBBox() above.
+    var srcCanvas=document.createElement('canvas');
+    srcCanvas.width=w;srcCanvas.height=h;
+    var srcCtx=srcCanvas.getContext('2d');
+    srcCtx.drawImage(img,0,0,w,h);
+    var bbox=findContentBBox(srcCtx,w,h);
+    var cropX=0,cropY=0,cropW=w,cropH=h;
+    if(bbox){
+     var padX=Math.round((bbox.maxX-bbox.minX)*0.08)+2;
+     var padY=Math.round((bbox.maxY-bbox.minY)*0.08)+2;
+     cropX=Math.max(0,bbox.minX-padX);
+     cropY=Math.max(0,bbox.minY-padY);
+     cropW=Math.min(w,bbox.maxX+padX)-cropX;
+     cropH=Math.min(h,bbox.maxY+padY)-cropY;
+    }
+    // Scale the CROPPED content to FIT the maxW x maxH box, preserving
+    // aspect ratio -- in EITHER direction (capped at a sane 8x upscale so a
+    // truly tiny/low-quality source doesn't blow up into an unusably
+    // blurry mess) -- so a tightly-cropped mark and a mark buried inside a
+    // large blank scan both end up a consistent, clearly-visible size.
+    var scale=Math.min(maxW/cropW,maxH/cropH,8);
+    var nw=Math.max(1,Math.round(cropW*scale));
+    var nh=Math.max(1,Math.round(cropH*scale));
     var canvas=document.createElement('canvas');
-    canvas.width=w;canvas.height=h;
+    canvas.width=nw;canvas.height=nh;
     var ctx=canvas.getContext('2d');
-    ctx.drawImage(img,0,0,w,h);
+    ctx.drawImage(srcCanvas,cropX,cropY,cropW,cropH,0,0,nw,nh);
     // Stamps/signatures are usually transparent-background PNGs meant to
     // overlay on a document — keep PNG whenever the source was PNG (or has
     // no reliable extension/type to judge by), only fall back to JPEG for
@@ -1017,13 +1057,14 @@ function wireImageUploadField(inputId,dbField,maxW,maxH){
   reader.readAsDataURL(file);
  });
 }
-// Retroactively fixes any stamp/signature that was already stored small
-// (uploaded before the upscale-on-upload fix above existed) — re-uploading
-// isn't the only way to end up with one; it can also arrive via a restored
-// backup. Runs once at boot (see loadDB().then below); decoding an image
-// is async, so this can't live inside normalizeDB(). Safe to call on every
-// boot: an image already at a good size is left untouched (no save/render
-// triggered), so this only ever does real work exactly once per image.
+// Retroactively fixes any stamp/signature that was already stored small OR
+// buried as a tiny mark inside a lot of blank padding (uploaded before the
+// crop-to-content fix above existed) — re-uploading isn't the only way to
+// end up with one; it can also arrive via a restored backup. Runs once at
+// boot (see loadDB().then below); decoding an image is async, so this
+// can't live inside normalizeDB(). Safe to call on every boot: an image
+// that's already tightly-cropped and a good size is left untouched (no
+// save/render triggered), so this only ever does real work once per image.
 function upgradeSmallCompanyImages(){
  var fields=[['stamp',220,220],['signature',280,120]];
  var pending=fields.length,changed=false;
@@ -1038,15 +1079,31 @@ function upgradeSmallCompanyImages(){
   var img=new Image();
   img.onload=function(){
    var w=img.width,h=img.height;
-   var scale=Math.min(maxW/w,maxH/h,8);
-   // Already a good size (or the source is too large to need help) --
-   // nothing to do. The 1.15 margin avoids pointlessly re-encoding an
-   // image that's already essentially at target size.
-   if(scale<=1.15||w<1||h<1){finish();return;}
-   var nw=Math.max(1,Math.round(w*scale)),nh=Math.max(1,Math.round(h*scale));
+   if(w<1||h<1){finish();return;}
+   var srcCanvas=document.createElement('canvas');
+   srcCanvas.width=w;srcCanvas.height=h;
+   var srcCtx=srcCanvas.getContext('2d');
+   srcCtx.drawImage(img,0,0,w,h);
+   var bbox=findContentBBox(srcCtx,w,h);
+   var cropX=0,cropY=0,cropW=w,cropH=h;
+   if(bbox){
+    var padX=Math.round((bbox.maxX-bbox.minX)*0.08)+2;
+    var padY=Math.round((bbox.maxY-bbox.minY)*0.08)+2;
+    cropX=Math.max(0,bbox.minX-padX);
+    cropY=Math.max(0,bbox.minY-padY);
+    cropW=Math.min(w,bbox.maxX+padX)-cropX;
+    cropH=Math.min(h,bbox.maxY+padY)-cropY;
+   }
+   var scale=Math.min(maxW/cropW,maxH/cropH,8);
+   // Already tightly cropped (no padding to remove) AND already a good
+   // size -- nothing to do. The 1.15 margin avoids pointlessly re-encoding
+   // an image that's already essentially at target size.
+   var noCropNeeded=(cropX===0&&cropY===0&&cropW===w&&cropH===h);
+   if(noCropNeeded&&scale<=1.15){finish();return;}
+   var nw=Math.max(1,Math.round(cropW*scale)),nh=Math.max(1,Math.round(cropH*scale));
    var canvas=document.createElement('canvas');
    canvas.width=nw;canvas.height=nh;
-   canvas.getContext('2d').drawImage(img,0,0,nw,nh);
+   canvas.getContext('2d').drawImage(srcCanvas,cropX,cropY,cropW,cropH,0,0,nw,nh);
    var isPNG=src.indexOf('data:image/png')===0;
    db.company[key]=isPNG?canvas.toDataURL('image/png'):canvas.toDataURL('image/jpeg',0.85);
    changed=true;
