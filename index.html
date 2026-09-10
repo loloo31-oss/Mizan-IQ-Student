@@ -1036,12 +1036,21 @@ function wireImageUploadField(inputId,dbField,maxW,maxH){
     // truly tiny/low-quality source doesn't blow up into an unusably
     // blurry mess) -- so a tightly-cropped mark and a mark buried inside a
     // large blank scan both end up a consistent, clearly-visible size.
-    var scale=Math.min(maxW/cropW,maxH/cropH,8);
+    // Capped lower (4x, was 8x): a low-resolution or blurry source stamp/
+    // signature photo stretched 8x turned into a big, visible-but-detail-
+    // less blob once cropped tight to its real content -- correctly sized,
+    // but no processing can recover detail that was never captured in the
+    // original photo/scan. A gentler cap keeps the result closer to the
+    // source's real resolution; if the mark still looks blurry after this,
+    // the fix is a sharper source photo (Settings > re-upload), not more
+    // upscaling.
+    var scale=Math.min(maxW/cropW,maxH/cropH,4);
     var nw=Math.max(1,Math.round(cropW*scale));
     var nh=Math.max(1,Math.round(cropH*scale));
     var canvas=document.createElement('canvas');
     canvas.width=nw;canvas.height=nh;
     var ctx=canvas.getContext('2d');
+    ctx.imageSmoothingEnabled=true;ctx.imageSmoothingQuality='high';
     ctx.drawImage(srcCanvas,cropX,cropY,cropW,cropH,0,0,nw,nh);
     // Stamps/signatures are usually transparent-background PNGs meant to
     // overlay on a document — keep PNG whenever the source was PNG (or has
@@ -1094,7 +1103,10 @@ function upgradeSmallCompanyImages(){
     cropW=Math.min(w,bbox.maxX+padX)-cropX;
     cropH=Math.min(h,bbox.maxY+padY)-cropY;
    }
-   var scale=Math.min(maxW/cropW,maxH/cropH,8);
+   // Capped lower (4x, was 8x) to match wireImageUploadField -- see the
+   // comment there for why an aggressive upscale of a low-resolution
+   // source turns into a detail-less blob once cropped tight to content.
+   var scale=Math.min(maxW/cropW,maxH/cropH,4);
    // Already tightly cropped (no padding to remove) AND already a good
    // size -- nothing to do. The 1.15 margin avoids pointlessly re-encoding
    // an image that's already essentially at target size.
@@ -1103,7 +1115,9 @@ function upgradeSmallCompanyImages(){
    var nw=Math.max(1,Math.round(cropW*scale)),nh=Math.max(1,Math.round(cropH*scale));
    var canvas=document.createElement('canvas');
    canvas.width=nw;canvas.height=nh;
-   canvas.getContext('2d').drawImage(srcCanvas,cropX,cropY,cropW,cropH,0,0,nw,nh);
+   var upCtx=canvas.getContext('2d');
+   upCtx.imageSmoothingEnabled=true;upCtx.imageSmoothingQuality='high';
+   upCtx.drawImage(srcCanvas,cropX,cropY,cropW,cropH,0,0,nw,nh);
    var isPNG=src.indexOf('data:image/png')===0;
    db.company[key]=isPNG?canvas.toDataURL('image/png'):canvas.toDataURL('image/jpeg',0.85);
    changed=true;
