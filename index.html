@@ -4922,6 +4922,155 @@ function accBalRangeRollup(accId,from2,to2,dispNormal){
  if(!kids.length)return signed;
  return signed+kids.reduce(function(s,k){return s+accBalRangeRollup(k.id,from2,to2,dispNormal);},0);
 }
+// ── Trial Balance Opening/Movement/Closing helpers ────────────────
+// Previous calendar day of a 'YYYY-MM-DD' date string -- used to find an
+// account's balance as of the day BEFORE a report's "From" date, i.e. that
+// period's Opening Balance. Blank in, blank out (no "From" date set).
+function prevDayStr(dateStr){
+ if(!dateStr)return dateStr;
+ var d=new Date(dateStr+'T00:00:00');
+ if(isNaN(d.getTime()))return dateStr;
+ d.setDate(d.getDate()-1);
+ return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0')+'-'+String(d.getDate()).padStart(2,'0');
+}
+// Balance of accId (rolled up through any children, same dispNormal-aware
+// sign convention as accBalRangeRollup) using ALL history up to and
+// including asOfDate -- the "as of a single point in time" counterpart to
+// accBalRangeRollup()'s date RANGE. asOfDate='' includes everything (i.e.
+// today's running total, no upper bound); the sentinel '0000-01-01' is used
+// below to exclude every real transaction, leaving just each account's own
+// manually-entered Opening Balance (.bal) -- that's the Trial Balance's
+// Opening Balance column when the report itself has no "From" date set.
+function acctBalanceAsOf(accId,asOfDate,dispNormal){
+ var a=db.accounts.find(function(x){return x.id===accId;});
+ dispNormal=dispNormal||(a&&a.normal);
+ var own=accBalRange(accId,null,asOfDate);
+ var signed=(a&&a.normal!==dispNormal)?-own:own;
+ var kids=db.accounts.filter(function(c){return c.pid===accId;});
+ if(!kids.length)return signed;
+ return signed+kids.reduce(function(s,k){return s+acctBalanceAsOf(k.id,asOfDate,dispNormal);},0);
+}
+// Gross Dr/Cr posted DIRECTLY to accId within [f,t] (own postings only, not
+// rolled up through children, and NOT normal-side-signed -- the actual raw
+// amounts on the Debit/Credit side, matching stmtCalc()'s own convention:
+// a receipt/payment's accTo is always the Dr side, accFrom always the Cr
+// side of its implied entry). Blank f/t means no lower/upper date bound.
+function acctGrossMovement(accId,f,t){
+ var dr=0,cr=0;
+ db.journals.forEach(function(je){
+  if(f&&je.date<f)return;
+  if(t&&je.date>t)return;
+  (je.lines||[]).forEach(function(l){
+   if(l.acc!==accId)return;
+   dr+=Number(l.dr)||0;cr+=Number(l.cr)||0;
+  });
+ });
+ (db.receipts||[]).forEach(function(r){
+  if(f&&r.date<f)return;
+  if(t&&r.date>t)return;
+  var amt=Number(r.amount)||0;
+  if(r.accTo===accId)dr+=amt;
+  if(r.accFrom===accId)cr+=amt;
+ });
+ (db.payments||[]).forEach(function(r){
+  if(f&&r.date<f)return;
+  if(t&&r.date>t)return;
+  var amt=Number(r.amount)||0;
+  if(r.accTo===accId)dr+=amt;
+  if(r.accFrom===accId)cr+=amt;
+ });
+ return {dr:dr,cr:cr};
+}
+// Same as acctGrossMovement but rolled up through children, for a main/sub
+// account row that needs to show its descendants' combined activity.
+function acctGrossMovementRollup(accId,f,t){
+ var own=acctGrossMovement(accId,f,t);
+ var kids=db.accounts.filter(function(c){return c.pid===accId;});
+ return kids.reduce(function(s,k){var km=acctGrossMovementRollup(k.id,f,t);return{dr:s.dr+km.dr,cr:s.cr+km.cr};},own);
+}
+// Splits a dispNormal-signed balance into its Debit/Credit display columns
+// (a negative balance means the account sits on the opposite side of its
+// own normal balance, e.g. an overdrawn cash account).
+function splitBalCols(bal,dispNormal){
+ if(dispNormal==='Debit')return bal>=0?{dr:bal,cr:0}:{dr:0,cr:-bal};
+ return bal>=0?{dr:0,cr:bal}:{dr:-bal,cr:0};
+}
+// The Trial Balance's full 6-column picture for one account/rollup:
+// Opening Dr/Cr, period Movement Dr/Cr (gross), and Closing Dr/Cr. Built so
+// that, by construction, Closing always equals Opening plus exactly the
+// same transactions the Movement columns sum (see acctBalanceAsOf's
+// '0000-01-01' sentinel for the no-"From"-date case) -- Opening+Net
+// Movement reconciles to Closing for every row, not just the report total.
+function acctTrialCols(accId,f,t,dispNormal,rollup){
+ var openAsOf=f?prevDayStr(f):'0000-01-01';
+ var open=rollup?acctBalanceAsOf(accId,openAsOf,dispNormal):accBalRange(accId,null,openAsOf);
+ var close=rollup?acctBalanceAsOf(accId,t||'',dispNormal):accBalRange(accId,null,t||'');
+ var mv=rollup?acctGrossMovementRollup(accId,f,t):acctGrossMovement(accId,f,t);
+ var o=splitBalCols(open,dispNormal),c=splitBalCols(close,dispNormal);
+ return {openDr:o.dr,openCr:o.cr,moveDr:mv.dr,moveCr:mv.cr,closeDr:c.dr,closeCr:c.cr};
+}
+// Builds the Trial Balance's row list -- shared by the on-screen pTrial(),
+// pdfTrial and xlsTrial so all three always show exactly the same rows.
+// Walks the chart of accounts RECURSIVELY to any depth, rather than a fixed
+// Main -> Sub -> Sub-sub (3 levels): a customer/supplier's own auto-created
+// sub-ledger account always sits ONE level below its shared country/type
+// "bucket" parent (see autoCreateContactAccount/genSubLedgerAccId, e.g.
+// "2101-01-001" under bucket "2101-01" under main "2101") -- a 4th level.
+// The old fixed-depth version silently stopped at the bucket and never
+// showed the individual customer/supplier row at all, even though its
+// balance WAS already being counted correctly in the flat totals pass
+// below (which scans db.accounts directly, not this tree) -- so the grand
+// total still tied to the Balance Sheet, but the one row an accountant
+// actually needs to reconcile a specific supplier/customer was invisible.
+function trialBalanceRows(f,t,lv){
+ var types=['Asset','Liability','Equity','Revenue','Expense'],rows=[];
+ // A "Main" account is ALWAYS its own flat, depth-0 row, even when it is
+ // itself nested under a higher Main (e.g. "1101" Cash, isMain:true with
+ // pid:"11" Current Assets) -- this chart of accounts uses isMain:true for
+ // every category/sub-category level, and the Trial Balance has always
+ // shown each of those as its own top-level line (its rolled-up figures
+ // via acctTrialCols(...,rollup:true) still correctly fold in every
+ // descendant's balance either way, isMain or not -- only the ROW/INDENT
+ // placement differs). Only a NON-main account nests beneath its immediate
+ // parent, and can chain arbitrarily deep doing so (see the comment above
+ // this function) -- walkLeaf() below follows exactly that non-main chain.
+ function walkLeaf(acc,tp,depth){
+  var kids=db.accounts.filter(function(c){return c.pid===acc.id&&!c.isMain;});
+  if(lv!=='main'){
+   var cols=acctTrialCols(acc.id,f,t,acc.normal,kids.length>0);
+   rows.push({id:acc.id,name:acc.name,nameAr:acc.nameAr||'',type:tp,normal:acc.normal,cols:cols,isMain:false,pid:acc.pid,lvl:depth});
+  }
+  kids.forEach(function(k){walkLeaf(k,tp,depth+1);});
+ }
+ types.forEach(function(tp){
+  db.accounts.filter(function(a){return a.type===tp&&a.isMain;}).forEach(function(m){
+   var kids=db.accounts.filter(function(c){return c.pid===m.id&&!c.isMain;});
+   if(lv!=='sub'){
+    var mCols=acctTrialCols(m.id,f,t,m.normal,kids.length>0);
+    rows.push({id:m.id,name:m.name,nameAr:m.nameAr||'',type:tp,normal:m.normal,cols:mCols,isMain:true,pid:m.pid,lvl:0});
+   }
+   kids.forEach(function(s){walkLeaf(s,tp,1);});
+  });
+  db.accounts.filter(function(a){return a.type===tp&&!a.isMain&&!a.pid;}).forEach(function(a){walkLeaf(a,tp,0);});
+ });
+ return rows;
+}
+// Trial Balance grand totals: one flat pass over every non-main account's
+// OWN figures (never a rollup, and NOT limited to any particular depth in
+// the tree) -- this is what keeps the totals correct and dedup-safe
+// regardless of nesting depth or of the handful of legacy COA entries that
+// carry BOTH isMain:true and a pid (e.g. "4101", "5101"), which are
+// otherwise reachable via two different Main->Sub traversal paths in
+// trialBalanceRows() above and would double-count if totals were
+// accumulated there instead. Every leaf account is visited exactly once.
+function trialBalanceTotals(f,t){
+ var tOpenDr=0,tOpenCr=0,tMoveDr=0,tMoveCr=0,tCloseDr=0,tCloseCr=0;
+ db.accounts.filter(function(a){return !a.isMain;}).forEach(function(a){
+  var c=acctTrialCols(a.id,f,t,a.normal,false);
+  tOpenDr+=c.openDr;tOpenCr+=c.openCr;tMoveDr+=c.moveDr;tMoveCr+=c.moveCr;tCloseDr+=c.closeDr;tCloseCr+=c.closeCr;
+ });
+ return {openDr:tOpenDr,openCr:tOpenCr,moveDr:tMoveDr,moveCr:tMoveCr,closeDr:tCloseDr,closeCr:tCloseCr};
+}
 
 function updatePITotals(){
  var sub=0,vat=0;
@@ -5004,7 +5153,7 @@ function pTrial(){
  var isAr=lang==='ar';
  var f=rptFrom,t=rptTo,lv=rptLevel;
  var h=tb(tr('nav_trial'),
-  '<button class="btn" data-action="editOB">'+ic('edit')+' Opening Balances</button>'
+  '<button class="btn" data-action="editOB">'+ic('edit')+' '+(isAr?'الأرصدة الافتتاحية':'Opening Balances')+'</button>'
   +'<button class="btn" data-action="xlsTrial">'+ic('dn')+' Excel</button>'
   +'<button class="btn" data-action="pdfTrial">'+ic('prt')+' PDF</button>');
  h+='<div class="pg">'+buildFilterBar();
@@ -5012,76 +5161,49 @@ function pTrial(){
   h+='<div style="text-align:center;padding:60px 20px;color:var(--t3)"><div style="font-size:48px;margin-bottom:12px">📊</div><div style="font-size:14px;font-weight:600;color:var(--t2)">'+(isAr?'اضغط "عرض التقرير" لعرض ميزان المراجعة':'Click "Show Report" to display Trial Balance')+'</div></div>';
   h+='</div>';return h;
  }
- var types=['Asset','Liability','Equity','Revenue','Expense'],rows=[];
- types.forEach(function(tp){
-  db.accounts.filter(function(a){return a.type===tp&&a.isMain;}).forEach(function(m){
-   var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
-   var mBal=accBalRangeRollup(m.id,f,t);
-   if(lv!=='sub')rows.push({id:m.id,name:m.name,nameAr:m.nameAr||'',type:tp,normal:m.normal,bal:mBal,isMain:true,lvl:0});
-   subs.forEach(function(s){
-    // A sub-account can itself have children now (e.g. "Local Customers"
-    // 1103-01, once individual customer sub-accounts exist under it -- see
-    // autoCreateContactAccount()); postings land on those, not on s itself,
-    // so s's displayed balance here is the rolled-up sum of its children.
-    var subSubs=db.accounts.filter(function(ss){return ss.pid===s.id;});
-    var sBal=accBalRangeRollup(s.id,f,t);
-    if(lv!=='main')rows.push({id:s.id,name:s.name,nameAr:s.nameAr||'',type:tp,normal:s.normal,bal:sBal,isMain:false,pid:m.id,lvl:1});
-    subSubs.forEach(function(ss){
-     var ssBal=accBalRange(ss.id,f,t);
-     if(lv!=='main')rows.push({id:ss.id,name:ss.name,nameAr:ss.nameAr||'',type:tp,normal:ss.normal,bal:ssBal,isMain:false,pid:s.id,lvl:2});
-    });
-   });
-  });
-  db.accounts.filter(function(a){return a.type===tp&&!a.isMain&&!a.pid;}).forEach(function(a){
-   var aBal=accBalRange(a.id,f,t);
-   rows.push({id:a.id,name:a.name,nameAr:a.nameAr||'',type:tp,normal:a.normal,bal:aBal,isMain:false,lvl:0});
-  });
- });
- // Totals: one flat pass over every non-main account's OWN balance (never
- // a rollup) -- this is what keeps the total correct and dedup-safe
- // regardless of nesting depth or of the handful of legacy COA entries
- // that carry BOTH isMain:true and a pid (e.g. "4101", "5101"), which are
- // otherwise reachable via two different Main->Sub traversal paths in the
- // rows loop above and would double-count if totals were accumulated
- // there instead. Every leaf account is visited exactly once here.
- var drTotal=0,crTotal=0;
- db.accounts.filter(function(a){return !a.isMain;}).forEach(function(a){
-  var bal=accBalRange(a.id,f,t);
-  if(a.normal==='Debit'){if(bal>=0)drTotal+=bal;else crTotal+=Math.abs(bal);}
-  else{if(bal>=0)crTotal+=bal;else drTotal+=Math.abs(bal);}
- });
- var dr=drTotal,cr=crTotal;
- var ok=Math.abs(dr-cr)<0.01;
- var diff2=Math.abs(dr-cr);
+ var typeLabels={Asset:isAr?'أصول':'Asset',Liability:isAr?'التزامات':'Liability',Equity:isAr?'حقوق ملكية':'Equity',Revenue:isAr?'إيرادات':'Revenue',Expense:isAr?'مصروفات':'Expense'};
+ var rows=trialBalanceRows(f,t,lv);
+ var tt=trialBalanceTotals(f,t);
+ var tOpenDr=tt.openDr,tOpenCr=tt.openCr,tMoveDr=tt.moveDr,tMoveCr=tt.moveCr,tCloseDr=tt.closeDr,tCloseCr=tt.closeCr;
+ var ok=Math.abs(tCloseDr-tCloseCr)<0.01;
+ var diff2=Math.abs(tCloseDr-tCloseCr);
  if(!ok){
   h+='<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:var(--r);padding:12px 16px;margin-bottom:16px;display:flex;align-items:center;gap:10px">'
    +'<span style="font-size:20px">⚠️</span>'
-   +'<div><div style="font-weight:700;color:#b91c1c;font-size:13px">ميزان المراجعة غير متوازن!</div>'
-   +'<div style="font-size:12px;color:#dc2626;margin-top:2px">فرق الأرصدة: <strong>'+N(diff2)+'</strong> — إجمالي المدين: '+N(dr)+' | إجمالي الدائن: '+N(cr)+'</div>'
+   +'<div><div style="font-weight:700;color:#b91c1c;font-size:13px">'+(isAr?'ميزان المراجعة غير متوازن!':'Trial Balance is out of balance!')+'</div>'
+   +'<div style="font-size:12px;color:#dc2626;margin-top:2px">'+(isAr?'فرق الأرصدة':'Difference')+': <strong>'+N(diff2)+'</strong> — '+(isAr?'إجمالي المدين':'Total Debit')+': '+N(tCloseDr)+' | '+(isAr?'إجمالي الدائن':'Total Credit')+': '+N(tCloseCr)+'</div>'
    +'</div></div>';
  }
  h+='<div class="card"><div class="tw"><table><thead><tr>'
-  +'<th>Code</th><th>Account</th>'+(rptShowCodes?'':'')+'<th>Type</th><th class="tr">Debit</th><th class="tr">Credit</th>'
+  +'<th>'+(isAr?'الرمز':'Code')+'</th><th>'+(isAr?'الحساب':'Account')+'</th><th>'+(isAr?'النوع':'Type')+'</th>'
+  +'<th class="tr">'+(isAr?'رصيد أول المدة مدين':'Opening Dr')+'</th><th class="tr">'+(isAr?'رصيد أول المدة دائن':'Opening Cr')+'</th>'
+  +'<th class="tr">'+(isAr?'عمليات مدينة':'Debit Movement')+'</th><th class="tr">'+(isAr?'عمليات دائنة':'Credit Movement')+'</th>'
+  +'<th class="tr">'+(isAr?'رصيد ختامي مدين':'Closing Dr')+'</th><th class="tr">'+(isAr?'رصيد ختامي دائن':'Closing Cr')+'</th>'
   +'</tr></thead><tbody>';
  rows.forEach(function(r){
-  var dr2,cr2;
-  if(r.normal==='Debit'){if(r.bal>=0){dr2=r.bal;cr2=0;}else{dr2=0;cr2=Math.abs(r.bal);}}
-  else{if(r.bal>=0){dr2=0;cr2=r.bal;}else{dr2=Math.abs(r.bal);cr2=0;}}
+  var c=r.cols;
   var rowBg=r.isMain?'background:var(--bg)':'';
   var indent=(r.lvl||0)?'padding-right:'+((r.lvl||0)*20)+'px':'';
-  var nameDisplay=rptShowCodes?(r.id+' '):'';
   h+='<tr style="'+rowBg+'">'
    +'<td><span class="tag">'+r.id+'</span></td>'
-   +'<td style="'+indent+'">'+(r.isMain?'<strong>'+r.name+'</strong>':r.name)+(r.nameAr&&lang==='ar'?' | '+r.nameAr:'')+'</td>'
-   +'<td style="font-size:11px;color:var(--t2)">'+r.type+'</td>'
-   +'<td class="tr mn">'+(dr2?N(dr2):'')+'</td>'
-   +'<td class="tr mn">'+(cr2?N(cr2):'')+'</td>'
+   +'<td style="'+indent+'">'+(r.isMain?'<strong>'+r.name+'</strong>':r.name)+(r.nameAr&&isAr?' | '+r.nameAr:'')+'</td>'
+   +'<td style="font-size:11px;color:var(--t2)">'+(typeLabels[r.type]||r.type)+'</td>'
+   +'<td class="tr mn">'+(c.openDr?N(c.openDr):'')+'</td>'
+   +'<td class="tr mn">'+(c.openCr?N(c.openCr):'')+'</td>'
+   +'<td class="tr mn">'+(c.moveDr?N(c.moveDr):'')+'</td>'
+   +'<td class="tr mn">'+(c.moveCr?N(c.moveCr):'')+'</td>'
+   +'<td class="tr mn">'+(c.closeDr?N(c.closeDr):'')+'</td>'
+   +'<td class="tr mn">'+(c.closeCr?N(c.closeCr):'')+'</td>'
    +'</tr>';
  });
  h+='<tr style="font-weight:700;background:var(--bg)">'
-  +'<td colspan="3" style="padding:8px 12px;font-size:11px;text-transform:uppercase;letter-spacing:.04em">Total</td>'
-  +'<td class="tr mn">'+N(dr)+'</td>'
-  +'<td class="tr mn">'+N(cr)+'</td>'
+  +'<td colspan="3" style="padding:8px 12px;font-size:11px;text-transform:uppercase;letter-spacing:.04em">'+(isAr?'الإجمالي':'Total')+'</td>'
+  +'<td class="tr mn">'+N(tOpenDr)+'</td>'
+  +'<td class="tr mn">'+N(tOpenCr)+'</td>'
+  +'<td class="tr mn">'+N(tMoveDr)+'</td>'
+  +'<td class="tr mn">'+N(tMoveCr)+'</td>'
+  +'<td class="tr mn">'+N(tCloseDr)+'</td>'
+  +'<td class="tr mn">'+N(tCloseCr)+'</td>'
   +'</tr>';
  return h+'</tbody></table></div></div></div>';
 }
@@ -5299,47 +5421,52 @@ function stmtCalc(){
  // so any account whose activity came via a Receipt/Payment voucher (very
  // common for cash/bank and customer/supplier accounts) silently showed an
  // incomplete statement with those transactions missing entirely.
- // Each row's "delta" is normal-side aware (a Credit-normal account, e.g. a
- // Liability/Equity/Revenue account or a supplier's Payable, must move UP
- // on a credit and DOWN on a debit) — matching accBalRange()'s own sign
- // convention, instead of the old dr-cr-always logic that ran every such
- // account's statement backwards.
+ // Each row's "delta" is a plain, always-the-same Debit-minus-Credit (a
+ // classic running-balance ledger column): a Debit always moves the
+ // balance UP and a Credit always moves it DOWN, for every account
+ // regardless of its own normal side. This is deliberate: for a
+ // Credit-normal account (a supplier's Payable, a Liability, Equity or
+ // Revenue account), a genuine credit balance is then shown as a NEGATIVE
+ // number (e.g. a supplier owed SAR 580,000 prints as -580,000) — the
+ // reader reads the sign itself to tell Debit vs Credit, matching how this
+ // app's own printed statements are expected to read. (An earlier version
+ // of this function instead flipped the sign for Credit-normal accounts so
+ // their balance always showed positive, matching accBalRange()'s own
+ // rollup convention used by the Trial Balance/Balance Sheet — but that is
+ // a different report with a different job; on a per-account Statement the
+ // sign itself is the signal, so this was reverted back to plain dr-cr.)
  var isDebitNormal=!acc||acc.normal!=='Credit';
  var all=[];
  db.journals.forEach(function(je){
   (je.lines||[]).forEach(function(l){
    if(l.acc!==selId)return;
    var dr=Number(l.dr)||0,cr=Number(l.cr)||0;
-   all.push({date:je.date,ref:je.id,desc:je.desc,dr:dr,cr:cr,delta:isDebitNormal?dr-cr:cr-dr});
+   all.push({date:je.date,ref:je.id,desc:je.desc,dr:dr,cr:cr,delta:dr-cr});
   });
  });
  // accTo/accFrom's dr/cr SIDE is fixed by role, not by the viewed account's
  // own normal balance type: a voucher always reads as "Dr accTo / Cr
  // accFrom" (a Receipt debits the deposit account and credits its counter;
  // a Payment debits its counter — the liability/expense being settled —
- // and credits the account paid from). Only the running BALANCE (delta)
- // depends on whether that side increases or decreases THIS account, which
- // is exactly what isDebitNormal already captures for journal lines above —
- // so reuse the same dr-cr/cr-dr formula here instead of re-deciding the
- // dr/cr split from isDebitNormal a second time. The previous version used
- // isDebitNormal to pick BOTH the column and the delta, which happened to
- // read right only when the counter account was itself Debit-normal (e.g.
- // a bank) — the moment the counter was a Credit-normal account (a
- // supplier's Payable being paid down, a customer's Payable-side account,
- // etc.) it silently posted the amount into the wrong column even though
- // the running balance itself still moved the correct direction.
+ // and credits the account paid from).
  (db.receipts||[]).forEach(function(r){
   var amt=Number(r.amount)||0;
-  if(r.accTo===selId){var dr=amt,cr=0;all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:dr,cr:cr,delta:isDebitNormal?dr-cr:cr-dr});}
-  if(r.accFrom===selId){var dr2=0,cr2=amt;all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:dr2,cr:cr2,delta:isDebitNormal?dr2-cr2:cr2-dr2});}
+  if(r.accTo===selId){var dr=amt,cr=0;all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:dr,cr:cr,delta:dr-cr});}
+  if(r.accFrom===selId){var dr2=0,cr2=amt;all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:dr2,cr:cr2,delta:dr2-cr2});}
  });
  (db.payments||[]).forEach(function(r){
   var amt=Number(r.amount)||0;
-  if(r.accTo===selId){var dr3=amt,cr3=0;all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:dr3,cr:cr3,delta:isDebitNormal?dr3-cr3:cr3-dr3});}
-  if(r.accFrom===selId){var dr4=0,cr4=amt;all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:dr4,cr:cr4,delta:isDebitNormal?dr4-cr4:cr4-dr4});}
+  if(r.accTo===selId){var dr3=amt,cr3=0;all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:dr3,cr:cr3,delta:dr3-cr3});}
+  if(r.accFrom===selId){var dr4=0,cr4=amt;all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:dr4,cr:cr4,delta:dr4-cr4});}
  });
  all.sort(function(a,b){return a.date.localeCompare(b.date);});
- var init=acc?(acc.bal||0):0; // the account's own manually-entered Opening Balance
+ // acc.bal is stored normal-side-signed (positive = the account's own
+ // natural balance direction — see accBalRange()), so it must be flipped
+ // here too for a Credit-normal account to land in this function's plain
+ // Debit-positive/Credit-negative space, consistent with every txn delta
+ // above (otherwise a nonzero manually-entered Opening Balance would show
+ // with the wrong sign relative to the transactions that follow it).
+ var init=acc?(isDebitNormal?(acc.bal||0):-(acc.bal||0)):0; // the account's own manually-entered Opening Balance
  var txns=all,open=init;
  if(fFrom){var bf=all.filter(function(t){return t.date<fFrom;});open=init+bf.reduce(function(s,t){return s+t.delta;},0);txns=txns.filter(function(t){return t.date>=fFrom;});}
  if(fTo)txns=txns.filter(function(t){return t.date<=fTo;});
@@ -7790,87 +7917,52 @@ window.xAction=function(type){
   printHTML('Journal Entries',html);
   return;
  } else if(type==='pdfTrial'){
-  // Uses the same accBalRange/accBalRangeRollup engine (and the selected
-  // rptFrom/rptTo date range) as the on-screen pTrial() and xlsTrial() --
-  // it must NOT read accounts' raw .bal directly, since .bal only ever
-  // reflects manually-entered Opening Balances and stays 0 forever for any
-  // account whose activity came from journals/receipts/payments (the
-  // normal case). Reading .bal here made every printed PDF show 0.00 (or a
-  // stale figure) for real accounts while the on-screen report was correct.
+  // Uses the same acctTrialCols() engine (and the selected rptFrom/rptTo
+  // date range) as the on-screen pTrial() and xlsTrial(), and follows the
+  // app's current display language exactly like pTrial() -- it must NOT
+  // read accounts' raw .bal directly, since .bal only ever reflects
+  // manually-entered Opening Balances and stays 0 forever for any account
+  // whose activity came from journals/receipts/payments (the normal case).
+  // Reading .bal here made every printed PDF show 0.00 (or a stale figure)
+  // for real accounts while the on-screen report was correct.
+  var isArP=lang==='ar';
   var fT=rptFrom,tT=rptTo;
-  var types=['Asset','Liability','Equity','Revenue','Expense'];
-  var html='<table><thead><tr><th>Code</th><th>Account</th><th>Type</th><th class="tr">Debit</th><th class="tr">Credit</th></tr></thead><tbody>';
-  types.forEach(function(t){db.accounts.filter(function(a){return a.type===t&&a.isMain;}).forEach(function(m){
-   var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
-   html+='<tr class="tot"><td>'+m.id+'</td><td><strong>'+m.name+'</strong></td><td>'+t+'</td><td></td><td></td></tr>';
-   subs.forEach(function(s){
-    // A sub can itself have children now (e.g. auto-generated customer/
-    // supplier sub-accounts under "Local Customers" -- see
-    // autoCreateContactAccount()); roll its displayed balance up from them
-    // for display (the TOTAL row below is a separate flat leaf-only pass,
-    // exactly like pTrial(), so nesting depth can never cause double-count).
-    var subSubs=db.accounts.filter(function(ss){return ss.pid===s.id;});
-    var sBal=accBalRangeRollup(s.id,fT,tT);
-    html+='<tr><td>'+s.id+'</td><td style="padding-left:14pt">'+s.name+'</td><td>'+t+'</td><td class="tr">'+(s.normal==='Debit'?N(sBal):'')+'</td><td class="tr">'+(s.normal==='Credit'?N(sBal):'')+'</td></tr>';
-    subSubs.forEach(function(ss){
-     var ssBal=accBalRange(ss.id,fT,tT);
-     html+='<tr><td>'+ss.id+'</td><td style="padding-left:28pt">'+ss.name+'</td><td>'+t+'</td><td class="tr">'+(ss.normal==='Debit'?N(ssBal):'')+'</td><td class="tr">'+(ss.normal==='Credit'?N(ssBal):'')+'</td></tr>';
-    });
-   });
-  });});
-  // Totals: same flat, dedup-safe leaf-account pass as pTrial() uses --
-  // never a rollup, so nested/legacy accounts are never double-counted.
-  var dr=0,cr=0;
-  db.accounts.filter(function(a){return !a.isMain;}).forEach(function(a){
-   var bal=accBalRange(a.id,fT,tT);
-   if(a.normal==='Debit'){if(bal>=0)dr+=bal;else cr+=Math.abs(bal);}
-   else{if(bal>=0)cr+=bal;else dr+=Math.abs(bal);}
+  var typeLabelsP={Asset:isArP?'أصول':'Asset',Liability:isArP?'التزامات':'Liability',Equity:isArP?'حقوق ملكية':'Equity',Revenue:isArP?'إيرادات':'Revenue',Expense:isArP?'مصروفات':'Expense'};
+  var rowsP=trialBalanceRows(fT,tT,'all');
+  var html='<table><thead><tr><th>'+(isArP?'الرمز':'Code')+'</th><th>'+(isArP?'الحساب':'Account')+'</th><th>'+(isArP?'النوع':'Type')+'</th>'
+   +'<th class="tr">'+(isArP?'رصيد أول المدة مدين':'Opening Dr')+'</th><th class="tr">'+(isArP?'رصيد أول المدة دائن':'Opening Cr')+'</th>'
+   +'<th class="tr">'+(isArP?'عمليات مدينة':'Debit Movement')+'</th><th class="tr">'+(isArP?'عمليات دائنة':'Credit Movement')+'</th>'
+   +'<th class="tr">'+(isArP?'رصيد ختامي مدين':'Closing Dr')+'</th><th class="tr">'+(isArP?'رصيد ختامي دائن':'Closing Cr')+'</th>'
+   +'</tr></thead><tbody>';
+  rowsP.forEach(function(r){
+   var c=r.cols;
+   var nm=r.isMain?'<strong>'+r.name+'</strong>':r.name;
+   var indentPt=(r.lvl||0)*14;
+   html+='<tr'+(r.isMain?' class="tot"':'')+'><td>'+r.id+'</td><td'+(indentPt?' style="padding-left:'+indentPt+'pt"':'')+'>'+nm+'</td><td>'+(typeLabelsP[r.type]||r.type)+'</td>'
+    +'<td class="tr">'+(c.openDr?N(c.openDr):'')+'</td><td class="tr">'+(c.openCr?N(c.openCr):'')+'</td>'
+    +'<td class="tr">'+(c.moveDr?N(c.moveDr):'')+'</td><td class="tr">'+(c.moveCr?N(c.moveCr):'')+'</td>'
+    +'<td class="tr">'+(c.closeDr?N(c.closeDr):'')+'</td><td class="tr">'+(c.closeCr?N(c.closeCr):'')+'</td></tr>';
   });
-  html+='<tr class="fin"><td colspan="3">TOTAL</td><td class="tr">'+N(dr)+'</td><td class="tr">'+N(cr)+'</td></tr></tbody></table>';
-  printHTML('Trial Balance',html);
+  var ttP=trialBalanceTotals(fT,tT);
+  html+='<tr class="fin"><td colspan="3">'+(isArP?'الإجمالي':'TOTAL')+'</td>'
+   +'<td class="tr">'+N(ttP.openDr)+'</td><td class="tr">'+N(ttP.openCr)+'</td>'
+   +'<td class="tr">'+N(ttP.moveDr)+'</td><td class="tr">'+N(ttP.moveCr)+'</td>'
+   +'<td class="tr">'+N(ttP.closeDr)+'</td><td class="tr">'+N(ttP.closeCr)+'</td></tr></tbody></table>';
+  printHTML(isArP?'ميزان المراجعة':'Trial Balance',html);
  } else if(type==='xlsTrial'){
+  var isArX=lang==='ar';
+  var typeLabelsX={Asset:isArX?'أصول':'Asset',Liability:isArX?'التزامات':'Liability',Equity:isArX?'حقوق ملكية':'Equity',Revenue:isArX?'إيرادات':'Revenue',Expense:isArX?'مصروفات':'Expense'};
   var f=rptFrom,t2=rptTo;
-  var types=['Asset','Liability','Equity','Revenue','Expense'],rows=[];
-  types.forEach(function(tp){
-   db.accounts.filter(function(a){return a.type===tp&&a.isMain;}).forEach(function(m){
-    var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
-    var mBal=accBalRangeRollup(m.id,f,t2);
-    rows.push([m.id,m.name,tp,'','']);
-    subs.forEach(function(s){
-     // See the pdfTrial branch above for why this rolls up through any
-     // children rather than reading s's own (possibly unused) balance,
-     // and why totals themselves come from a separate flat pass below.
-     var subSubs=db.accounts.filter(function(ss){return ss.pid===s.id;});
-     var sBal=accBalRangeRollup(s.id,f,t2);
-     var dr2,cr2;
-     if(s.normal==='Debit'){if(sBal>=0){dr2=sBal;cr2='';}else{dr2='';cr2=Math.abs(sBal);}}
-     else{if(sBal>=0){dr2='';cr2=sBal;}else{dr2=Math.abs(sBal);cr2='';}}
-     rows.push([s.id,'  '+s.name,tp,dr2,cr2]);
-     subSubs.forEach(function(ss){
-      var ssBal=accBalRange(ss.id,f,t2);
-      var dr3,cr3;
-      if(ss.normal==='Debit'){if(ssBal>=0){dr3=ssBal;cr3='';}else{dr3='';cr3=Math.abs(ssBal);}}
-      else{if(ssBal>=0){dr3='';cr3=ssBal;}else{dr3=Math.abs(ssBal);cr3='';}}
-      rows.push([ss.id,'    '+ss.name,tp,dr3,cr3]);
-     });
-    });
-    if(!subs.length){
-     var dr2,cr2;
-     if(m.normal==='Debit'){if(mBal>=0){dr2=mBal;cr2='';}else{dr2='';cr2=Math.abs(mBal);}}
-     else{if(mBal>=0){dr2='';cr2=mBal;}else{dr2=Math.abs(mBal);cr2='';}}
-     rows[rows.length-1][3]=dr2;rows[rows.length-1][4]=cr2;
-    }
-   });
+  var rowsX=trialBalanceRows(f,t2,'all');
+  var rows=rowsX.map(function(r){
+   var c=r.cols,indent=Array((r.lvl||0)+1).join('  ');
+   return [r.id,indent+r.name,typeLabelsX[r.type]||r.type,c.openDr||'',c.openCr||'',c.moveDr||'',c.moveCr||'',c.closeDr||'',c.closeCr||''];
   });
-  // Totals: same flat, dedup-safe pass as pTrial()/pdfTrial() above, using
-  // the date-ranged accBalRange() (this export respects rptFrom/rptTo).
-  var dr=0,cr=0;
-  db.accounts.filter(function(a){return !a.isMain;}).forEach(function(a){
-   var bal=accBalRange(a.id,f,t2);
-   if(a.normal==='Debit'){if(bal>=0)dr+=bal;else cr+=Math.abs(bal);}
-   else{if(bal>=0)cr+=bal;else dr+=Math.abs(bal);}
-  });
-  exportXLS([[db.company.name],[db.company.address||''],[tr('nav_trial'),'','Date: '+today()],[],['Code','Account','Type','Debit','Credit']].concat(rows).concat([['','TOTAL','',dr,cr]]),'Trial Balance','Trial_Balance_'+today());
+  var ttX=trialBalanceTotals(f,t2);
+  var hdrX=isArX
+   ?['الرمز','الحساب','النوع','رصيد أول المدة مدين','رصيد أول المدة دائن','عمليات مدينة','عمليات دائنة','رصيد ختامي مدين','رصيد ختامي دائن']
+   :['Code','Account','Type','Opening Dr','Opening Cr','Debit Movement','Credit Movement','Closing Dr','Closing Cr'];
+  exportXLS([[db.company.name],[db.company.address||''],[tr('nav_trial'),'','Date: '+today()],[],hdrX].concat(rows).concat([['','',isArX?'الإجمالي':'TOTAL',ttX.openDr,ttX.openCr,ttX.moveDr,ttX.moveCr,ttX.closeDr,ttX.closeCr]]),isArX?'ميزان المراجعة':'Trial Balance','Trial_Balance_'+today());
  } else if(type==='xlsIncome'){
   var f=rptFrom,t2=rptTo;
   var d=incData();
