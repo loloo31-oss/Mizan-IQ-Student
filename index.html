@@ -1157,11 +1157,12 @@ function printHTML(title,body){
 // nothing has been uploaded, with the same onerror fallback for a stored
 // image that turns out to be unusable.
 function sigStampFooterHtml(){
- var co=db.company;
  var blank='.....................................';
- var sigImg=co.signature?'<span><img src="'+co.signature+'" style="height:26px;max-width:75px;object-fit:contain;display:inline-block;vertical-align:middle" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'inline\'"><span style="display:none">'+blank+'</span></span>':blank;
- var stampImg=co.stamp?'<span><img src="'+co.stamp+'" style="height:34px;max-width:55px;object-fit:contain;display:inline-block;vertical-align:middle" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'inline\'"><span style="display:none">'+blank+'</span></span>':blank;
- return '<div style="margin-top:26pt;display:flex;justify-content:space-between;font-size:9pt"><div><strong>Prepared by:</strong> '+blank+'</div><div><strong>Signature:</strong> '+sigImg+'</div><div><strong>Stamp:</strong> '+stampImg+'</div></div>';
+ // Embedding the actual uploaded Stamp/Signature images here was tried and
+ // then explicitly reverted at the user's request (the small embedded
+ // marks kept coming out unclear no matter how the upscale/crop logic was
+ // tuned) -- back to a plain blank line for a physical signature, always.
+ return '<div style="margin-top:26pt;display:flex;justify-content:space-between;font-size:9pt"><div><strong>Prepared by:</strong> '+blank+'</div><div><strong>Signature:</strong> '+blank+'</div><div><strong>Stamp:</strong> '+blank+'</div></div>';
 }
 
 // ── Balance Confirmation Letter ───────────────────────────────
@@ -1245,21 +1246,14 @@ function confirmLetterBodyHtml(contact,acc){
   return '<tr><td style="'+LTR+';'+cellBase+extra+'">'+en+'</td><td style="'+RTL+';'+cellBase+extra+'">'+ar+'</td></tr>';
  }
  // Our own company's sign-off — Company name and (a default) Title are
- // things we actually know; the signer's personal Name is left blank for
- // manual entry, and Signature/Stamp embed the uploaded images when present
- // (see pSettings()'s Company Stamp / Financial Manager Signature cards),
- // otherwise fall back to a blank line for a physical signature.
+ // things we actually know; the signer's personal Name, Signature and
+ // Stamp are all left as a blank line for physical signing. (Embedding the
+ // uploaded Stamp/Signature images here was tried and then explicitly
+ // reverted at the user's request — the small embedded marks kept coming
+ // out unclear no matter how the crop/upscale logic was tuned.)
  var blank='.....................................';
- // onerror fallback: if the stored image ever turns out to be an unusable
- // data URI (e.g. an extreme-aspect-ratio upload rounded down to a 0px
- // canvas dimension before this was guarded against below — see
- // wireImageUploadField), the <img> would otherwise render as nothing at
- // all, with no visible sign anything is even meant to be there. Falling
- // back to the same dotted blank line here keeps the letter presentable in
- // any browser-rendered context (on-screen preview, the Print/PDF popup);
- // it has no effect in the Word export, which isn't a live script context.
- var sigImg=co.signature?'<span><img src="'+co.signature+'" style="height:26px;max-width:75px;object-fit:contain;display:inline-block;vertical-align:middle" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'inline\'"><span style="display:none">'+blank+'</span></span>':blank;
- var stampImg=co.stamp?'<span><img src="'+co.stamp+'" style="height:34px;max-width:55px;object-fit:contain;display:inline-block;vertical-align:middle" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'inline\'"><span style="display:none">'+blank+'</span></span>':blank;
+ var sigImg=blank;
+ var stampImg=blank;
  var balEn=eff.side==='Credit'
   ?'Please be informed that your <u>credit</u> balance with us amounts to <strong>'+curCode+' '+amountFmt+'</strong>.'
   :'Please be informed that your <u>debit</u> balance with us amounts to <strong>'+curCode+' '+amountFmt+'</strong>.';
