@@ -299,6 +299,86 @@ function autoCreateContactAccount(accountsArr,isSup,contact){
  });
  return newId;
 }
+// When normalizeDB()'s backfill below moves a customer/supplier off a
+// shared/bucket account onto its own brand-new dedicated leaf account,
+// re-pointing ONLY contact.linkedAccId left every one of that contact's
+// PAST invoices, receipts and payments still tagged to the OLD account id
+// in db.journals/receipts/payments -- the new account was blank, so its
+// Account Statement (and any other report keyed off the account id) came
+// back completely empty even though the balance elsewhere (which rolls up
+// through account IDs, not through the contact record) could still look
+// fine. This moves that history along with the contact, plus any leftover
+// manually-entered Opening Balance on the old account (rare for a bucket,
+// but a straight non-destructive carry-over either way).
+function migrateAccountPostings(d,oldId,newId){
+ if(!oldId||!newId||oldId===newId)return;
+ var oldAcc=d.accounts.find(function(a){return a.id===oldId;});
+ var newAcc=d.accounts.find(function(a){return a.id===newId;});
+ if(oldAcc&&newAcc&&oldAcc.bal){newAcc.bal=(newAcc.bal||0)+oldAcc.bal;oldAcc.bal=0;}
+ (d.journals||[]).forEach(function(je){
+  (je.lines||[]).forEach(function(l){if(l.acc===oldId)l.acc=newId;});
+ });
+ (d.receipts||[]).forEach(function(r){
+  if(r.accTo===oldId)r.accTo=newId;
+  if(r.accFrom===oldId)r.accFrom=newId;
+ });
+ (d.payments||[]).forEach(function(p){
+  if(p.accTo===oldId)p.accTo=newId;
+  if(p.accFrom===oldId)p.accFrom=newId;
+ });
+}
+// Finds accounts that hold real posted activity (journal lines, receipts or
+// payments) but are no longer any customer's or supplier's linkedAccId --
+// i.e. an "orphaned" account. This is exactly the state an EARLIER version
+// of the backfill in normalizeDB() above could leave behind: it moved a
+// contact off a shared bucket account onto a brand-new dedicated one
+// (fixing "no account number of its own") but, before migrateAccountPostings
+// existed, never carried that contact's history along -- so the contact's
+// OWN account looks empty (an empty Account Statement) while its real
+// invoices/payments stay stranded on the old account, unreachable from any
+// contact. This is read-only and only used to surface candidates for the
+// user to confirm and merge on the Backup/Data page (pBackup()) -- it never
+// merges anything on its own, since (unlike the still-current sharing this
+// session's data has for normalizeDB() to detect automatically) there is no
+// safe way to tell WHICH customer/supplier an already-orphaned account used
+// to belong to without a person who knows the business confirming it.
+// The fixed Accounts Receivable / Accounts Payable sub-ledger root ids that
+// contactParentAccId()/autoCreateContactAccount() ever create leaf accounts
+// under (see contactParentAccId above). An orphan candidate must live in
+// this tree -- either be one of these bucket accounts itself (a contact
+// could have been directly linked to the shared bucket in old data, before
+// individual per-contact accounts existed) or a descendant of one (a
+// per-contact leaf account, autoGen or not). This is what correctly tells
+// apart a genuinely-orphaned customer/supplier account from an ordinary
+// chart-of-accounts entry (a bank account, a cash account, a revenue or
+// expense account...) that simply isn't linked to any contact -- which is
+// normal and expected for those, not a sign anything is broken.
+var AR_AP_ROOT_IDS={'2101':true,'2101-01':true,'2101-02':true,'1103':true,'1103-01':true,'1103-02':true};
+function isInReceivablesPayablesTree(accId){
+ var seen={},id=accId,guard=0;
+ while(id&&guard<50){
+  if(AR_AP_ROOT_IDS[id])return true;
+  if(seen[id])return false; // cycle guard, should never happen
+  seen[id]=true;
+  var a=db.accounts.find(function(x){return x.id===id;});
+  id=a?a.pid:null;
+  guard++;
+ }
+ return false;
+}
+function findOrphanedAccountsWithHistory(){
+ var linkedIds={};
+ (db.customers||[]).concat(db.suppliers||[]).forEach(function(c){if(c.linkedAccId)linkedIds[c.linkedAccId]=true;});
+ var out=[];
+ db.accounts.filter(function(a){return !a.isMain&&!linkedIds[a.id]&&isInReceivablesPayablesTree(a.id);}).forEach(function(a){
+  var txnCount=0,totalDr=0,totalCr=0;
+  (db.journals||[]).forEach(function(je){(je.lines||[]).forEach(function(l){if(l.acc===a.id){txnCount++;totalDr+=Number(l.dr)||0;totalCr+=Number(l.cr)||0;}});});
+  (db.receipts||[]).forEach(function(r){if(r.accTo===a.id){txnCount++;totalDr+=Number(r.amount)||0;}if(r.accFrom===a.id){txnCount++;totalCr+=Number(r.amount)||0;}});
+  (db.payments||[]).forEach(function(p){if(p.accTo===a.id){txnCount++;totalDr+=Number(p.amount)||0;}if(p.accFrom===a.id){txnCount++;totalCr+=Number(p.amount)||0;}});
+  if(txnCount>0||a.bal)out.push({id:a.id,name:a.name,nameAr:a.nameAr||'',type:a.type,normal:a.normal,txnCount:txnCount,totalDr:totalDr,totalCr:totalCr,bal:a.bal||0});
+ });
+ return out;
+}
 function normalizeDB(d){
  if(!d.exp)d.exp={};
  if(!d.customers)d.customers=[];
@@ -393,10 +473,30 @@ function normalizeDB(d){
   return true;
  }
  d.customers.forEach(function(c){
-  if(!hasOwnLeafAcc(c.linkedAccId)){var nid=autoCreateContactAccount(d.accounts,false,c);if(nid)c.linkedAccId=nid;}
+  if(!hasOwnLeafAcc(c.linkedAccId)){
+   var oldId=c.linkedAccId;
+   var nid=autoCreateContactAccount(d.accounts,false,c);
+   if(nid){
+    // Only migrate the old account's history along when this contact was
+    // its SOLE occupant -- if more than one customer/supplier was ever
+    // linked straight to it, there is no way to tell from the account id
+    // alone which historical line belongs to which of them, so those stay
+    // on the old (now-orphaned) shared account rather than risk moving
+    // another contact's history onto this one.
+    if(oldId&&(linkCount[oldId]||0)<=1)migrateAccountPostings(d,oldId,nid);
+    c.linkedAccId=nid;
+   }
+  }
  });
  d.suppliers.forEach(function(s){
-  if(!hasOwnLeafAcc(s.linkedAccId)){var nid=autoCreateContactAccount(d.accounts,true,s);if(nid)s.linkedAccId=nid;}
+  if(!hasOwnLeafAcc(s.linkedAccId)){
+   var oldIdS=s.linkedAccId;
+   var nidS=autoCreateContactAccount(d.accounts,true,s);
+   if(nidS){
+    if(oldIdS&&(linkCount[oldIdS]||0)<=1)migrateAccountPostings(d,oldIdS,nidS);
+    s.linkedAccId=nidS;
+   }
+  }
  });
  return d;
 }
@@ -500,7 +600,7 @@ function loadDB(){
 var view='dashboard',modal=null,invView=null,cusView=null,supView=null;
 var fAcc='',fFrom='',fTo='',stimer=null,lastSave=null;
 var tAcc={},tJE={},tInv={},tCus={},tSup={},tRcpt={},tPymt={},tCC={},tUser={};
-var tFAEdit={},tFA=null,tLocEdit={},postDepTarget=null;
+var tFAEdit={},tFA=null,tLocEdit={},postDepTarget=null,mergeOrphanTarget=null;
 var currentUser=null;
 var coSwitcherOpen=false;
 // Renders the small "switch company" popover shown under the ⇄ button in
@@ -725,6 +825,15 @@ function restoreAdminDataFromCloud(){
 var backupReminderChecked=false; // set once per page load — see maybeShowBackupReminder()
 var cbState={contactId:''}; // Balance Confirmation Letter — see pConfirmBalance()
 var rptFrom='',rptTo='',rptLevel='all',rptShowCodes=false,rptLoaded=false; // report filters
+// Accounts Analysis report's own filter state (deliberately separate from
+// rptFrom/rptTo/rptLevel/rptShowCodes above -- this report has its own
+// distinct filter panel: per-type checkboxes, a "show control (main)
+// accounts too" toggle, an opening-balance visibility toggle and a
+// hide-zero-balance toggle, none of which the Trial Balance/General Ledger
+// filter bar has, so sharing state would let one report's filter choice
+// silently change another's).
+var aaFrom='',aaTo='',aaShowOpen=true,aaShowCodes=false,aaShowMain=false,aaHideZero=true,aaLoaded=false;
+var aaTypes={Asset:true,Liability:true,Equity:true,Revenue:true,Expense:true};
 
 // HELPERS
 function N(n){return Number(n||0).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2});}
@@ -1313,9 +1422,19 @@ function exportConfirmLetterWord(title,bodyHtml,fnameBase){
   +(co.address?'<div style="font-size:8pt;color:#888">'+co.address+'</div>':'')
   +(co.vatNo?'<div style="font-size:8pt;color:#888">VAT: '+co.vatNo+(co.cr?' | CR: '+co.cr:'')+'</div>':'')
   +'</td></tr></table><hr style="border:none;border-top:2pt solid #0D3B6E">';
+ // A generic table/th/td stylesheet, deliberately using the SAME class
+ // names (.tr/.tot/.fin) as printHTML()'s own <style> above -- this lets any
+ // report build ONE body-HTML string (th/td markup with those classes,
+ // exactly like the pdfXxx branches already do) and hand it to both
+ // printHTML() (screen/PDF) and this function (Word) unchanged, with a
+ // consistent look in both. Bodies with their own fully-inlined per-cell
+ // styles (like the Balance Confirmation Letter above) are unaffected --
+ // an inline style always wins over these class rules.
+ var genericTableCss='<style>table{border-collapse:collapse;width:100%;font-size:9.5pt}th{background:#0D3B6E;color:#fff;padding:6pt 8pt;text-align:right}td{padding:5pt 8pt;border:0.75pt solid #ddd}.tr{text-align:left}.tot{font-weight:700;background:#f0f4f8}.fin{font-weight:700;background:#0D3B6E;color:#fff}h3{color:#0D3B6E;font-size:11pt}</style>';
  var html='<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">'
   +'<head><meta charset="UTF-8"><title>'+title+'</title>'
   +'<!--[if gte mso 9]><xml><w:WordDocument><w:View>Print</w:View><w:Zoom>100</w:Zoom></w:WordDocument></xml><![endif]-->'
+  +genericTableCss
   +'</head><body>'+header+bodyHtml+'</body></html>';
  var blob=new Blob(['﻿',html],{type:'application/msword'});
  var a=document.createElement('a');
@@ -2076,6 +2195,7 @@ function buildLayout(){
   {k:'journal',     i:'book',  l:tr('nav_journal')},
   {k:'receipt',     i:'ainI',  l:tr('nav_receipt')},
   {k:'payment',     i:'ainO',  l:tr('nav_payment')},
+  {k:'adjustops',   i:'edit',  l:isAr?'تعديل العمليات':'Adjust Transactions'},
 
   // ── Inventory ──────────────────────────────────────────────
   {sec:isAr?'📦 المخزون والمبيعات':'📦 Inventory & Sales'},
@@ -2100,6 +2220,8 @@ function buildLayout(){
   // ── Financial Reports ──────────────────────────────────────
   {sec:isAr?'📊 التقارير المالية':'📊 Financial Reports'},
   {k:'trial',       i:'scale', l:tr('nav_trial')},
+  {k:'gl',          i:'doc',   l:isAr?'دفتر الأستاذ العام':'General Ledger'},
+  {k:'acctAnalysis',i:'trend', l:isAr?'تحليل الحسابات':'Accounts Analysis'},
   {k:'income',      i:'trend', l:tr('nav_income')},
   {k:'balance',     i:'bank',  l:tr('nav_balance')},
   {k:'equity',      i:'scale', l:isAr?'قائمة التغير في حقوق الملكية':'Changes in Equity'},
@@ -2172,7 +2294,7 @@ function buildLayout(){
    }
   });
   if(currentSec!==null)nav+='</div>';
- var pages={dashboard:pDashboard,training:pTraining,ai_settings:pAISettings,ai_bank:pAIBank,ai_analysis:pAIAnalysis,ai_cashflow:pAICashFlow,ai_forecast:pAIForecast,coa:pCOA,items:pItems,po:pPurchaseOrders,purchases:pPurchases,sales2:pSales2,stockrpt:pStockRpt,fixedassets:pFixedAssets,assetlocations:pAssetLocations,depreciation:pDepreciation,users:pUsers,fiscalyear:pFiscalYear,journal:pJournal,receipt:pReceipt,payment:pPayment,trial:pTrial,income:pIncome,balance:pBalance,equity:pEquity,workcap:pWorkCap,statement:pStatement,agingAR:pAgingAR,agingAP:pAgingAP,taxSales:pTaxSales,taxPurchases:pTaxPurchases,zakat:pZakat,budget:pBudget,budgetcmp:pBudgetCompare,mgmtdash:pMgmtDash,boarddash:pBoardDash,licadmin:pLicenseAdmin,customers:pCustomers,suppliers:pSuppliers,confirmbal:pConfirmBalance,settings:pSettings,backup:pBackup,costcenters:pCostCenters,ccreport:pCCReport};
+ var pages={dashboard:pDashboard,training:pTraining,ai_settings:pAISettings,ai_bank:pAIBank,ai_analysis:pAIAnalysis,ai_cashflow:pAICashFlow,ai_forecast:pAIForecast,coa:pCOA,items:pItems,po:pPurchaseOrders,purchases:pPurchases,sales2:pSales2,stockrpt:pStockRpt,fixedassets:pFixedAssets,assetlocations:pAssetLocations,depreciation:pDepreciation,users:pUsers,fiscalyear:pFiscalYear,journal:pJournal,adjustops:pAdjustOps,receipt:pReceipt,payment:pPayment,trial:pTrial,gl:pGL,acctAnalysis:pAcctAnalysis,income:pIncome,balance:pBalance,equity:pEquity,workcap:pWorkCap,statement:pStatement,agingAR:pAgingAR,agingAP:pAgingAP,taxSales:pTaxSales,taxPurchases:pTaxPurchases,zakat:pZakat,budget:pBudget,budgetcmp:pBudgetCompare,mgmtdash:pMgmtDash,boarddash:pBoardDash,licadmin:pLicenseAdmin,customers:pCustomers,suppliers:pSuppliers,confirmbal:pConfirmBalance,settings:pSettings,backup:pBackup,costcenters:pCostCenters,ccreport:pCCReport};
  // This used to be `if(view==='fixedassets'&&tFA){return pAssetDetail();}`,
  // returning pAssetDetail()'s HTML directly and skipping every line below —
  // including the sidebar/nav AND the `(modal?buildModal():'')` append at
@@ -2224,10 +2346,13 @@ function fld(lbl,inp){return '<div class="fl"><label>'+lbl+'</label>'+inp+'</div
 var PERM_MODULES=[
  {k:'coa',          l:'Chart of Accounts',      actions:'vaed'},
  {k:'journal',      l:'Journal Entries',         actions:'vaed'},
+ {k:'adjustops',    l:'Adjust Transactions',     actions:'vaed'},
  {k:'invoice',      l:'Tax Invoices',            actions:'vaed'},
  {k:'receipt',      l:'Receipt Vouchers',        actions:'vaed'},
  {k:'payment',      l:'Payment Vouchers',        actions:'vaed'},
  {k:'trial',        l:'Trial Balance',           actions:'v'},
+ {k:'gl',           l:'General Ledger',          actions:'v'},
+ {k:'acctAnalysis', l:'Accounts Analysis',       actions:'v'},
  {k:'income',       l:'Income Statement',        actions:'v'},
  {k:'balance',      l:'Balance Sheet',           actions:'v'},
  {k:'equity',       l:'Changes in Equity',        actions:'v'},
@@ -4398,7 +4523,12 @@ function pCOA(){
   var mains=db.accounts.filter(function(a){return a.type===t&&a.isMain;});
   var stand=db.accounts.filter(function(a){return a.type===t&&!a.isMain&&!a.pid;});
   if(!mains.length&&!stand.length)return;
-  var tot=db.accounts.filter(function(a){return a.type===t&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id);},0);
+  // Flat sum over every account's OWN balance, main included -- same fix
+  // as trialBalanceTotals(): the type-header total badge above the table
+  // must count a main account's own direct postings too (e.g. "4101"),
+  // not just its non-main leaves, or it silently undercounts/disagrees
+  // with the account rows' own rolled-up balances shown just below it.
+  var tot=db.accounts.filter(function(a){return a.type===t;}).reduce(function(s,a){return s+accBalRange(a.id);},0);
   h+='<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><div class="ct" style="margin:0">'+t+'</div><span class="mn" style="font-size:12px;font-weight:700;color:var(--t2)">'+N(tot)+'</span></div>';
   h+='<div class="tw"><table><thead><tr><th style="width:26px"></th><th>Code</th><th>Account</th><th>Level</th><th>Normal</th><th class="tr">Balance</th></tr></thead><tbody>';
   mains.forEach(function(m){
@@ -4481,6 +4611,80 @@ function pagerSlice(arr,pageKey){
 
 // ── Journal state for inline view ────────────────────────────
 var jeState={mode:'list',currentIdx:-1}; // mode: list | view | new | edit
+// State for the "Adjust Transactions" screen (تعديل العمليات) — a
+// dedicated lookup-by-number entry point into the SAME tJE edit buffer
+// pJournal()'s own edit mode uses, so it reuses that page's already-wired
+// account-search/VAT/save handlers instead of duplicating them.
+var adjOpsState={mode:'search',type:'journal',num:'',notFound:false};
+
+// Shared lines editor (account/cost-center/debit/credit/VAT/per-line note)
+// used by BOTH pJournal()'s inline edit mode and pAdjustOps() — kept as one
+// function so the two entry points into the same tJE buffer can never
+// silently drift apart. Renders into an id="jeLines" tbody; jeSave() (see
+// bindEvents) reads directly from that DOM, not from any state this
+// function keeps of its own.
+function buildJELinesEditor(j,isAr){
+ var leaves=leafAccs();
+ var out='<div class="tw"><table style="table-layout:auto"><thead><tr>'
+  +'<th style="width:34px">#</th>'
+  +'<th>'+(isAr?'الحساب':'Account')+'</th>'
+  +'<th style="min-width:120px">'+(isAr?'مركز التكلفة':'Cost Center')+'</th>'
+  +'<th style="min-width:110px;text-align:right">'+(isAr?'مدين':'Debit')+'</th>'
+  +'<th style="min-width:110px;text-align:right">'+(isAr?'دائن':'Credit')+'</th>'
+  +'<th style="min-width:70px;text-align:center">VAT%</th>'
+  +'<th style="min-width:140px">'+(isAr?'تعريف':'Note')+'</th>'
+  +'<th style="min-width:120px">'+(isAr?'رقم المرجع':'Reference #')+'</th>'
+  +'<th style="width:36px"></th>'
+  +'</tr></thead><tbody id="jeLines">';
+ j.lines.forEach(function(l,i){
+  var selAccLabel='';
+  if(l.acc){var la=db.accounts.find(function(x){return x.id===l.acc;});var lp=la&&la.pid?db.accounts.find(function(x){return x.id===la.pid;}):null;if(la)selAccLabel=(lp?lp.name+'/':'')+la.id+' '+la.name;}
+  var accOpts='<option value="">Select...</option>';
+  // A line can already reference a "main" account that has children (a
+  // parent account with its own direct postings — a legitimate pattern in
+  // this app, e.g. Sales Revenue "4101"), which leafAccs() excludes since
+  // it lists only childless accounts. Without this, loading such a line
+  // into the editor would silently lose its account (the <select> falls
+  // back to no selection) and block saving. So the currently-assigned
+  // account is always offered, even when it isn't a leaf.
+  var pickerAccs=leaves;
+  if(l.acc&&!leaves.some(function(a){return a.id===l.acc;})){
+   var curAcc=db.accounts.find(function(x){return x.id===l.acc;});
+   if(curAcc)pickerAccs=[curAcc].concat(leaves);
+  }
+  pickerAccs.forEach(function(a){
+   var p=a.pid?db.accounts.find(function(x){return x.id===a.pid;}):null;
+   var label=(p?accN(p)+' / ':'')+a.id+' - '+a.name+(a.nameAr&&a.nameAr!==a.name?' | '+a.nameAr:'');
+   accOpts+='<option value="'+a.id+'"'+(a.id===l.acc?' selected':'')+' data-ar="'+(a.nameAr||'')+'">'+label+'</option>';
+  });
+  out+='<tr><td style="text-align:center;color:var(--t2);font-size:12px">'+(i+1)+'</td>'
+   +'<td style="position:relative;min-width:260px">'
+   +'<input class="jeAS" data-i="'+i+'" autocomplete="off" placeholder="'+(isAr?'بحث حساب...':'Search account...')+'" value="'+selAccLabel+'" style="width:100%;padding:6px 10px;border:1px solid var(--bd2);border-radius:var(--r);font-size:13px;background:var(--sf);color:var(--tx)">'
+  +'<div class="jeAD" data-i="'+i+'" style="display:none;position:fixed;z-index:9999;background:var(--sf);border:1px solid var(--bd2);border-radius:var(--r);width:380px;max-height:220px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.25)">'
+   +'<select class="jeA" data-i="'+i+'" size="7" style="width:100%;border:none;outline:none;font-size:12px;background:var(--sf);color:var(--tx);padding:2px 0">'+accOpts+'</select>'
+   +'</div></td>';
+  var accObj=db.accounts.find(function(x){return x.id===l.acc;});
+  var showCC=accObj&&(accObj.type==='Expense'||accObj.type==='Revenue');
+  out+='<td style="min-width:120px">';
+  if(showCC||l.cc){
+   out+='<select class="jeCC" data-i="'+i+'" style="font-size:11px"><option value="">— '+(isAr?'لا يوجد':'No CC')+'—</option>';
+   db.costCenters.filter(function(c){return c.active;}).forEach(function(c){out+='<option value="'+c.id+'"'+(l.cc===c.id?' selected':'')+'>'+c.id+' '+c.name+'</option>';});
+   out+='</select>';
+  } else {
+   out+='<span style="font-size:11px;color:var(--t3)">—</span>';
+  }
+  out+='</td>'
+   +'<td style="min-width:110px"><input type="number" class="jeD" data-i="'+i+'" value="'+(l.dr||'')+'" placeholder="0.00" min="0" style="min-width:100px;text-align:right"></td>'
+   +'<td style="min-width:110px"><input type="number" class="jeC" data-i="'+i+'" value="'+(l.cr||'')+'" placeholder="0.00" min="0" style="min-width:100px;text-align:right"></td>'
+   +'<td style="min-width:65px;text-align:center"><select class="jeVAT" data-i="'+i+'" style="font-size:11px;width:62px;padding:3px 2px"><option value="">-</option><option value="15"'+(l.vat===15?' selected':'')+'>15%</option><option value="5"'+(l.vat===5?' selected':'')+'>5%</option></select></td>'
+   +'<td style="min-width:140px"><input class="jeLDesc" data-i="'+i+'" value="'+(l.desc||'')+'" placeholder="'+(isAr?'تعريف السطر':'Line note')+'" style="width:100%;font-size:12px"></td>'
+   +'<td style="min-width:120px"><input class="jeLRef" data-i="'+i+'" value="'+(l.ref||'')+'" placeholder="'+(isAr?'رقم المرجع':'Reference')+'" style="width:100%;font-size:12px"></td>'
+   +'<td>'+(i>1?'<button class="btn bsm bg0 bdr" data-rmjl="'+i+'">'+ic('del')+'</button>':'')+'</td></tr>';
+ });
+ out+='</tbody></table></div>'+btn_('bg0','addJELine',ic('plus')+' '+(isAr?'إضافة سطر':'Add Line'))
+  +'<div id="jeHint" style="font-size:12px;color:var(--t2);margin-top:6px"></div>';
+ return out;
+}
 
 function pJournal(){
  var isAr=lang==='ar';
@@ -4600,51 +4804,11 @@ function pJournal(){
   } else {
    // Edit/New mode — inline form (same as mJE but inline)
    var j=tJE;
-   var leaves=leafAccs();
    content+='<div class="fr2" style="margin-bottom:12px">'
     +fld(isAr?'التاريخ *':'Date *','<input type="date" id="j-date" value="'+(j.date||today())+'">')
     +fld(isAr?'الوصف *':'Description *','<input id="j-desc" value="'+(j.desc||'')+'" placeholder="'+(isAr?'وصف القيد':'Transaction description')+'">')
     +'</div>';
-   content+='<div class="tw"><table style="table-layout:auto"><thead><tr>'
-    +'<th>'+(isAr?'الحساب':'Account')+'</th>'
-    +'<th style="min-width:120px">'+(isAr?'مركز التكلفة':'Cost Center')+'</th>'
-    +'<th style="min-width:110px;text-align:right">'+(isAr?'مدين':'Debit')+'</th>'
-    +'<th style="min-width:110px;text-align:right">'+(isAr?'دائن':'Credit')+'</th>'
-    +'<th style="min-width:70px;text-align:center">VAT%</th>'
-    +'<th style="width:36px"></th>'
-    +'</tr></thead><tbody id="jeLines">';
-   j.lines.forEach(function(l,i){
-    var selAccLabel='';
-    if(l.acc){var la=db.accounts.find(function(x){return x.id===l.acc;});var lp=la&&la.pid?db.accounts.find(function(x){return x.id===la.pid;}):null;if(la)selAccLabel=(lp?lp.name+'/':'')+la.id+' '+la.name;}
-    var accOpts='<option value="">Select...</option>';
-    leaves.forEach(function(a){
-     var p=a.pid?db.accounts.find(function(x){return x.id===a.pid;}):null;
-     var label=(p?accN(p)+' / ':'')+a.id+' - '+a.name+(a.nameAr&&a.nameAr!==a.name?' | '+a.nameAr:'');
-     accOpts+='<option value="'+a.id+'"'+(a.id===l.acc?' selected':'')+' data-ar="'+(a.nameAr||'')+'">'+label+'</option>';
-    });
-    content+='<tr><td style="position:relative;min-width:260px">'
-     +'<input class="jeAS" data-i="'+i+'" autocomplete="off" placeholder="'+(isAr?'بحث حساب...':'Search account...')+'" value="'+selAccLabel+'" style="width:100%;padding:6px 10px;border:1px solid var(--bd2);border-radius:var(--r);font-size:13px;background:var(--sf);color:var(--tx)">'
-    +'<div class="jeAD" data-i="'+i+'" style="display:none;position:fixed;z-index:9999;background:var(--sf);border:1px solid var(--bd2);border-radius:var(--r);width:380px;max-height:220px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.25)">'
-     +'<select class="jeA" data-i="'+i+'" size="7" style="width:100%;border:none;outline:none;font-size:12px;background:var(--sf);color:var(--tx);padding:2px 0">'+accOpts+'</select>'
-     +'</div></td>';
-    var accObj=db.accounts.find(function(x){return x.id===l.acc;});
-    var showCC=accObj&&(accObj.type==='Expense'||accObj.type==='Revenue');
-    content+='<td style="min-width:120px">';
-    if(showCC||l.cc){
-     content+='<select class="jeCC" data-i="'+i+'" style="font-size:11px"><option value="">— '+(isAr?'لا يوجد':'No CC')+'—</option>';
-     db.costCenters.filter(function(c){return c.active;}).forEach(function(c){content+='<option value="'+c.id+'"'+(l.cc===c.id?' selected':'')+'>'+c.id+' '+c.name+'</option>';});
-     content+='</select>';
-    } else {
-     content+='<span style="font-size:11px;color:var(--t3)">—</span>';
-    }
-    content+='</td>'
-     +'<td style="min-width:110px"><input type="number" class="jeD" data-i="'+i+'" value="'+(l.dr||'')+'" placeholder="0.00" min="0" style="min-width:100px;text-align:right"></td>'
-     +'<td style="min-width:110px"><input type="number" class="jeC" data-i="'+i+'" value="'+(l.cr||'')+'" placeholder="0.00" min="0" style="min-width:100px;text-align:right"></td>'
-     +'<td style="min-width:65px;text-align:center"><select class="jeVAT" data-i="'+i+'" style="font-size:11px;width:62px;padding:3px 2px"><option value="">-</option><option value="15"'+(l.vat===15?' selected':'')+'>15%</option><option value="5"'+(l.vat===5?' selected':'')+'>5%</option></select></td>'
-     +'<td>'+(i>1?'<button class="btn bsm bg0 bdr" data-rmjl="'+i+'">'+ic('del')+'</button>':'')+'</td></tr>';
-   });
-   content+='</tbody></table></div>'+btn_('bg0','addJELine',ic('plus')+' '+(isAr?'إضافة سطر':'Add Line'))
-    +'<div id="jeHint" style="font-size:12px;color:var(--t2);margin-top:6px"></div>';
+   content+=buildJELinesEditor(j,isAr);
   }
  }
 
@@ -4656,6 +4820,61 @@ function pJournal(){
  return h;
 }
 
+// ── Adjust Transactions (تعديل العمليات) ──────────────────────
+// A dedicated "look it up by number, edit it, save" screen, separate from
+// pJournal()'s own browse/list flow — requested to mirror another
+// accounting product's "Transaction Adjustment" screen (search by
+// operation type + number, header totals, an editable line grid). Reuses
+// the SAME tJE edit buffer and buildJELinesEditor()/jeSave() machinery
+// pJournal()'s own edit mode uses (see adjOpsState above), so a correction
+// made here is saved through the exact same validated path — not a
+// second, divergent implementation of journal editing.
+function pAdjustOps(){
+ var isAr=lang==='ar';
+ var h=tb(isAr?'تعديل العمليات':'Adjust Transactions','');
+ h+='<div class="pg">';
+
+ h+='<div class="card" style="margin-bottom:14px">';
+ h+='<div class="fr2" style="margin-bottom:12px">'
+  +fld(isAr?'نوع العملية':'Transaction Type','<select id="adjType"><option value="journal">'+(isAr?'قيد يومية':'Journal Entry')+'</option></select>')
+  +fld(isAr?'رقم العملية':'Transaction No.','<input id="adjNum" value="'+(adjOpsState.num||'')+'" placeholder="'+(isAr?'مثال: JE001':'e.g. JE001')+'">')
+  +'</div>';
+ h+='<div style="display:flex;gap:8px">'
+  +'<button class="btn bp" id="btnAdjLoad">🔍 '+(isAr?'تحميل':'Load')+'</button>'
+  +'<button class="btn" id="btnAdjCancel">✖ '+(isAr?'إلغاء':'Cancel')+'</button>'
+  +'</div>';
+ if(adjOpsState.notFound){
+  h+='<div style="margin-top:10px;color:var(--rd);font-size:13px">⚠️ '+(isAr?'لم يتم العثور على عملية بهذا الرقم':'No transaction found with this number')+'</div>';
+ }
+ h+='</div>';
+
+ if(adjOpsState.mode==='loaded'){
+  var j=tJE;
+  var tD=j.lines.reduce(function(s,l){return s+Number(l.dr||0);},0);
+  var tC=j.lines.reduce(function(s,l){return s+Number(l.cr||0);},0);
+  h+='<div class="card">';
+  h+='<div class="fr2" style="margin-bottom:12px">'
+   +fld(isAr?'رقم العملية':'Transaction #','<div class="tag" style="font-size:14px;padding:8px 12px">'+(j.editId||'')+'</div>')
+   +fld(isAr?'تاريخ المستند *':'Document Date *','<input type="date" id="j-date" value="'+(j.date||today())+'">')
+   +'</div>';
+  h+='<div class="fr2" style="margin-bottom:12px">'
+   +fld(isAr?'رقم المستند':'Document No.','<input id="j-docno" value="'+(j.docNo||'')+'" placeholder="'+(isAr?'رقم مرجعي اختياري':'Optional reference')+'">')
+   +fld(isAr?'الوصف *':'Description *','<input id="j-desc" value="'+(j.desc||'')+'">')
+   +'</div>';
+  h+='<div class="fr2" style="margin-bottom:12px">'
+   +fld(isAr?'اجمالي الجانب المدين':'Total Debit Side','<div id="adjTotDr" class="mn" style="padding:8px 0;font-weight:700">'+N(tD)+'</div>')
+   +fld(isAr?'اجمالي الجانب الدائن':'Total Credit Side','<div id="adjTotCr" class="mn" style="padding:8px 0;font-weight:700">'+N(tC)+'</div>')
+   +'</div>';
+  h+=buildJELinesEditor(j,isAr);
+  h+='<div style="margin-top:12px"><button class="btn bp" id="jeSave" style="background:#0F6E56;border-color:#0F6E56">💾 '+(isAr?'حفظ':'Save')+'</button></div>';
+  h+='</div>';
+ } else {
+  h+='<div style="text-align:center;padding:60px 20px;color:var(--t3)"><div style="font-size:48px;margin-bottom:12px">🧾</div>'
+   +'<div style="font-size:14px;font-weight:600;color:var(--t2)">'+(isAr?'ادخل نوع ورقم العملية ثم اضغط تحميل':'Enter the transaction type and number, then click Load')+'</div></div>';
+ }
+ h+='</div>';
+ return h;
+}
 
 function pInvoice(){
  if(invView){
@@ -5055,17 +5274,34 @@ function trialBalanceRows(f,t,lv){
  });
  return rows;
 }
-// Trial Balance grand totals: one flat pass over every non-main account's
-// OWN figures (never a rollup, and NOT limited to any particular depth in
-// the tree) -- this is what keeps the totals correct and dedup-safe
-// regardless of nesting depth or of the handful of legacy COA entries that
-// carry BOTH isMain:true and a pid (e.g. "4101", "5101"), which are
-// otherwise reachable via two different Main->Sub traversal paths in
-// trialBalanceRows() above and would double-count if totals were
-// accumulated there instead. Every leaf account is visited exactly once.
+// Trial Balance grand totals: one flat pass over EVERY account's OWN
+// figures (never a rollup, and NOT limited to any particular depth in the
+// tree, and NOT excluding isMain accounts) -- this is what keeps the
+// totals correct and dedup-safe regardless of nesting depth.
+//
+// IMPORTANT: this used to filter to `!a.isMain` only, on the theory that a
+// main account's figures are already "covered" by its children. That is
+// true for a main account's ROLLUP display row (its own postings AND its
+// children's, shown together in trialBalanceRows() above) -- but it is
+// NOT true for a flat, non-rollup total: several of this app's own default
+// chart-of-accounts entries carry BOTH isMain:true and a pid (e.g. "4101"
+// Sales & Service Revenue, "5101" Cost of Goods Sold) specifically so
+// day-to-day postings (an ordinary Sales/Purchase Invoice) can be made
+// DIRECTLY to them with no separate leaf sub-account underneath. Excluding
+// Excluding every isMain account from this flat pass silently dropped every such
+// direct posting from the Trial Balance's own grand total (while the
+// SAME posting still correctly showed up on that very account's own row
+// via trialBalanceRows(), and in every other account it touched) --
+// proven by reproducing it: a perfectly balanced journal entry (Dr a
+// regular leaf bank account / Cr "4101" directly) made the Trial Balance
+// falsely report itself "out of balance" by the full amount of the entry.
+// Summing every account's OWN postings (rollup:false), with NO isMain
+// filter, fixes this with no double-counting risk: a journal line names
+// exactly one account id, so it contributes to exactly one account's own
+// total here, whichever account (main or not) that happens to be.
 function trialBalanceTotals(f,t){
  var tOpenDr=0,tOpenCr=0,tMoveDr=0,tMoveCr=0,tCloseDr=0,tCloseCr=0;
- db.accounts.filter(function(a){return !a.isMain;}).forEach(function(a){
+ db.accounts.forEach(function(a){
   var c=acctTrialCols(a.id,f,t,a.normal,false);
   tOpenDr+=c.openDr;tOpenCr+=c.openCr;tMoveDr+=c.moveDr;tMoveCr+=c.moveCr;tCloseDr+=c.closeDr;tCloseCr+=c.closeCr;
  });
@@ -5224,8 +5460,22 @@ function typeSignedLeafBal(a,type,f,t){
 }
 function incData(){
  var f=rptFrom,t=rptTo;
- var rev=db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Revenue',f,t);},0);
- var exp=db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Expense',f,t);},0);
+ // Sum EVERY Revenue/Expense account's OWN figure -- main accounts
+ // included, not just non-main leaves. Several of this app's own default
+ // Revenue/Expense accounts (e.g. "4101" Sales & Service Revenue) are
+ // isMain:true and are the normal, expected posting target for an ordinary
+ // Sales/Purchase Invoice with no separate leaf sub-account underneath --
+ // excluding isMain here silently dropped every such posting from Revenue/
+ // Net Income (proven by reproducing it: Revenue and Net Income both
+ // stayed 0.00 after a perfectly ordinary sale posted straight to "4101",
+ // even though the very next screenful -- the account-by-account breakdown
+ // below -- had its own separate bug that also hid the same amount, now
+ // fixed alongside this one). No double-counting risk: a journal
+ // line/receipt/payment names exactly one account, so it is counted in
+ // exactly one account's own typeSignedLeafBal() here, whichever account
+ // (main or not) that happens to be.
+ var rev=db.accounts.filter(function(a){return a.type==='Revenue';}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Revenue',f,t);},0);
+ var exp=db.accounts.filter(function(a){return a.type==='Expense';}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Expense',f,t);},0);
  // COGS lives at '51' ("Cost of Goods Sold (COGS)") in this app's chart of
  // accounts — '5000' matches no account at all here, which silently made
  // Gross Profit always equal Total Revenue (ca stayed 0) and left the real
@@ -5249,8 +5499,10 @@ function pIncome(){
  h+='<div class="card" style="max-width:560px"><div class="rh">Revenue</div>';
  db.accounts.filter(function(a){return a.type==='Revenue'&&a.isMain;}).forEach(function(m){
   var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
-  var bal=subs.reduce(function(s,x){return s+typeSignedLeafBal(x,'Revenue',f,t);},0);
-  if(!subs.length)bal=typeSignedLeafBal(m,'Revenue',f,t);
+  // Own postings PLUS subs -- never "OR": a main account can carry direct
+  // postings of its own (e.g. "4101") at the same time as having real
+  // sub-accounts, and both must be counted, not just whichever is nonzero.
+  var bal=typeSignedLeafBal(m,'Revenue',f,t)+subs.reduce(function(s,x){return s+typeSignedLeafBal(x,'Revenue',f,t);},0);
   var mCode=rptShowCodes?'<span class="tag" style="font-size:10px;margin-inline-end:4px">'+m.id+'</span>':'';
   h+='<div class="rr"><strong>'+mCode+accN(m)+'</strong><span class="mn">'+N(bal)+'</span></div>';
   subs.forEach(function(s){
@@ -5265,8 +5517,8 @@ function pIncome(){
  h+='<div class="rh">Operating Expenses</div>';
  db.accounts.filter(function(a){return a.type==='Expense'&&a.isMain&&a.id!=='51';}).forEach(function(m){
   var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
-  var bal=subs.reduce(function(s,x){return s+typeSignedLeafBal(x,'Expense',f,t);},0);
-  if(!subs.length)bal=typeSignedLeafBal(m,'Expense',f,t);
+  // Own postings PLUS subs -- see the matching comment on the Revenue loop above.
+  var bal=typeSignedLeafBal(m,'Expense',f,t)+subs.reduce(function(s,x){return s+typeSignedLeafBal(x,'Expense',f,t);},0);
   var mCode=rptShowCodes?'<span class="tag" style="font-size:10px;margin-inline-end:4px">'+m.id+'</span>':'';
   h+='<div class="rr"><strong>'+mCode+accN(m)+'</strong><span class="mn">('+N(bal)+')</span></div>';
   subs.forEach(function(s){
@@ -5473,6 +5725,209 @@ function stmtCalc(){
  var run=open,rows=txns.map(function(t){run+=t.delta;return{date:t.date,ref:t.ref,desc:t.desc,dr:t.dr,cr:t.cr,bal:run};});
  return{acc:acc,par:par,rows:rows,open:open,close:run,tD:txns.reduce(function(s,t){return s+t.dr;},0),tC:txns.reduce(function(s,t){return s+t.cr;},0),period:(fFrom||fTo)?((fFrom||'Start')+' to '+(fTo||'Today')):'All Periods'};
 }
+
+// ── General Ledger (دفتر الأستاذ العام) ────────────────────────
+// Exactly the same per-account ledger engine as stmtCalc() above (same
+// three sources -- journals, receipts, payments -- same plain
+// Debit-positive/Credit-negative sign convention, same opening-balance
+// handling), but generalized to take (accId,f,t) as plain parameters
+// instead of reading the Account Statement page's own fAcc/fFrom/fTo
+// globals, so it can be called once per account for a multi-account
+// report. Deliberately left as a separate function rather than having
+// stmtCalc() delegate to it -- stmtCalc() is already tested and delivered
+// (its sign convention was the subject of an explicit, confirmed fix), so
+// it is left completely untouched here to avoid any risk of regressing it.
+function acctLedgerData(accId,f,t){
+ var acc=db.accounts.find(function(a){return a.id===accId;});
+ if(!acc)return{acc:null,rows:[],open:0,close:0,tD:0,tC:0};
+ var all=[];
+ db.journals.forEach(function(je){
+  (je.lines||[]).forEach(function(l){
+   if(l.acc!==accId)return;
+   var dr=Number(l.dr)||0,cr=Number(l.cr)||0;
+   all.push({date:je.date,ref:je.id,desc:je.desc,dr:dr,cr:cr,delta:dr-cr});
+  });
+ });
+ (db.receipts||[]).forEach(function(r){
+  var amt=Number(r.amount)||0;
+  if(r.accTo===accId)all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:amt,cr:0,delta:amt});
+  if(r.accFrom===accId)all.push({date:r.date,ref:r.ref||r.id||'',desc:r.desc||'',dr:0,cr:amt,delta:-amt});
+ });
+ (db.payments||[]).forEach(function(p){
+  var amt=Number(p.amount)||0;
+  if(p.accTo===accId)all.push({date:p.date,ref:p.ref||p.id||'',desc:p.desc||'',dr:amt,cr:0,delta:amt});
+  if(p.accFrom===accId)all.push({date:p.date,ref:p.ref||p.id||'',desc:p.desc||'',dr:0,cr:amt,delta:-amt});
+ });
+ all.sort(function(a,b){return a.date.localeCompare(b.date);});
+ var isDebitNormal=acc.normal!=='Credit';
+ var init=isDebitNormal?(acc.bal||0):-(acc.bal||0);
+ var txns=all,open=init;
+ if(f){var bf=all.filter(function(x){return x.date<f;});open=init+bf.reduce(function(s,x){return s+x.delta;},0);txns=txns.filter(function(x){return x.date>=f;});}
+ if(t)txns=txns.filter(function(x){return x.date<=t;});
+ var run=open,rows=txns.map(function(x){run+=x.delta;return{date:x.date,ref:x.ref,desc:x.desc,dr:x.dr,cr:x.cr,bal:run};});
+ return{acc:acc,rows:rows,open:open,close:run,tD:txns.reduce(function(s,x){return s+x.dr;},0),tC:txns.reduce(function(s,x){return s+x.cr;},0)};
+}
+// Which accounts appear, in which order, with which indentation level and
+// Main/Sub grouping, is governed by the exact same trialBalanceRows(f,t,lv)
+// used by the Trial Balance -- this is what gives the General Ledger the
+// same "Main Only / Sub Only / Main + Sub" and "Account Codes" options as
+// the Trial Balance, for free, with no separate hierarchy logic to keep in
+// sync. An account with no opening balance and no activity in the period is
+// then left out of the printed ledger entirely (nothing to show for it);
+// everything else that matched the level filter is included regardless of
+// isMain.
+function glRows(f,t,lv){
+ return trialBalanceRows(f,t,lv).map(function(r){
+  return{id:r.id,name:r.name,nameAr:r.nameAr,type:r.type,isMain:r.isMain,lvl:r.lvl,ledger:acctLedgerData(r.id,f,t)};
+ }).filter(function(r){return r.ledger.rows.length>0||Math.abs(r.ledger.open)>=0.005||Math.abs(r.ledger.close)>=0.005;});
+}
+
+// ── Accounts Analysis (تحليل الحسابات) -- N-month trend report ─────
+// One account per row, its Opening Balance, then its own NET movement
+// (plain dr-cr, same convention as acctLedgerData/the Account Statement --
+// see the sign-convention comment on stmtCalc() above) for each calendar
+// month the selected date range spans, and a final Closing Balance column
+// (Opening + the sum of every monthly movement -- always the TRUE closing
+// balance, whether or not the Opening column itself is shown on screen).
+//
+// Plain net movement for one account, own postings only, over [f,t]
+// (blank bound = unbounded either side) -- the same three sources
+// (journals/receipts/payments) and the same signing as acctLedgerData()'s
+// per-transaction deltas, just pre-summed instead of returned row by row.
+function acctNetMovement(accId,f,t){
+ var net=0;
+ db.journals.forEach(function(je){
+  if(f&&je.date<f)return;if(t&&je.date>t)return;
+  (je.lines||[]).forEach(function(l){if(l.acc===accId)net+=(Number(l.dr)||0)-(Number(l.cr)||0);});
+ });
+ (db.receipts||[]).forEach(function(r){
+  if(f&&r.date<f)return;if(t&&r.date>t)return;
+  var amt=Number(r.amount)||0;
+  if(r.accTo===accId)net+=amt;
+  if(r.accFrom===accId)net-=amt;
+ });
+ (db.payments||[]).forEach(function(p){
+  if(f&&p.date<f)return;if(t&&p.date>t)return;
+  var amt=Number(p.amount)||0;
+  if(p.accTo===accId)net+=amt;
+  if(p.accFrom===accId)net-=amt;
+ });
+ return net;
+}
+// A "control account" (a main/parent account, e.g. "1101" Cash and Cash
+// Equivalents) rolled up through its whole subtree. Unlike
+// accBalRangeRollup()/acctBalanceAsOf() (used by the Trial Balance/Balance
+// Sheet), this does NOT sign-flip contra accounts relative to a "normal
+// side" -- there is no normal-side projection in this report's plain
+// dr-cr convention, so a parent's rollup is simply the sum of its own
+// postings (if any -- some legacy chart-of-accounts entries are isMain
+// and still carry direct postings) plus every descendant's own plain
+// value, added directly. That is a safe, always-correct sum in this
+// convention: a plain dr-cr delta is already basis-independent, so it
+// adds up correctly with no special-casing regardless of which accounts
+// underneath happen to be contra accounts.
+function acctAnalysisRollupOpen(accId,f){
+ var own=acctLedgerData(accId,f,null).open;
+ var kids=db.accounts.filter(function(c){return c.pid===accId;});
+ return kids.reduce(function(s,k){return s+acctAnalysisRollupOpen(k.id,f);},own);
+}
+function acctAnalysisRollupMove(accId,f,t){
+ var own=acctNetMovement(accId,f,t);
+ var kids=db.accounts.filter(function(c){return c.pid===accId;});
+ return kids.reduce(function(s,k){return s+acctAnalysisRollupMove(k.id,f,t);},own);
+}
+// Splits [f,t] into one entry per calendar month it spans (each clipped to
+// f/t at the two ends), e.g. 2025-03-15..2025-05-10 -> Mar 15-31, Apr 1-30,
+// May 1-10. Capped at 36 months (3 years) -- callers should warn instead of
+// silently truncating when a wider range is requested.
+function monthsBetween(f,t){
+ if(!f||!t)return[];
+ var months=[],d=new Date(f+'T00:00:00');
+ d.setDate(1);
+ var endMark=new Date(t+'T00:00:00');
+ var guard=0;
+ while(d<=endMark&&guard<400){
+  var y=d.getFullYear(),m=d.getMonth();
+  var mStart=y+'-'+String(m+1).padStart(2,'0')+'-01';
+  var lastDay=new Date(y,m+1,0).getDate();
+  var mEnd=y+'-'+String(m+1).padStart(2,'0')+'-'+String(lastDay).padStart(2,'0');
+  var clipStart=mStart<f?f:mStart;
+  var clipEnd=mEnd>t?t:mEnd;
+  var AR_MON=['يناير','فبراير','مارس','أبريل','مايو','يونيو','يوليو','أغسطس','سبتمبر','أكتوبر','نوفمبر','ديسمبر'];
+  var EN_MON=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  months.push({from:clipStart,to:clipEnd,labelAr:AR_MON[m]+' '+y,labelEn:EN_MON[m]+' '+y});
+  d.setMonth(d.getMonth()+1);
+  guard++;
+ }
+ return months;
+}
+// Builds the full Accounts Analysis data set: one section per selected
+// account type (in the same fixed order the rest of the app already uses),
+// each with its rows (leaf accounts always; main/"control" accounts too
+// when showMain is set, using the rollup helpers above) and a section
+// subtotal. The subtotal is always a flat sum over EVERY leaf (non-main)
+// account of that type -- regardless of hideZero or which rows ended up
+// displayed -- so it can never silently drift from the underlying data the
+// way a total built only from visible rows could (the same lesson the
+// Trial Balance's own totals pass already learned).
+function acctAnalysisData(f,t,months,showMain,hideZero,types){
+ var order=['Asset','Liability','Equity','Revenue','Expense'];
+ var sections=[];
+ order.forEach(function(tp){
+  if(!types[tp])return;
+  var allAccsOfType=db.accounts.filter(function(a){return a.type===tp;});
+  var leafAccsOfType=allAccsOfType.filter(function(a){return !a.isMain;});
+  var rowAccs=showMain?allAccsOfType:leafAccsOfType;
+  // Stable order: by id, with a main account immediately followed by its
+  // own direct leaf children (mirrors the Trial Balance's visual grouping)
+  // -- built the same way trialBalanceRows() orders things, just simpler
+  // since Accounts Analysis only ever needs one level of main+direct-subs,
+  // not arbitrary depth (customer/supplier sub-ledgers are always leaves,
+  // never shown as their own "control" row here).
+  var mains=rowAccs.filter(function(a){return a.isMain;}).sort(function(a,b){return a.id.localeCompare(b.id);});
+  var ordered=[];
+  mains.forEach(function(m){
+   ordered.push(m);
+   rowAccs.filter(function(a){return !a.isMain&&a.pid===m.id;}).sort(function(a,b){return a.id.localeCompare(b.id);}).forEach(function(a){ordered.push(a);});
+  });
+  // Any leaf not already placed under one of the mains above (e.g. showMain
+  // is off, so no main rows exist to anchor under) -- just append in id order.
+  rowAccs.forEach(function(a){if(ordered.indexOf(a)===-1)ordered.push(a);});
+  var rows=ordered.map(function(a){
+   var open=a.isMain?acctAnalysisRollupOpen(a.id,f):acctLedgerData(a.id,f,t).open;
+   var monthly=months.map(function(mo){return a.isMain?acctAnalysisRollupMove(a.id,mo.from,mo.to):acctNetMovement(a.id,mo.from,mo.to);});
+   var closing=open+monthly.reduce(function(s,x){return s+x;},0);
+   return{id:a.id,name:a.name,nameAr:a.nameAr||'',isMain:!!a.isMain,open:open,monthly:monthly,closing:closing};
+  }).filter(function(r){
+   if(!hideZero)return true;
+   return Math.abs(r.open)>=0.005||Math.abs(r.closing)>=0.005||r.monthly.some(function(x){return Math.abs(x)>=0.005;});
+  });
+  // The section subtotal is a flat, own-postings-only sum over EVERY
+  // account of this type -- main or not -- never limited to non-main
+  // leaves and never a rollup. A `!isMain` filter here would silently drop
+  // any account that is isMain but still carries direct postings of its
+  // own (this app's own default chart of accounts does exactly that for
+  // "4101" Sales & Service Revenue and "5101" Cost of Goods Sold, which
+  // have no sub-accounts underneath by default and are the normal posting
+  // target for an ordinary Sales/Purchase Invoice) -- exactly the bug just
+  // found and fixed in trialBalanceTotals() above. Summing every account's
+  // OWN figures once, regardless of isMain, is dedup-safe: a given journal
+  // line/receipt/payment names exactly one account, so it is counted in
+  // exactly one account's own contribution here.
+  var tOpen=0,tClose=0,tMonthly=months.map(function(){return 0;});
+  allAccsOfType.forEach(function(a){
+   var d=acctLedgerData(a.id,f,t);
+   tOpen+=d.open;
+   var mv=months.map(function(mo){return acctNetMovement(a.id,mo.from,mo.to);});
+   mv.forEach(function(v,i){tMonthly[i]+=v;});
+  });
+  tClose=tOpen+tMonthly.reduce(function(s,x){return s+x;},0);
+  if(hideZero&&!rows.length&&Math.abs(tOpen)<0.005&&Math.abs(tClose)<0.005&&tMonthly.every(function(x){return Math.abs(x)<0.005;}))return;
+  sections.push({type:tp,rows:rows,total:{open:tOpen,monthly:tMonthly,closing:tClose}});
+ });
+ return sections;
+}
+
 function pStatement(){
  var d=stmtCalc(),leaves=leafAccs(),selId=fAcc||(leaves[0]||{}).id;
  var selAcc=leaves.find(function(a){return a.id===selId;})||leaves[0];
@@ -5499,6 +5954,130 @@ function pStatement(){
  h+='<tr style="background:var(--bg);font-weight:700"><td colspan="3">Period Totals</td><td class="tr mn" style="color:var(--bl)">'+N(d.tD)+'</td><td class="tr mn" style="color:var(--rd)">'+N(d.tC)+'</td><td></td></tr>';
  h+='<tr style="background:var(--gnb)"><td colspan="5" style="font-weight:700;color:var(--gn)">Closing Balance</td><td class="tr mn" style="font-weight:700;color:var(--gn)">'+N(d.close)+'</td></tr>';
  return h+'</tbody></table></div></div></div>';
+}
+
+// Reuses buildFilterBar() -- the exact same From/To/Level/Account Codes
+// controls already shared with the Trial Balance -- so "Main accounts only
+// / Sub accounts only / Main + Sub" and "show account codes" work here with
+// no new UI. One card per account, each its own mini running-balance ledger
+// (same engine as the Account Statement), in the same order/grouping the
+// Trial Balance uses.
+function pGL(){
+ var isAr=lang==='ar';
+ var f=rptFrom,t=rptTo,lv=rptLevel;
+ var h=tb(isAr?'دفتر الأستاذ العام':'General Ledger',
+  '<button class="btn" data-action="xlsGL">'+ic('dn')+' Excel</button>'
+  +'<button class="btn" data-action="wordGL">'+ic('dn')+' Word</button>'
+  +'<button class="btn" data-action="pdfGL">'+ic('prt')+' PDF</button>');
+ h+='<div class="pg">'+buildFilterBar();
+ if(!rptLoaded){
+  h+='<div style="text-align:center;padding:60px 20px;color:var(--t3)"><div style="font-size:48px;margin-bottom:12px">📒</div><div style="font-size:14px;font-weight:600;color:var(--t2)">'+(isAr?'اضغط "عرض التقرير" لعرض دفتر الأستاذ العام':'Click "Show Report" to display the General Ledger')+'</div></div>';
+  h+='</div>';return h;
+ }
+ var rows=glRows(f,t,lv);
+ if(!rows.length){
+  h+='<div class="es" style="padding:30px">'+(isAr?'لا توجد حسابات لها أرصدة أو عمليات ضمن هذه الفترة/المستوى المحدد.':'No accounts have a balance or activity for this period/level.')+'</div>';
+  return h+'</div>';
+ }
+ h+='<div style="font-size:11px;color:var(--t2);margin-bottom:10px">'+(isAr?'الحسابات التي لا رصيد افتتاحي ولا عمليات لها ضمن الفترة لا تظهر هنا.':'Accounts with no opening balance and no activity in this period are not shown.')+'</div>';
+ rows.forEach(function(r){
+  var d=r.ledger;
+  var codeTag=rptShowCodes?'<span class="tag" style="margin-inline-end:6px">'+r.id+'</span>':'';
+  h+='<div class="card" style="margin-bottom:14px">';
+  h+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:6px;margin-bottom:10px">'
+   +'<div>'+codeTag+'<strong style="font-size:14px">'+(r.isMain?'📁 ':'')+r.name+(r.nameAr&&isAr?' | '+r.nameAr:'')+'</strong></div>'
+   +'<span style="font-size:11px;color:var(--t2)">'+(isAr?'افتتاحي':'Opening')+': <b>'+N(d.open)+'</b> &nbsp;|&nbsp; '+(isAr?'ختامي':'Closing')+': <b>'+N(d.close)+'</b></span>'
+   +'</div>';
+  h+='<div class="tw"><table><thead><tr><th>'+(isAr?'التاريخ':'Date')+'</th><th>'+(isAr?'المرجع':'Ref')+'</th><th>'+(isAr?'البيان':'Description')+'</th><th class="tr">'+(isAr?'مدين':'Debit')+'</th><th class="tr">'+(isAr?'دائن':'Credit')+'</th><th class="tr">'+(isAr?'الرصيد':'Balance')+'</th></tr></thead><tbody>';
+  h+='<tr style="background:var(--amb)"><td colspan="5" style="font-weight:700;color:var(--sf)">'+(isAr?'رصيد افتتاحي':'Opening Balance')+'</td><td class="tr mn" style="font-weight:700;color:var(--sf)">'+N(d.open)+'</td></tr>';
+  if(!d.rows.length)h+='<tr><td colspan="6"><div class="es" style="padding:10px">'+(isAr?'لا توجد عمليات فى هذة الفترة':'No transactions in this period.')+'</div></td></tr>';
+  d.rows.forEach(function(x){
+   h+='<tr><td>'+x.date+'</td><td><span class="tag">'+x.ref+'</span></td><td>'+x.desc+'</td>'
+    +'<td class="tr mn" style="color:'+(x.dr?'var(--bl)':'var(--t3)')+'">'+(x.dr?N(x.dr):'')+'</td>'
+    +'<td class="tr mn" style="color:'+(x.cr?'var(--rd)':'var(--t3)')+'">'+(x.cr?N(x.cr):'')+'</td>'
+    +'<td class="tr mn" style="font-weight:700">'+N(x.bal)+'</td></tr>';
+  });
+  h+='<tr style="background:var(--bg);font-weight:700"><td colspan="3">'+(isAr?'إجمالي الفترة':'Period Totals')+'</td><td class="tr mn" style="color:var(--bl)">'+N(d.tD)+'</td><td class="tr mn" style="color:var(--rd)">'+N(d.tC)+'</td><td></td></tr>';
+  h+='<tr style="background:var(--gnb)"><td colspan="5" style="font-weight:700;color:var(--gn)">'+(isAr?'رصيد ختامي':'Closing Balance')+'</td><td class="tr mn" style="font-weight:700;color:var(--gn)">'+N(d.close)+'</td></tr>';
+  h+='</tbody></table></div></div>';
+ });
+ return h+'</div>';
+}
+
+function buildAcctAnalysisFilterBar(){
+ var isAr=lang==='ar';
+ var typeChecks=[['Asset',isAr?'الأصول':'Assets'],['Liability',isAr?'الالتزامات':'Liabilities'],['Equity',isAr?'حقوق الملكية':'Equity'],['Revenue',isAr?'الإيرادات':'Revenue'],['Expense',isAr?'المصروفات':'Expenses']];
+ var typesHtml=typeChecks.map(function(tc){
+  return '<div style="display:flex;align-items:center;gap:5px"><input type="checkbox" class="aaType" data-type="'+tc[0]+'" '+(aaTypes[tc[0]]?'checked':'')+' style="width:15px;height:15px;cursor:pointer"><label style="font-size:12px;cursor:pointer">'+tc[1]+'</label></div>';
+ }).join('');
+ function chk(id,checked,label){
+  return '<div style="display:flex;align-items:center;gap:5px"><input type="checkbox" id="'+id+'" '+(checked?'checked':'')+' style="width:15px;height:15px;cursor:pointer"><label for="'+id+'" style="font-size:12px;cursor:pointer;white-space:nowrap">'+label+'</label></div>';
+ }
+ return '<div class="card" style="max-width:820px;margin-bottom:14px">'
+  +'<div style="display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap;margin-bottom:12px">'
+  +'<div class="fl"><label>'+(isAr?'من تاريخ':'From')+'</label><input type="date" id="aaFrom" value="'+(aaFrom||'')+'" style="padding:6px 10px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"></div>'
+  +'<div class="fl"><label>'+(isAr?'إلى تاريخ':'To')+'</label><input type="date" id="aaTo" value="'+(aaTo||'')+'" style="padding:6px 10px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"></div>'
+  +'</div>'
+  +'<div style="font-size:11px;font-weight:700;color:var(--t2);margin-bottom:6px">'+(isAr?'نوع الحساب':'Account Type')+'</div>'
+  +'<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:12px">'+typesHtml+'</div>'
+  +'<div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:12px">'
+  +chk('aaShowOpen',aaShowOpen,isAr?'عرض الرصيد الافتتاحي':'Show Opening Balance')
+  +chk('aaShowCodes',aaShowCodes,isAr?'عرض الرموز بالتقرير':'Show Account Codes')
+  +chk('aaShowMain',aaShowMain,isAr?'عرض حساب التحكم أيضًا':'Show Control Account Too')
+  +chk('aaHideZero',aaHideZero,isAr?'لا تظهر الحساب إذا كان الرصيد صفر (0)':"Don't show account if balance is zero (0)")
+  +'</div>'
+  +'<div style="display:flex;gap:10px">'
+  +'<button class="btn bp" id="btnApplyAA" style="background:#185FA5;border-color:#185FA5">'+(isAr?'🔍 عرض التقرير':'🔍 Show Report')+'</button>'
+  +'<button class="btn" id="btnClearAA">'+(isAr?'مسح':'Clear')+'</button>'
+  +'</div></div>';
+}
+// Shared by the on-screen page and the pdfAA/xlsAA/wordAA export branches --
+// reads the current aa* filter state, validates the date range, and returns
+// {ok:false,msg} or {ok:true,months,sections}.
+function acctAnalysisBuild(){
+ var isAr=lang==='ar';
+ if(!aaFrom||!aaTo)return{ok:false,msg:isAr?'يرجى تحديد الفترة (من تاريخ - إلى تاريخ) أولاً.':'Please choose a date range (From - To) first.'};
+ var months=monthsBetween(aaFrom,aaTo);
+ if(months.length>36)return{ok:false,msg:isAr?'الفترة المحددة طويلة جدًا (أكثر من 36 شهرًا). يرجى اختيار فترة أقصر.':'The selected period is too long (over 36 months). Please choose a shorter range.'};
+ var sections=acctAnalysisData(aaFrom,aaTo,months,aaShowMain,aaHideZero,aaTypes);
+ return{ok:true,months:months,sections:sections};
+}
+function pAcctAnalysis(){
+ var isAr=lang==='ar';
+ var h=tb(isAr?'تحليل الحسابات':'Accounts Analysis',
+  '<button class="btn" data-action="xlsAA">'+ic('dn')+' Excel</button>'
+  +'<button class="btn" data-action="wordAA">'+ic('dn')+' Word</button>'
+  +'<button class="btn" data-action="pdfAA">'+ic('prt')+' PDF</button>');
+ h+='<div class="pg">'+buildAcctAnalysisFilterBar();
+ if(!aaLoaded){
+  h+='<div style="text-align:center;padding:60px 20px;color:var(--t3)"><div style="font-size:48px;margin-bottom:12px">📈</div><div style="font-size:14px;font-weight:600;color:var(--t2)">'+(isAr?'اضغط "عرض التقرير" لعرض تحليل الحسابات':'Click "Show Report" to display Accounts Analysis')+'</div></div>';
+  h+='</div>';return h;
+ }
+ var d=acctAnalysisBuild();
+ if(!d.ok){h+='<div class="es" style="padding:30px">'+d.msg+'</div></div>';return h;}
+ var typeLabels={Asset:isAr?'الأصول':'Assets',Liability:isAr?'الالتزامات':'Liabilities',Equity:isAr?'حقوق الملكية':'Equity',Revenue:isAr?'الإيرادات':'Revenue',Expense:isAr?'المصروفات':'Expenses'};
+ if(!d.sections.length){h+='<div class="es" style="padding:30px">'+(isAr?'لا توجد حسابات مطابقة لهذه الفلاتر.':'No accounts match these filters.')+'</div></div>';return h;}
+ h+='<div class="card"><div class="tw"><table><thead><tr><th>'+(isAr?'اسم الحساب':'Account Name')+'</th>'
+  +(aaShowOpen?'<th class="tr">'+(isAr?'الرصيد الافتتاحي':'Opening Balance')+'</th>':'')
+  +d.months.map(function(m){return '<th class="tr">'+(isAr?m.labelAr:m.labelEn)+'</th>';}).join('')
+  +'<th class="tr">'+(isAr?'الرصيد الختامي':'Closing Balance')+'</th></tr></thead><tbody>';
+ d.sections.forEach(function(sec){
+  h+='<tr style="background:var(--bg)"><td colspan="'+(2+(aaShowOpen?1:0)+d.months.length)+'" style="font-weight:700;padding:8px 12px">'+typeLabels[sec.type]+'</td></tr>';
+  sec.rows.forEach(function(r){
+   var codeTag=aaShowCodes?'<span class="tag" style="margin-inline-end:6px">'+r.id+'</span>':'';
+   h+='<tr>'
+    +'<td style="'+(r.isMain?'font-weight:700':'')+'">'+(r.isMain?'📁 ':'')+codeTag+r.name+(r.nameAr&&isAr?' | '+r.nameAr:'')+'</td>'
+    +(aaShowOpen?'<td class="tr mn">'+N(r.open)+'</td>':'')
+    +r.monthly.map(function(v){return '<td class="tr mn">'+(v?N(v):'')+'</td>';}).join('')
+    +'<td class="tr mn" style="font-weight:700">'+N(r.closing)+'</td></tr>';
+  });
+  h+='<tr style="background:var(--bg);font-weight:700"><td>'+(isAr?'إجمالي '+typeLabels[sec.type]:'Total '+typeLabels[sec.type])+'</td>'
+   +(aaShowOpen?'<td class="tr mn">'+N(sec.total.open)+'</td>':'')
+   +sec.total.monthly.map(function(v){return '<td class="tr mn">'+N(v)+'</td>';}).join('')
+   +'<td class="tr mn">'+N(sec.total.closing)+'</td></tr>';
+ });
+ h+='</tbody></table></div></div>';
+ return h+'</div>';
 }
 
 function agingData(ents,getItems){
@@ -5646,7 +6225,15 @@ function pWorkCap(){
 
  // ── Account Balance Helpers ───────────────────────────────
  function accBal(accId){return accBalRange(accId,'',t2);}
- function typeAccs(type){return db.accounts.filter(function(a){return a.type===type&&!a.isMain;});}
+ // Same fix as trialBalanceTotals()/incData(): every bucket below (cash,
+ // receivables, inventory, payables, revenue for DSO/DIO/DPO, ...) sums
+ // each MATCHED account's own postings via accBal()/accBalRange() (never
+ // a rollup), so including isMain accounts here is dedup-safe and
+ // required -- excluding them (the old `!a.isMain` filter) silently
+ // dropped a main account's own direct postings, e.g. Revenue posted
+ // straight to "4101" would have made `rev` below read 0 and broken the
+ // DSO/DIO/DPO day-count ratios entirely.
+ function typeAccs(type){return db.accounts.filter(function(a){return a.type===type;});}
 
  // ── Current Assets Breakdown ─────────────────────────────
  var cashAccs=typeAccs('Asset').filter(function(a){return a.name.indexOf('نقد')>-1||a.name.indexOf('صندوق')>-1||a.name.indexOf('بنك')>-1||a.name.toLowerCase().indexOf('cash')>-1||a.name.toLowerCase().indexOf('bank')>-1;});
@@ -5664,7 +6251,11 @@ function pWorkCap(){
   // inventory/prepaid name patterns above) fell into "other current
   // assets" and inflated both Working Capital and the Current Ratio.
   var isLongTerm=a.name.indexOf('طويل')>-1||a.name.toLowerCase().indexOf('long')>-1||a.name.indexOf('ثابت')>-1||a.name.toLowerCase().indexOf('fixed')>-1||a.name.indexOf('استثمار')>-1||a.name.toLowerCase().indexOf('invest')>-1;
-  return !inCash&&!inRecv&&!inInv&&!inPrep&&!isLongTerm&&!a.isMain;
+  // No `!a.isMain` here either -- a pure grouping header's own balance is
+  // 0 anyway (adds nothing), but a main account WITH real direct postings
+  // that doesn't match any keyword bucket above is still real money that
+  // belongs in this catch-all, same reasoning as typeAccs() above.
+  return !inCash&&!inRecv&&!inInv&&!inPrep&&!isLongTerm;
  });
 
  var cash=cashAccs.reduce(function(s,a){return s+Math.max(0,accBal(a.id));},0);
@@ -5682,7 +6273,8 @@ function pWorkCap(){
   var inPay=payAccs.some(function(x){return x.id===a.id;});
   var inAdv=advRecAccs.some(function(x){return x.id===a.id;});
   var inAcc=accExpAccs.some(function(x){return x.id===a.id;});
-  return !inPay&&!inAdv&&!inAcc&&!a.isMain&&a.name.indexOf('طويل')===-1&&a.name.toLowerCase().indexOf('long')===-1;
+  // Same reasoning as otherCurrAccs above: no `!a.isMain` exclusion.
+  return !inPay&&!inAdv&&!inAcc&&a.name.indexOf('طويل')===-1&&a.name.toLowerCase().indexOf('long')===-1;
  });
 
  var payables=payAccs.reduce(function(s,a){return s+Math.max(0,accBal(a.id));},0);
@@ -5823,8 +6415,17 @@ function pEquity(){
 
  var f=rptFrom,t=rptTo;
 
- // Get all equity accounts
- var eqAccs=db.accounts.filter(function(a){return a.type==='Equity'&&!a.isMain;});
+ // Get all equity accounts that function as a real postable line item --
+ // i.e. have no children of their own -- rather than filtering by
+ // `!isMain`. This app's own default chart of accounts has "3104" Net
+ // Profit / Loss for the Period as isMain:true with NO sub-accounts
+ // underneath (it is the normal direct posting target for a Fiscal Year
+ // Close's closing entry -- see xAction's 'closeFiscalYear'): a plain
+ // `!isMain` filter would drop it from this table ENTIRELY -- no column
+ // for it at all, not just an undercounted one -- silently hiding an
+ // entire year's closing entry from the Statement of Changes in Equity.
+ // Same idea as this app's own leafAccs() helper, just type-scoped.
+ var eqAccs=db.accounts.filter(function(a){return a.type==='Equity'&&!db.accounts.some(function(c){return c.pid===a.id;});});
 
  // Net movement on an account from journals/receipts/payments within
  // [from2,to2] ONLY — unlike accBalRange(), this does NOT add the account's
@@ -5878,9 +6479,14 @@ function pEquity(){
  }
  function periodBal(accId){return acctDelta(accId,f||'',t);}
 
- // Net income for period
- var rev=db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,f,t);},0);
- var exp=db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,f,t);},0);
+ // Net income for period — same fix as incData(): sum EVERY Revenue/
+ // Expense account's own figure (main accounts included, not just non-main
+ // leaves, since e.g. "4101"/"5101" can carry direct postings of their
+ // own), and use typeSignedLeafBal() rather than raw accBalRange() so a
+ // contra account (e.g. a Debit-normal "Sales Returns" nested under
+ // Revenue) correctly SUBTRACTS from the total instead of adding to it.
+ var rev=db.accounts.filter(function(a){return a.type==='Revenue';}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Revenue',f,t);},0);
+ var exp=db.accounts.filter(function(a){return a.type==='Expense';}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Expense',f,t);},0);
  var netIncome=rev-exp;
 
  // Column headers
@@ -6128,8 +6734,13 @@ function execCalc(){
  var t=today();
  var yr=t.slice(0,4);
  var f=yr+'-01-01';
+ // Flat sum over every account's OWN (non-rollup) balance -- same fix as
+ // trialBalanceTotals()/incData(): a `!a.isMain` filter here silently
+ // dropped a main account's own direct postings (e.g. Revenue/COGS posted
+ // straight to "4101"/"5101"), while summing ALL accounts of a type is
+ // dedup-safe since each journal line names exactly one account id.
  function sumType(type,from,to){
-  return db.accounts.filter(function(a){return a.type===type&&!a.isMain;})
+  return db.accounts.filter(function(a){return a.type===type;})
    .reduce(function(s,a){return s+accBalRange(a.id,from||f,to||t);},0);
  }
  var rev=sumType('Revenue');
@@ -6139,16 +6750,16 @@ function execCalc(){
  var tLiab=sumType('Liability','','');
  var tEquity=sumType('Equity','','')+netIncome;
  // Gross profit (Revenue - COGS only)
- var cogs=db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain&&(a.name.indexOf('تكلفة')>-1||a.name.indexOf('بضاعة')>-1||a.name.toLowerCase().indexOf('cost')>-1||a.name.toLowerCase().indexOf('cogs')>-1);}).reduce(function(s,a){return s+accBalRange(a.id,f,t);},0);
+ var cogs=db.accounts.filter(function(a){return a.type==='Expense'&&(a.name.indexOf('تكلفة')>-1||a.name.indexOf('بضاعة')>-1||a.name.toLowerCase().indexOf('cost')>-1||a.name.toLowerCase().indexOf('cogs')>-1);}).reduce(function(s,a){return s+accBalRange(a.id,f,t);},0);
  var grossProfit=rev-cogs;
  // Cash
- var cash=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&(a.name.indexOf('نقد')>-1||a.name.indexOf('صندوق')>-1||a.name.indexOf('بنك')>-1||a.name.toLowerCase().indexOf('cash')>-1||a.name.toLowerCase().indexOf('bank')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
+ var cash=db.accounts.filter(function(a){return a.type==='Asset'&&(a.name.indexOf('نقد')>-1||a.name.indexOf('صندوق')>-1||a.name.indexOf('بنك')>-1||a.name.toLowerCase().indexOf('cash')>-1||a.name.toLowerCase().indexOf('bank')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
  // Receivables
- var receivables=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&(a.name.indexOf('عميل')>-1||a.name.indexOf('مدين')>-1||a.name.toLowerCase().indexOf('receiv')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
+ var receivables=db.accounts.filter(function(a){return a.type==='Asset'&&(a.name.indexOf('عميل')>-1||a.name.indexOf('مدين')>-1||a.name.toLowerCase().indexOf('receiv')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
  // Inventory
- var inventory=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&(a.name.indexOf('مخزون')>-1||a.name.indexOf('بضاعة')>-1||a.name.toLowerCase().indexOf('inventor')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
+ var inventory=db.accounts.filter(function(a){return a.type==='Asset'&&(a.name.indexOf('مخزون')>-1||a.name.indexOf('بضاعة')>-1||a.name.toLowerCase().indexOf('inventor')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
  var currentAssets=cash+receivables+inventory;
- var currentLiab=db.accounts.filter(function(a){return a.type==='Liability'&&!a.isMain&&(a.name.indexOf('قصير')>-1||a.name.indexOf('مورد')>-1||a.name.indexOf('دائن')>-1||a.name.toLowerCase().indexOf('current')>-1||a.name.toLowerCase().indexOf('payable')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
+ var currentLiab=db.accounts.filter(function(a){return a.type==='Liability'&&(a.name.indexOf('قصير')>-1||a.name.indexOf('مورد')>-1||a.name.indexOf('دائن')>-1||a.name.toLowerCase().indexOf('current')>-1||a.name.toLowerCase().indexOf('payable')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
  if(currentLiab===0)currentLiab=tLiab*0.6; // estimate
  // Sales invoices count & amount
  var siCount=(db.salesInvoices2||[]).filter(function(s){return s.date>=f&&s.date<=t&&s.type!=='return';}).length;
@@ -6221,7 +6832,14 @@ function pMgmtDash(){
  // Row 3: Ratios
  h+='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px">';
  h+=kpiCard(isAr?'التدفقات من الأنشطة التشغيلية':'Operating CF',N(d.netIncome+d.exp*0.1),isAr?'تقريبي':'Approx','#185FA5','💧');
- h+=kpiCard(isAr?'الزكاة المقدرة':'Estimated Zakat',N(Math.max(0,d.tEquity+d.netIncome)*0.025),(isAr?'2.5% من الوعاء':'2.5% of base'),'#B45309','☪️');
+ // Found while regression-testing the isMain fixes above (unrelated bug):
+ // d.tEquity already includes d.netIncome (see execCalc()'s "var
+ // tEquity=sumType('Equity','','')+netIncome;"), so adding d.netIncome
+ // again here double-counted it -- e.g. equity 0 + net income 3,500
+ // showed an estimated Zakat of 175.00 (0.025×7,000) instead of the
+ // correct 87.50 (0.025×3,500), disagreeing with the dedicated Zakat
+ // report's own (correct) zakatCalc() result for the same data.
+ h+=kpiCard(isAr?'الزكاة المقدرة':'Estimated Zakat',N(Math.max(0,d.tEquity)*0.025),(isAr?'2.5% من الوعاء':'2.5% of base'),'#B45309','☪️');
  h+=kpiCard(isAr?'إجمالي الديون':'Total Liabilities',N(d.tLiab),(isAr?'نسبة الدين للملكية:':'Debt/Equity:')+' '+d.debtToEquity.toFixed(2)+'x','#b91c1c','📊');
  h+=kpiCard(isAr?'العائد على حقوق الملكية':'ROE',d.roe.toFixed(1)+'%',(isAr?'حقوق الملكية:':'Equity:')+' '+N(d.tEquity),'#0F6E56','📈');
  h+='</div>';
@@ -6333,7 +6951,8 @@ function pBoardDash(){
  h+=kpiCard(isAr?'نسبة التداول':'Current Ratio',d.currentRatio.toFixed(2)+'x',isAr?'الأصول المتداولة/الخصوم':' Current Assets/Liabilities',d.currentRatio>=1.5?'#0F6E56':d.currentRatio>=1?'#B45309':'#b91c1c','⚖️');
  h+=kpiCard(isAr?'هامش صافي الربح':'Net Margin',d.netMargin.toFixed(1)+'%',isAr?'صافي الربح/الإيرادات':'Net Income/Revenue',d.netMargin>=10?'#0F6E56':d.netMargin>=5?'#B45309':'#b91c1c','📊');
  h+=kpiCard(isAr?'نسبة الدين للملكية':'D/E Ratio',d.debtToEquity.toFixed(2)+'x',isAr?'الديون/حقوق الملكية':'Liabilities/Equity',d.debtToEquity<=1?'#0F6E56':d.debtToEquity<=2?'#B45309':'#b91c1c','📋');
- h+=kpiCard(isAr?'الزكاة المقدرة':'Est. Zakat',N(Math.max(0,d.tEquity+d.netIncome)*0.025),isAr?'2.5% من الوعاء الزكوي':'2.5% of Zakat base','#B45309','☪️');
+ // Same double-count fix as the Management Dashboard's identical KPI.
+ h+=kpiCard(isAr?'الزكاة المقدرة':'Est. Zakat',N(Math.max(0,d.tEquity)*0.025),isAr?'2.5% من الوعاء الزكوي':'2.5% of Zakat base','#B45309','☪️');
  h+='</div>';
 
  h+='<div style="background:var(--bg);border-radius:8px;padding:10px 14px;font-size:11px;color:var(--t2);line-height:1.8">'
@@ -6352,14 +6971,18 @@ function pBoardDash(){
 // the same data. One function now, called from both places, so they can't
 // disagree again.
 function zakatCalc(f,t){
+ // Same fix as trialBalanceTotals()/incData()/execCalc(): flat sum over
+ // EVERY account's own (non-rollup) balance, main accounts included --
+ // excluding them silently dropped a main account's own direct postings
+ // (e.g. Revenue posted straight to "4101") from the Zakat base.
  function sumType(type){
-  return db.accounts.filter(function(a){return a.type===type&&!a.isMain;})
+  return db.accounts.filter(function(a){return a.type===type;})
    .reduce(function(s,a){return s+accBalRange(a.id,'',t);},0);
  }
  var totalEquity=sumType('Equity');
  var netIncome=(function(){
-  var r=db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Revenue',f,t);},0);
-  var x=db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Expense',f,t);},0);
+  var r=db.accounts.filter(function(a){return a.type==='Revenue';}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Revenue',f,t);},0);
+  var x=db.accounts.filter(function(a){return a.type==='Expense';}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Expense',f,t);},0);
   return r-x;
  })();
  var totalAssets=sumType('Asset');
@@ -6375,11 +6998,11 @@ function zakatCalc(f,t){
   var netVal=fa.cost-(fa.accDepreciation||0);
   return s+(netVal>0?netVal:0);
  },0):0;
- var cash=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&(a.name.toLowerCase().indexOf('cash')>-1||a.name.indexOf('نقد')>-1||a.name.indexOf('صندوق')>-1||a.name.indexOf('بنك')>-1||a.name.toLowerCase().indexOf('bank')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
- var receivables=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&(a.name.indexOf('عميل')>-1||a.name.indexOf('مدين')>-1||a.name.toLowerCase().indexOf('receiv')>-1||a.name.toLowerCase().indexOf('customer')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
- var inventory=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&(a.name.indexOf('مخزون')>-1||a.name.indexOf('بضاعة')>-1||a.name.toLowerCase().indexOf('inventor')>-1||a.name.toLowerCase().indexOf('stock')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
- var longTermLiab=db.accounts.filter(function(a){return a.type==='Liability'&&!a.isMain&&(a.name.indexOf('طويل')>-1||a.name.toLowerCase().indexOf('long')>-1||a.name.indexOf('قرض')>-1||a.name.toLowerCase().indexOf('loan')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
- var longTermInv=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&((a.name.indexOf('استثمار')>-1&&a.name.indexOf('طويل')>-1)||(a.name.toLowerCase().indexOf('invest')>-1&&a.name.toLowerCase().indexOf('long')>-1));}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
+ var cash=db.accounts.filter(function(a){return a.type==='Asset'&&(a.name.toLowerCase().indexOf('cash')>-1||a.name.indexOf('نقد')>-1||a.name.indexOf('صندوق')>-1||a.name.indexOf('بنك')>-1||a.name.toLowerCase().indexOf('bank')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
+ var receivables=db.accounts.filter(function(a){return a.type==='Asset'&&(a.name.indexOf('عميل')>-1||a.name.indexOf('مدين')>-1||a.name.toLowerCase().indexOf('receiv')>-1||a.name.toLowerCase().indexOf('customer')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
+ var inventory=db.accounts.filter(function(a){return a.type==='Asset'&&(a.name.indexOf('مخزون')>-1||a.name.indexOf('بضاعة')>-1||a.name.toLowerCase().indexOf('inventor')>-1||a.name.toLowerCase().indexOf('stock')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
+ var longTermLiab=db.accounts.filter(function(a){return a.type==='Liability'&&(a.name.indexOf('طويل')>-1||a.name.toLowerCase().indexOf('long')>-1||a.name.indexOf('قرض')>-1||a.name.toLowerCase().indexOf('loan')>-1);}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
+ var longTermInv=db.accounts.filter(function(a){return a.type==='Asset'&&((a.name.indexOf('استثمار')>-1&&a.name.indexOf('طويل')>-1)||(a.name.toLowerCase().indexOf('invest')>-1&&a.name.toLowerCase().indexOf('long')>-1));}).reduce(function(s,a){return s+Math.max(0,accBalRange(a.id,'',t));},0);
  // ZATCA Method: Zakat Base = (Equity + Net Income + Long-term liabilities) - Fixed Assets - Long-term investments
  var zakatBase=Math.max(0,(totalEquity+netIncome+longTermLiab)-fixedAssetsNet-longTermInv);
  var currentLiab=totalLiab-longTermLiab;
@@ -6547,8 +7170,13 @@ function pBudget(){
   var bud=budgetState.editing||{id:'B'+Date.now(),name:'',year:new Date().getFullYear(),currency:'SAR',lines:[]};
   // Build account lines if empty
   if(!bud.lines.length){
-   var revAccs=db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;});
-   var expAccs=db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;});
+   // Budget lines = every postable account (no children of its own), same
+   // "no children" test as pEquity()'s eqAccs -- a plain `!isMain` filter
+   // would have skipped "4101"/"5101", this app's own default DIRECT
+   // posting target for ordinary Sales/COGS, leaving the user unable to
+   // set a budget target for the account real postings actually land on.
+   var revAccs=db.accounts.filter(function(a){return a.type==='Revenue'&&!db.accounts.some(function(c){return c.pid===a.id;});});
+   var expAccs=db.accounts.filter(function(a){return a.type==='Expense'&&!db.accounts.some(function(c){return c.pid===a.id;});});
    bud.lines=revAccs.map(function(a){return {accId:a.id,name:a.name,nameAr:a.nameAr||a.name,type:'Revenue',months:Array(12).fill(0)};})
     .concat(expAccs.map(function(a){return {accId:a.id,name:a.name,nameAr:a.nameAr||a.name,type:'Expense',months:Array(12).fill(0)};}));
   }
@@ -7209,6 +7837,38 @@ function pBackup(){
   +'</div></div>'
   +'<button class="btn bp" id="btnRestoreCloud">☁️⬇️ '+(isAr?'استعادة من السحابة الآن':'Restore from Cloud Now')+'</button>'
   +'</div></div>';
+ // Orphaned-account repair: accounts with real posted activity that no
+ // customer/supplier currently points to (see findOrphanedAccountsWithHistory
+ // for exactly how this can happen — most commonly a contact that was moved
+ // onto its own dedicated account before this app carried its history along
+ // automatically). Shown only when at least one exists, since this is a
+ // rare cleanup case, not a normal everyday screen.
+ var orphans=findOrphanedAccountsWithHistory();
+ if(orphans.length){
+  var contactOptsFor=function(isSupType){
+   var list=isSupType?(db.suppliers||[]):(db.customers||[]);
+   return list.map(function(c){return '<option value="'+c.id+'">'+c.id+' — '+(c.name||'')+(c.nameAr?' | '+c.nameAr:'')+'</option>';}).join('');
+  };
+  h+='<div class="card" style="max-width:660px;border:2px solid #dc262640">'
+   +'<div class="ct" style="color:#b91c1c">⚠️ '+(isAr?'حسابات يتيمة تحتاج مراجعة':'Orphaned accounts needing review')+'</div>'
+   +'<div style="font-size:13px;color:var(--t2);margin-bottom:14px;line-height:1.8">'
+   +(isAr
+    ?'الحسابات التالية تحتوي على قيود/عمليات فعلية لكنها غير مرتبطة حاليًا بأي عميل أو مورد — غالبًا لأن العميل/المورد نُقل إلى حساب جديد فارغ فى وقت سابق دون نقل تاريخه معه. اختر العميل/المورد الصحيح لكل حساب واضغط "دمج" لنقل كل عملياته إلى حسابه الحالي.'
+    :'The accounts below carry real posted activity but are not currently linked to any customer/supplier — usually because the contact was moved onto a new, empty account at some point without its history following. Pick the correct customer/supplier for each and click "Merge" to move all its activity onto their current account.')
+   +'</div>';
+  orphans.forEach(function(o){
+   var isSupType=o.normal==='Credit';
+   h+='<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:10px 0;border-top:1px solid var(--bd2)">'
+    +'<div style="flex:1;min-width:180px"><span class="tag">'+o.id+'</span> <strong>'+o.name+'</strong>'+(o.nameAr?' | '+o.nameAr:'')+'<div style="font-size:11px;color:var(--t3);margin-top:2px">'+(isAr?'عدد العمليات:':'Transactions:')+' '+o.txnCount+' — '+(isAr?'مدين:':'Dr:')+' '+N(o.totalDr)+' / '+(isAr?'دائن:':'Cr:')+' '+N(o.totalCr)+'</div></div>'
+    +'<select class="orphanTarget" data-orphan="'+o.id+'" style="padding:6px 10px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;min-width:220px">'
+    +'<option value="">'+(isAr?'— اختر '+(isSupType?'المورد':'العميل')+' —':'— Select '+(isSupType?'supplier':'customer')+' —')+'</option>'
+    +contactOptsFor(isSupType)
+    +'</select>'
+    +'<button class="btn bp bsm" data-action="mergeOrphanAcc" data-orphan="'+o.id+'">🔗 '+(isAr?'دمج':'Merge')+'</button>'
+    +'</div>';
+  });
+  h+='</div>';
+ }
  return h;
 }
 
@@ -7229,7 +7889,11 @@ function pFiscalYear(){
    +'<label style="font-weight:600">'+(isAr?'حساب الأرباح المتراكمة *':'Retained Earnings Account *')+'</label>'
    +'<select id="fy-retained" style="width:100%;padding:7px 10px;border:1px solid var(--bd2);border-radius:var(--r);font-size:13px">'
    +'<option value="">— '+(isAr?'اختر الحساب':'Select Account')+' —</option>'
-   +db.accounts.filter(function(a){return a.type==='Equity'&&!a.isMain;}).map(function(a){return '<option value="'+a.id+'"'+(a.id===(activeFY.retainedAccId||db.company.retainedAccId||'')?' selected':'')+'>'+a.id+' - '+accN(a)+'</option>';}).join('')
+   // Same "no children" test as pEquity()'s eqAccs -- a plain `!isMain`
+   // filter excluded "3104" Net Profit/Loss for the Period entirely, even
+   // though it's this app's own default seed name for exactly this
+   // purpose and the single most natural choice for a closing target.
+   +db.accounts.filter(function(a){return a.type==='Equity'&&!db.accounts.some(function(c){return c.pid===a.id;});}).map(function(a){return '<option value="'+a.id+'"'+(a.id===(activeFY.retainedAccId||db.company.retainedAccId||'')?' selected':'')+'>'+a.id+' - '+accN(a)+'</option>';}).join('')
    +'</select>'
    +'</div>'
    +'<div style="background:#fef2f2;border:1px solid #fca5a5;border-radius:var(--r);padding:10px 14px;margin-bottom:14px;font-size:12px">'
@@ -7637,28 +8301,48 @@ window.xAction=function(type){
  if(type==='xlsEquity'||type==='pdfEquity'){
   var isAr2=lang==='ar';
   var f2=rptFrom,t2=rptTo;
-  var eqAccs2=db.accounts.filter(function(a){return a.type==='Equity'&&!a.isMain;});
-  var rev2=db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,f2,t2);},0);
-  var exp2=db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,f2,t2);},0);
+  // Same fixes as pEquity(): columns = every Equity account with no
+  // children of its own (so a childless isMain account like "3104" Net
+  // Profit/Loss for the Period, the normal Fiscal-Year-Close posting
+  // target, still gets a column instead of being silently dropped), and
+  // Net Income summed over ALL Revenue/Expense accounts (main included)
+  // via typeSignedLeafBal() so a main account's own direct postings and
+  // any contra account are both handled correctly.
+  var eqAccs2=db.accounts.filter(function(a){return a.type==='Equity'&&!db.accounts.some(function(c){return c.pid===a.id;});});
+  var rev2=db.accounts.filter(function(a){return a.type==='Revenue';}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Revenue',f2,t2);},0);
+  var exp2=db.accounts.filter(function(a){return a.type==='Expense';}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Expense',f2,t2);},0);
   var ni2=rev2-exp2;
-  var headers=[isAr2?'البيان':'Description'].concat(eqAccs2.map(function(a){return a.name;})).concat([isAr2?'صافي الدخل':'Net Income',isAr2?'الإجمالي':'Total']);
-  var aoa3=[[isAr2?'قائمة التغير في حقوق الملكية':'Statement of Changes in Equity'],[db.company.name||''],[],headers];
+  var headers=[isAr2?'البيان':'Description'].concat(eqAccs2.map(function(a){return isAr2&&a.nameAr?a.nameAr:a.name;})).concat([isAr2?'صافي الدخل':'Net Income',isAr2?'الإجمالي':'Total']);
   // Opening
   var openRow=[isAr2?'الرصيد الافتتاحي':'Opening Balance'];
   var openTot2=0;
   eqAccs2.forEach(function(a){var b=accBalRange(a.id,'',f2?new Date(new Date(f2).getTime()-86400000).toISOString().slice(0,10):'');openRow.push(b);openTot2+=b;});
   openRow.push(0);openRow.push(openTot2);
-  aoa3.push(openRow);
   // Net income row
   var niRow=[isAr2?'صافي الدخل':'Net Income'].concat(eqAccs2.map(function(){return 0;})).concat([ni2,ni2]);
-  aoa3.push(niRow);
   // Closing
   var closeRow2=[isAr2?'الرصيد الختامي':'Closing Balance'];
   var closeTot2=0;
   eqAccs2.forEach(function(a){var b=accBalRange(a.id,'',t2);closeRow2.push(b);closeTot2+=b;});
   closeTot2+=ni2;closeRow2.push(ni2);closeRow2.push(closeTot2);
-  aoa3.push(closeRow2);
-  exportXLS(aoa3,'Equity','Equity_Changes_'+today());
+  if(type==='xlsEquity'){
+   var aoa3=[[isAr2?'قائمة التغير في حقوق الملكية':'Statement of Changes in Equity'],[db.company.name||''],[],headers];
+   aoa3.push(openRow);aoa3.push(niRow);aoa3.push(closeRow2);
+   exportXLS(aoa3,'Equity','Equity_Changes_'+today());
+   return;
+  }
+  // pdfEquity — previously fell through to the Excel branch above and
+  // produced an .xlsx file when the user clicked "PDF"; now builds an
+  // actual printable/Word-exportable HTML table, same class names
+  // (.tr/.tot/.fin) as every other report's PDF export.
+  var htmlEq='<table><thead><tr><th>'+headers.join('</th><th>')+'</th></tr></thead><tbody>';
+  function eqPdfRow(cells,cls){
+   var r='<tr'+(cls?' class="'+cls+'"':'')+'><td>'+cells[0]+'</td>';
+   for(var i=1;i<cells.length;i++)r+='<td class="tr">'+N(cells[i])+'</td>';
+   return r+'</tr>';
+  }
+  htmlEq+=eqPdfRow(openRow,'tot')+eqPdfRow(niRow,'')+eqPdfRow(closeRow2,'fin')+'</tbody></table>';
+  printHTML(isAr2?'قائمة التغير في حقوق الملكية':'Statement of Changes in Equity',htmlEq);
   return;
  }
  if(type==='xlsTaxSales'){
@@ -7752,6 +8436,22 @@ window.xAction=function(type){
  }
  if(type==='importCoA'){importCoA();return;}
  if(type==='exportBackup'){exportBackup();return;}
+ if(type==='mergeOrphanAcc'){
+  var isArM=lang==='ar';
+  var tgt=mergeOrphanTarget;mergeOrphanTarget=null;
+  if(!tgt||!tgt.orphanId||!tgt.contactId)return;
+  var contact=findContactById(tgt.contactId);
+  if(!contact||!contact.linkedAccId){alert(isArM?'تعذر العثور على حساب هذا العميل/المورد':'Could not find this customer/supplier\'s account');return;}
+  var orphanAcc=db.accounts.find(function(a){return a.id===tgt.orphanId;});
+  var confirmMsg=isArM
+   ?'سيتم نقل كل عمليات الحساب "'+tgt.orphanId+' - '+(orphanAcc?orphanAcc.name:'')+'" إلى حساب "'+contact.name+'" ('+contact.linkedAccId+'). هذا الإجراء لا يمكن التراجع عنه تلقائيًا. متابعة؟'
+   :'This will move every transaction on account "'+tgt.orphanId+' - '+(orphanAcc?orphanAcc.name:'')+'" onto "'+contact.name+'"\'s account ('+contact.linkedAccId+'). This cannot be automatically undone. Continue?';
+  if(!confirm(confirmMsg))return;
+  migrateAccountPostings(db,tgt.orphanId,contact.linkedAccId);
+  save();render();
+  alert(isArM?'✅ تم الدمج بنجاح.':'✅ Merged successfully.');
+  return;
+ }
  if(type==='cbGenerate'){
   var cbId=((document.getElementById('cb-contact-resolved')||{}).value||'').trim();
   cbState.contactId=cbId;render();return;
@@ -7963,6 +8663,117 @@ window.xAction=function(type){
    ?['الرمز','الحساب','النوع','رصيد أول المدة مدين','رصيد أول المدة دائن','عمليات مدينة','عمليات دائنة','رصيد ختامي مدين','رصيد ختامي دائن']
    :['Code','Account','Type','Opening Dr','Opening Cr','Debit Movement','Credit Movement','Closing Dr','Closing Cr'];
   exportXLS([[db.company.name],[db.company.address||''],[tr('nav_trial'),'','Date: '+today()],[],hdrX].concat(rows).concat([['','',isArX?'الإجمالي':'TOTAL',ttX.openDr,ttX.openCr,ttX.moveDr,ttX.moveCr,ttX.closeDr,ttX.closeCr]]),isArX?'ميزان المراجعة':'Trial Balance','Trial_Balance_'+today());
+ } else if(type==='pdfGL'||type==='wordGL'){
+  // Same glRows(f,t,lv) engine (and same rptFrom/rptTo/rptLevel/rptShowCodes
+  // filters) as the on-screen pGL() -- one small ledger table per account,
+  // built with the same th/td + .tr/.tot/.fin classes printHTML() styles,
+  // so this single htmlG string works unchanged for both the PDF (via
+  // printHTML) and the Word (via exportConfirmLetterWord) export.
+  var isArG=lang==='ar';
+  var fG=rptFrom,tG=rptTo,lvG=rptLevel;
+  var rowsG=glRows(fG,tG,lvG);
+  var titleG=isArG?'دفتر الأستاذ العام':'General Ledger';
+  var htmlG='';
+  if(!rowsG.length){
+   htmlG='<p>'+(isArG?'لا توجد حسابات لها أرصدة أو عمليات ضمن هذه الفترة/المستوى المحدد.':'No accounts have a balance or activity for this period/level.')+'</p>';
+  } else {
+   rowsG.forEach(function(r){
+    var d=r.ledger;
+    var codeTxt=rptShowCodes?r.id+' - ':'';
+    htmlG+='<h3>'+codeTxt+r.name+(r.nameAr&&isArG?' | '+r.nameAr:'')+'</h3>';
+    htmlG+='<table><thead><tr><th>'+(isArG?'التاريخ':'Date')+'</th><th>'+(isArG?'المرجع':'Ref')+'</th><th>'+(isArG?'البيان':'Description')+'</th><th class="tr">'+(isArG?'مدين':'Debit')+'</th><th class="tr">'+(isArG?'دائن':'Credit')+'</th><th class="tr">'+(isArG?'الرصيد':'Balance')+'</th></tr></thead><tbody>';
+    htmlG+='<tr class="tot"><td colspan="5">'+(isArG?'رصيد افتتاحي':'Opening Balance')+'</td><td class="tr">'+N(d.open)+'</td></tr>';
+    if(!d.rows.length)htmlG+='<tr><td colspan="6">'+(isArG?'لا توجد عمليات فى هذة الفترة':'No transactions in this period.')+'</td></tr>';
+    d.rows.forEach(function(x){
+     htmlG+='<tr><td>'+x.date+'</td><td>'+x.ref+'</td><td>'+x.desc+'</td><td class="tr">'+(x.dr?N(x.dr):'')+'</td><td class="tr">'+(x.cr?N(x.cr):'')+'</td><td class="tr" style="font-weight:700">'+N(x.bal)+'</td></tr>';
+    });
+    htmlG+='<tr class="fin"><td colspan="5">'+(isArG?'رصيد ختامي':'Closing Balance')+'</td><td class="tr">'+N(d.close)+'</td></tr></tbody></table>';
+   });
+  }
+  if(type==='pdfGL')printHTML(titleG,htmlG);
+  else exportConfirmLetterWord(titleG,htmlG,'General_Ledger_'+today());
+ } else if(type==='xlsGL'){
+  var isArG2=lang==='ar';
+  var fG2=rptFrom,tG2=rptTo,lvG2=rptLevel;
+  var rowsG2=glRows(fG2,tG2,lvG2);
+  var titleG2=isArG2?'دفتر الأستاذ العام':'General Ledger';
+  var hdrG2=isArG2?['التاريخ','المرجع','البيان','مدين','دائن','الرصيد']:['Date','Ref','Description','Debit','Credit','Balance'];
+  var aoaG=[[db.company.name],[db.company.address||''],[titleG2,'','Date: '+today()]];
+  rowsG2.forEach(function(r){
+   var d=r.ledger;
+   aoaG.push([]);
+   aoaG.push([(rptShowCodes?r.id+' - ':'')+r.name+(r.nameAr&&isArG2?' | '+r.nameAr:'')]);
+   aoaG.push(hdrG2);
+   aoaG.push([isArG2?'رصيد افتتاحي':'Opening Balance','','','','',d.open]);
+   d.rows.forEach(function(x){aoaG.push([x.date,x.ref,x.desc,x.dr||'',x.cr||'',x.bal]);});
+   aoaG.push([isArG2?'رصيد ختامي':'Closing Balance','','','','',d.close]);
+  });
+  if(!rowsG2.length)aoaG.push([isArG2?'لا توجد حسابات لها أرصدة أو عمليات ضمن هذه الفترة/المستوى المحدد.':'No accounts have a balance or activity for this period/level.']);
+  exportXLS(aoaG,titleG2,'General_Ledger_'+today());
+ } else if(type==='pdfAA'||type==='wordAA'){
+  // Same acctAnalysisBuild() engine (current aa* filter state) as the
+  // on-screen pAcctAnalysis() -- one flat table, section header rows and a
+  // per-type subtotal row, built with the same th/td + .tot/.fin classes
+  // printHTML() styles, so one htmlA string serves both PDF (printHTML)
+  // and Word (exportConfirmLetterWord) unchanged.
+  var isArA=lang==='ar';
+  var dA=acctAnalysisBuild();
+  var titleA=isArA?'تحليل الحسابات':'Accounts Analysis';
+  var typeLabelsA={Asset:isArA?'الأصول':'Assets',Liability:isArA?'الالتزامات':'Liabilities',Equity:isArA?'حقوق الملكية':'Equity',Revenue:isArA?'الإيرادات':'Revenue',Expense:isArA?'المصروفات':'Expenses'};
+  var htmlA='';
+  if(!dA.ok){
+   htmlA='<p>'+dA.msg+'</p>';
+  } else if(!dA.sections.length){
+   htmlA='<p>'+(isArA?'لا توجد حسابات مطابقة لهذه الفلاتر.':'No accounts match these filters.')+'</p>';
+  } else {
+   htmlA='<table><thead><tr><th>'+(isArA?'اسم الحساب':'Account Name')+'</th>'
+    +(aaShowOpen?'<th class="tr">'+(isArA?'الرصيد الافتتاحي':'Opening Balance')+'</th>':'')
+    +dA.months.map(function(m){return '<th class="tr">'+(isArA?m.labelAr:m.labelEn)+'</th>';}).join('')
+    +'<th class="tr">'+(isArA?'الرصيد الختامي':'Closing Balance')+'</th></tr></thead><tbody>';
+   dA.sections.forEach(function(sec){
+    htmlA+='<tr class="tot"><td colspan="'+(2+(aaShowOpen?1:0)+dA.months.length)+'">'+typeLabelsA[sec.type]+'</td></tr>';
+    sec.rows.forEach(function(r){
+     var codeTxt=aaShowCodes?r.id+' - ':'';
+     htmlA+='<tr><td>'+(r.isMain?'<strong>':'')+codeTxt+r.name+(r.nameAr&&isArA?' | '+r.nameAr:'')+(r.isMain?'</strong>':'')+'</td>'
+      +(aaShowOpen?'<td class="tr">'+N(r.open)+'</td>':'')
+      +r.monthly.map(function(v){return '<td class="tr">'+(v?N(v):'')+'</td>';}).join('')
+      +'<td class="tr" style="font-weight:700">'+N(r.closing)+'</td></tr>';
+    });
+    htmlA+='<tr class="fin"><td>'+(isArA?'إجمالي '+typeLabelsA[sec.type]:'Total '+typeLabelsA[sec.type])+'</td>'
+     +(aaShowOpen?'<td class="tr">'+N(sec.total.open)+'</td>':'')
+     +sec.total.monthly.map(function(v){return '<td class="tr">'+N(v)+'</td>';}).join('')
+     +'<td class="tr">'+N(sec.total.closing)+'</td></tr>';
+   });
+   htmlA+='</tbody></table>';
+  }
+  if(type==='pdfAA')printHTML(titleA,htmlA);
+  else exportConfirmLetterWord(titleA,htmlA,'Accounts_Analysis_'+today());
+ } else if(type==='xlsAA'){
+  var isArA2=lang==='ar';
+  var dA2=acctAnalysisBuild();
+  var titleA2=isArA2?'تحليل الحسابات':'Accounts Analysis';
+  var typeLabelsA2={Asset:isArA2?'الأصول':'Assets',Liability:isArA2?'الالتزامات':'Liabilities',Equity:isArA2?'حقوق الملكية':'Equity',Revenue:isArA2?'الإيرادات':'Revenue',Expense:isArA2?'المصروفات':'Expenses'};
+  var aoaA=[[db.company.name],[db.company.address||''],[titleA2,'','Date: '+today()],[]];
+  if(!dA2.ok){
+   aoaA.push([dA2.msg]);
+  } else if(!dA2.sections.length){
+   aoaA.push([isArA2?'لا توجد حسابات مطابقة لهذه الفلاتر.':'No accounts match these filters.']);
+  } else {
+   var hdrA=[isArA2?'اسم الحساب':'Account Name'].concat(aaShowOpen?[isArA2?'الرصيد الافتتاحي':'Opening Balance']:[]).concat(dA2.months.map(function(m){return isArA2?m.labelAr:m.labelEn;})).concat([isArA2?'الرصيد الختامي':'Closing Balance']);
+   aoaA.push(hdrA);
+   dA2.sections.forEach(function(sec){
+    aoaA.push([typeLabelsA2[sec.type]]);
+    sec.rows.forEach(function(r){
+     var nameCell=(aaShowCodes?r.id+' - ':'')+r.name+(r.nameAr&&isArA2?' | '+r.nameAr:'');
+     var line=[nameCell].concat(aaShowOpen?[r.open]:[]).concat(r.monthly).concat([r.closing]);
+     aoaA.push(line);
+    });
+    var totLine=[(isArA2?'إجمالي ':'Total ')+typeLabelsA2[sec.type]].concat(aaShowOpen?[sec.total.open]:[]).concat(sec.total.monthly).concat([sec.total.closing]);
+    aoaA.push(totLine);
+    aoaA.push([]);
+   });
+  }
+  exportXLS(aoaA,titleA2,'Accounts_Analysis_'+today());
  } else if(type==='xlsIncome'){
   var f=rptFrom,t2=rptTo;
   var d=incData();
@@ -7970,7 +8781,8 @@ window.xAction=function(type){
   aoa.push(['REVENUE','','']);
   db.accounts.filter(function(a){return a.type==='Revenue'&&a.isMain;}).forEach(function(m){
    var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
-   var bal=subs.length?subs.reduce(function(s,x){return s+typeSignedLeafBal(x,'Revenue',f,t2);},0):typeSignedLeafBal(m,'Revenue',f,t2);
+   // Own postings PLUS subs -- see the matching comment in pIncome() above.
+   var bal=typeSignedLeafBal(m,'Revenue',f,t2)+subs.reduce(function(s,x){return s+typeSignedLeafBal(x,'Revenue',f,t2);},0);
    aoa.push([m.id,m.name,bal]);
    subs.forEach(function(s){aoa.push([s.id,'  '+accN(s),typeSignedLeafBal(s,'Revenue',f,t2)]);});
   });
@@ -7983,7 +8795,8 @@ window.xAction=function(type){
   aoa.push(['OPERATING EXPENSES','']);
   db.accounts.filter(function(a){return a.type==='Expense'&&a.isMain&&a.id!=='51';}).forEach(function(m){
    var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
-   var bal=subs.length?subs.reduce(function(s,x){return s+typeSignedLeafBal(x,'Expense',f,t2);},0):typeSignedLeafBal(m,'Expense',f,t2);
+   // Own postings PLUS subs -- see the matching comment in pIncome() above.
+   var bal=typeSignedLeafBal(m,'Expense',f,t2)+subs.reduce(function(s,x){return s+typeSignedLeafBal(x,'Expense',f,t2);},0);
    aoa.push([m.name,bal]);
    subs.forEach(function(s){aoa.push(['  '+accN(s),typeSignedLeafBal(s,'Expense',f,t2)]);});
   });
@@ -7992,9 +8805,20 @@ window.xAction=function(type){
   aoa.push(['NET INCOME / (LOSS)',d.ni]);
   exportXLS(aoa,'Income Statement','Income_Statement_'+today());
  } else if(type==='pdfIncome'){
+  // Same Main + (own postings PLUS subs) hierarchy as the on-screen
+  // pIncome()/xlsIncome() breakdown -- this used to instead list every
+  // NON-MAIN Revenue/Expense leaf flat, which entirely omitted any main
+  // account with direct postings of its own (e.g. "4101" Sales & Service
+  // Revenue, the normal posting target for an ordinary Sales Invoice with
+  // no separate leaf sub-account) from the printed PDF.
   var f=rptFrom,t2=rptTo;
   var d=incData(),html='<table><tbody><tr><th colspan="2">REVENUE</th></tr>';
-  db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).forEach(function(a){var b=typeSignedLeafBal(a,'Revenue',f,t2);html+='<tr><td style="padding-left:14pt">'+accN(a)+'</td><td class="tr">'+N(b)+'</td></tr>';});
+  db.accounts.filter(function(a){return a.type==='Revenue'&&a.isMain;}).forEach(function(m){
+   var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
+   var bal=typeSignedLeafBal(m,'Revenue',f,t2)+subs.reduce(function(s,x){return s+typeSignedLeafBal(x,'Revenue',f,t2);},0);
+   html+='<tr class="tot"><td>'+accN(m)+'</td><td class="tr">'+N(bal)+'</td></tr>';
+   subs.forEach(function(s){var b=typeSignedLeafBal(s,'Revenue',f,t2);html+='<tr><td style="padding-left:14pt">'+accN(s)+'</td><td class="tr">'+N(b)+'</td></tr>';});
+  });
   html+='<tr class="tot"><td>Total Revenue</td><td class="tr">'+N(d.rev)+'</td></tr>';
   html+='<tr><td>Cost of Goods Sold</td><td class="tr">('+N(d.ca)+')</td></tr>';
   html+='<tr class="tot"><td>Gross Profit</td><td class="tr">'+N(d.gp)+'</td></tr><tr><th colspan="2">OPERATING EXPENSES</th></tr>';
@@ -8003,7 +8827,12 @@ window.xAction=function(type){
   // Operating Expenses (as this used to, with no exclusion at all) doesn't
   // change the final Net Income total but makes the same cost appear
   // twice in the printed breakdown.
-  db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain&&a.pid!=='51'&&a.id!=='51';}).forEach(function(a){var b=typeSignedLeafBal(a,'Expense',f,t2);html+='<tr><td style="padding-left:14pt">'+accN(a)+'</td><td class="tr">('+N(b)+')</td></tr>';});
+  db.accounts.filter(function(a){return a.type==='Expense'&&a.isMain&&a.id!=='51';}).forEach(function(m){
+   var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
+   var bal=typeSignedLeafBal(m,'Expense',f,t2)+subs.reduce(function(s,x){return s+typeSignedLeafBal(x,'Expense',f,t2);},0);
+   html+='<tr class="tot"><td>'+accN(m)+'</td><td class="tr">('+N(bal)+')</td></tr>';
+   subs.forEach(function(s){var b=typeSignedLeafBal(s,'Expense',f,t2);html+='<tr><td style="padding-left:14pt">'+accN(s)+'</td><td class="tr">('+N(b)+')</td></tr>';});
+  });
   html+='<tr class="fin"><td>NET INCOME</td><td class="tr">'+N(d.ni)+'</td></tr></tbody></table>';
   printHTML('Income Statement',html);
  } else if(type==='xlsBalance'){
@@ -8528,6 +9357,10 @@ function bindEvents(){
   var date2=(document.getElementById('j-date')||{}).value||today();
   var desc2=(document.getElementById('j-desc')||{}).value||'';
   if(!desc2){alert(lang==='ar'?'أدخل وصف القيد':'Enter description');return;}
+  // Optional document number — only present on the "Adjust Transactions"
+  // screen (pAdjustOps); absent (null) on pJournal()'s own form, so this
+  // stays a no-op there.
+  var docNoEl=document.getElementById('j-docno');
   var lines2=[];
   document.querySelectorAll('#jeLines tr').forEach(function(tr){
    var i=tr.querySelector('.jeA')?tr.querySelector('.jeA').dataset.i:'';
@@ -8536,7 +9369,12 @@ function bindEvents(){
    var cr=Number((tr.querySelector('.jeC')||{}).value)||0;
    var vat=Number((tr.querySelector('.jeVAT')||{}).value)||0;
    var cc=(tr.querySelector('.jeCC')||{}).value||'';
-   if(acc&&(dr||cr))lines2.push({acc:acc,dr:dr,cr:cr,vat:vat||undefined,cc:cc||undefined});
+   // .jeLDesc/.jeLRef (per-line note/reference) only exist in the shared
+   // buildJELinesEditor() table — always true now for both pJournal() and
+   // pAdjustOps(), kept optional here defensively.
+   var ldesc=(tr.querySelector('.jeLDesc')||{}).value||'';
+   var lref=(tr.querySelector('.jeLRef')||{}).value||'';
+   if(acc&&(dr||cr))lines2.push({acc:acc,dr:dr,cr:cr,vat:vat||undefined,cc:cc||undefined,desc:ldesc||undefined,ref:lref||undefined});
   });
   if(lines2.length<2){alert(lang==='ar'?'أضف سطرين على الأقل':'Add at least 2 lines');return;}
   var tD3=lines2.reduce(function(s,l){return s+(l.dr||0);},0);
@@ -8548,17 +9386,48 @@ function bindEvents(){
   var linesToSave=jeExpandVATLines(lines2);
   if(tJE.editId){
    var idx3=db.journals.findIndex(function(j){return j.id===tJE.editId;});
-   if(idx3>=0){db.journals[idx3].date=date2;db.journals[idx3].desc=desc2;db.journals[idx3].lines=linesToSave;}
+   if(idx3>=0){
+    db.journals[idx3].date=date2;db.journals[idx3].desc=desc2;db.journals[idx3].lines=linesToSave;
+    if(docNoEl)db.journals[idx3].docNo=docNoEl.value||undefined;
+   }
   } else {
    var newId='JE'+String(db.journals.length+1).padStart(3,'0');
-   db.journals.push({id:newId,date:date2,desc:desc2,lines:linesToSave});
+   var newJE={id:newId,date:date2,desc:desc2,lines:linesToSave};
+   if(docNoEl&&docNoEl.value)newJE.docNo=docNoEl.value;
+   db.journals.push(newJE);
    // Navigate to new entry
    jeState.currentIdx=0;
+  }
+  // Reached via pAdjustOps() (the "Adjust Transactions" screen) rather
+  // than pJournal() itself — stay on that screen (don't jump into
+  // pJournal()'s own view mode) and confirm with the same alert() style
+  // the rest of the app already uses for one-shot confirmations.
+  if(adjOpsState.mode==='loaded'){
+   save();
+   alert(lang==='ar'?'✅ تم حفظ التعديلات بنجاح':'✅ Changes saved successfully');
+   render();return;
   }
   jeState.mode='view';save();render();
  });
  on1('jeCancel','click',function(){
   jeState.mode=jeState.currentIdx>=0?'view':'list';render();
+ });
+ // ── Adjust Transactions (pAdjustOps) handlers ─────────────────
+ on1('btnAdjLoad','click',function(){
+  var typeSel=(document.getElementById('adjType')||{}).value||'journal';
+  var num=((document.getElementById('adjNum')||{}).value||'').trim();
+  if(!num){alert(lang==='ar'?'أدخل رقم العملية':'Enter the transaction number');return;}
+  if(typeSel==='journal'){
+   var je=db.journals.find(function(j){return j.id===num||j.id.toLowerCase()===num.toLowerCase()||(j.docNo&&j.docNo.toLowerCase()===num.toLowerCase());});
+   if(!je){adjOpsState.notFound=true;adjOpsState.mode='search';adjOpsState.num=num;render();return;}
+   tJE={editId:je.id,date:je.date,desc:je.desc,docNo:je.docNo||'',lines:jeCollapseVATLines(je.lines)};
+   adjOpsState.mode='loaded';adjOpsState.notFound=false;adjOpsState.num=num;
+   render();
+  }
+ });
+ on1('btnAdjCancel','click',function(){
+  adjOpsState={mode:'search',type:'journal',num:'',notFound:false};
+  render();
  });
  on1('jeNavFirst','click',function(){jeState.currentIdx=0;jeState.mode='view';render();});
  on1('jeNavPrev','click',function(){if(jeState.currentIdx>0){jeState.currentIdx--;jeState.mode='view';render();}});
@@ -8878,6 +9747,18 @@ function bindEvents(){
   render();
  });
  on1('btnClearRpt','click',function(){rptFrom='';rptTo='';rptLevel='all';rptShowCodes=false;rptLoaded=false;render();});
+ on1('btnApplyAA','click',function(){
+  aaFrom=(document.getElementById('aaFrom')||{}).value||'';
+  aaTo=(document.getElementById('aaTo')||{}).value||'';
+  aaShowOpen=!!(document.getElementById('aaShowOpen')||{}).checked;
+  aaShowCodes=!!(document.getElementById('aaShowCodes')||{}).checked;
+  aaShowMain=!!(document.getElementById('aaShowMain')||{}).checked;
+  aaHideZero=!!(document.getElementById('aaHideZero')||{}).checked;
+  document.querySelectorAll('.aaType').forEach(function(el){aaTypes[el.dataset.type]=!!el.checked;});
+  aaLoaded=true;
+  render();
+ });
+ on1('btnClearAA','click',function(){aaFrom='';aaTo='';aaShowOpen=true;aaShowCodes=false;aaShowMain=false;aaHideZero=true;aaTypes={Asset:true,Liability:true,Equity:true,Revenue:true,Expense:true};aaLoaded=false;render();});
  // Zakat page's own date inputs (#zk-from/#zk-to) were never actually
  // wired to anything — pZakat()'s calculation reads the shared
  // rptFrom/rptTo report-filter variables, not these fields, so clicking
@@ -9674,6 +10555,15 @@ function bindEvents(){
   alert(isAr?'✅ تم الربط. اضغط "استعادة من السحابة الآن" لجلب البيانات.':'✅ Linked. Click "Restore from Cloud Now" to pull the data.');
  });
  on1('btnRestoreCloud','click',function(){restoreAdminDataFromCloud();});
+ on('[data-action="mergeOrphanAcc"]','click',function(el){
+  var isAr9=lang==='ar';
+  var orphanId=el.dataset.orphan;
+  var sel=document.querySelector('.orphanTarget[data-orphan="'+orphanId+'"]');
+  var contactId=sel?sel.value:'';
+  if(!contactId){alert(isAr9?'اختر العميل أو المورد أولاً':'Select a customer or supplier first');return;}
+  mergeOrphanTarget={orphanId:orphanId,contactId:contactId};
+  window.xAction('mergeOrphanAcc');
+ });
  on1('logoFile','change',function(e){
   var file=e.target.files[0];if(!file)return;
   var reader=new FileReader();
@@ -9826,10 +10716,14 @@ function bindEvents(){
   aiAnalysisState.loading=true;render();
   try{
    var f=(document.getElementById('aiana-from')||{}).value||'';var t2=(document.getElementById('aiana-to')||{}).value||'';
-   var rev=db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,f,t2);},0);
-   var xp=db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,f,t2);},0);
-   var assets=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,f,t2);},0);
-   var liab=db.accounts.filter(function(a){return a.type==='Liability'&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,f,t2);},0);
+   // Same fix as trialBalanceTotals()/execCalc(): flat sum over every
+   // account's own balance, main included, so the figures fed to the AI
+   // analysis prompt aren't silently missing a main account's own direct
+   // postings (e.g. Revenue posted straight to "4101").
+   var rev=db.accounts.filter(function(a){return a.type==='Revenue';}).reduce(function(s,a){return s+accBalRange(a.id,f,t2);},0);
+   var xp=db.accounts.filter(function(a){return a.type==='Expense';}).reduce(function(s,a){return s+accBalRange(a.id,f,t2);},0);
+   var assets=db.accounts.filter(function(a){return a.type==='Asset';}).reduce(function(s,a){return s+accBalRange(a.id,f,t2);},0);
+   var liab=db.accounts.filter(function(a){return a.type==='Liability';}).reduce(function(s,a){return s+accBalRange(a.id,f,t2);},0);
    var data={company:db.company.name,currency:db.company.currency||'SAR',revenue:rev,expenses:xp,netIncome:rev-xp,assets:assets,liabilities:liab,equity:assets-liab,type:aiAnalysisState.type};
    var cur5=db.company.currency||'SAR';
    var typePrompts={
@@ -9905,10 +10799,13 @@ function bindEvents(){
    // activity — see accBalRange's own doc comment). All four now use the
    // same contra-aware, all-postings-inclusive helper the other reports use.
    var asOf=today();
-   var rev=db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Revenue','',asOf);},0);
-   var xp=db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Expense','',asOf);},0);
-   var assets=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain;}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Asset','',asOf);},0);
-   var liab=db.accounts.filter(function(a){return a.type==='Liability'&&!a.isMain;}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Liability','',asOf);},0);
+   // Same fix as elsewhere: main accounts included (not just non-main
+   // leaves), or a main account's own direct postings (e.g. "4101") are
+   // silently missing from the figures fed to the AI forecast prompt.
+   var rev=db.accounts.filter(function(a){return a.type==='Revenue';}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Revenue','',asOf);},0);
+   var xp=db.accounts.filter(function(a){return a.type==='Expense';}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Expense','',asOf);},0);
+   var assets=db.accounts.filter(function(a){return a.type==='Asset';}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Asset','',asOf);},0);
+   var liab=db.accounts.filter(function(a){return a.type==='Liability';}).reduce(function(s,a){return s+typeSignedLeafBal(a,'Liability','',asOf);},0);
    var data={company:db.company.name,currency:db.company.currency||'SAR',revenue:rev,expenses:xp,netIncome:rev-xp,assets:assets,liabilities:liab,forecastMonths:period,type:aiForecastState.type};
    var cur2=db.company.currency||'SAR';
    var typeNamesAr={sales:'تنبؤ المبيعات',bankruptcy:'تحليل مخاطر الإفلاس — Altman Z-Score',cashflow:'تنبؤ التدفق النقدي',budget:'الميزانية التقديرية'};
@@ -10064,8 +10961,15 @@ function bindEvents(){
   if(!activeFY2){alert(lang==='ar'?'\u0644\u0627 \u062a\u0648\u062c\u062f \u0633\u0646\u0629 \u0645\u0627\u0644\u064a\u0629 \u0645\u0641\u062a\u0648\u062d\u0629':'No open fiscal year');return;}
   if(!confirm(lang==='ar'?'\u0625\u063a\u0644\u0627\u0642 \u0627\u0644\u0633\u0646\u0629 \u0627\u0644\u0645\u0627\u0644\u064a\u0629 '+activeFY2.year+'?':'Close fiscal year '+activeFY2.year+'?'))return;
 
-  var rev2=db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,activeFY2.from,activeFY2.to);},0);
-  var exp2=db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;}).reduce(function(s,a){return s+accBalRange(a.id,activeFY2.from,activeFY2.to);},0);
+  // Same fix as every other report this audit touched, but higher-stakes
+  // here: this ACTUALLY POSTS the closing journal entry, so a `!a.isMain`
+  // filter didn't just misreport a total, it silently left a main
+  // Revenue/Expense account's own direct postings (e.g. "4101"/"5101",
+  // this app's own default posting target for ordinary Sales/COGS) OUT of
+  // netIncome2 AND un-zeroed after "closing" -- its balance would then
+  // incorrectly carry into the new fiscal year instead of being reset.
+  var rev2=db.accounts.filter(function(a){return a.type==='Revenue';}).reduce(function(s,a){return s+accBalRange(a.id,activeFY2.from,activeFY2.to);},0);
+  var exp2=db.accounts.filter(function(a){return a.type==='Expense';}).reduce(function(s,a){return s+accBalRange(a.id,activeFY2.from,activeFY2.to);},0);
   var netIncome2=rev2-exp2;
 
   // Closing JE - close revenue and expense accounts
@@ -10073,11 +10977,11 @@ function bindEvents(){
    desc:(lang==='ar'?'\u0642\u064a\u062f \u0625\u063a\u0644\u0627\u0642 \u0627\u0644\u0633\u0646\u0629 \u0627\u0644\u0645\u0627\u0644\u064a\u0629 ':'Year-End Closing ')+activeFY2.year,
    lines:[],isClosing:true,fy:activeFY2.year};
 
-  db.accounts.filter(function(a){return a.type==='Revenue'&&!a.isMain;}).forEach(function(a){
+  db.accounts.filter(function(a){return a.type==='Revenue';}).forEach(function(a){
    var b=accBalRange(a.id,activeFY2.from,activeFY2.to);
    if(Math.abs(b)>0.001)closeJE2.lines.push({acc:a.id,dr:b,cr:0});
   });
-  db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;}).forEach(function(a){
+  db.accounts.filter(function(a){return a.type==='Expense';}).forEach(function(a){
    var b=accBalRange(a.id,activeFY2.from,activeFY2.to);
    if(Math.abs(b)>0.001)closeJE2.lines.push({acc:a.id,dr:0,cr:b});
   });
@@ -10092,7 +10996,12 @@ function bindEvents(){
    desc:(lang==='ar'?'\u0623\u0631\u0635\u062f\u0629 \u0627\u0641\u062a\u062a\u0627\u062d\u064a\u0629 \u0633\u0646\u0629 ':'Opening Balances FY ')+nextYr,
    lines:[],isOpening:true,fy:nextYr};
 
-  db.accounts.filter(function(a){return (a.type==='Asset'||a.type==='Liability'||a.type==='Equity')&&!a.isMain;}).forEach(function(a){
+  // Same fix for the new year's Opening Balances entry: a main Asset/
+  // Liability/Equity account's own balance (e.g. "3104" Net Profit/Loss
+  // for the Period, which the closing entry above may have just posted
+  // to) must still be carried forward -- excluding isMain accounts here
+  // would silently drop it from next year's opening balances.
+  db.accounts.filter(function(a){return (a.type==='Asset'||a.type==='Liability'||a.type==='Equity');}).forEach(function(a){
    var b=accBalRange(a.id,'',activeFY2.to);
    if(Math.abs(b)>0.001){
     if(a.normal==='Debit')obJE2.lines.push({acc:a.id,dr:b>0?b:0,cr:b<0?Math.abs(b):0});
@@ -10793,6 +11702,8 @@ function jeExpandVATLines(lines){
   var g='v'+(grp++);
   var mainLine={acc:l.acc,dr:0,cr:0,vat:vatRate,vatGroup:g};
   if(l.cc)mainLine.cc=l.cc;
+  if(l.desc)mainLine.desc=l.desc;
+  if(l.ref)mainLine.ref=l.ref;
   if(isExpense)mainLine.dr=bd.netAmt;else mainLine.cr=bd.netAmt;
   var vatLine={acc:bd.vatAccId,dr:0,cr:0,isVatLine:true,vatGroup:g};
   if(isExpense)vatLine.dr=bd.vatAmt;else vatLine.cr=bd.vatAmt;
@@ -10847,6 +11758,10 @@ function calcVATLines(){
 function jeHint(){
  var tD=tJE.lines.reduce(function(s,l){return s+Number(l.dr||0);},0);
  var tC=tJE.lines.reduce(function(s,l){return s+Number(l.cr||0);},0);
+ // Live "Total Debit/Credit Side" fields on the Adjust Transactions screen
+ // (pAdjustOps) — absent (null) on pJournal()'s own form, so harmless there.
+ var totDrEl=document.getElementById('adjTotDr');if(totDrEl)totDrEl.textContent=N(tD);
+ var totCrEl=document.getElementById('adjTotCr');if(totCrEl)totCrEl.textContent=N(tC);
  var el=document.getElementById('jeHint');if(!el)return;
  var isAr=lang==='ar';
  var diff=Math.abs(tD-tC);
