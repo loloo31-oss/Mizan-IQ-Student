@@ -6855,7 +6855,20 @@ function execCalc(){
  var latestBud=budgets.find(function(b){return b.year===parseInt(yr);});
  var budRev=latestBud?latestBud.lines.filter(function(l){return l.type==='Revenue';}).reduce(function(s,l){return s+(l.months||[]).reduce(function(a,v){return a+(+v||0);},0);},0):0;
  var budRevPct=budRev>0?Math.round(rev/budRev*100):null;
- return {rev:rev,exp:exp,netIncome:netIncome,grossProfit:grossProfit,grossMargin:grossMargin,netMargin:netMargin,tAsset:tAsset,tLiab:tLiab,tEquity:tEquity,cash:cash,receivables:receivables,inventory:inventory,currentAssets:currentAssets,currentLiab:currentLiab,currentRatio:currentRatio,debtToEquity:debtToEquity,roe:roe,siCount:siCount,siTotal:siTotal,budRev:budRev,budRevPct:budRevPct,yr:yr,asOf:t};
+ // Zakat estimate shown on both dashboards -- MUST reuse the same shared
+ // zakatCalc(f,t) the dedicated Zakat screen/exports use (see the long
+ // comment above that function), not a separate approximation here. This
+ // used to be a locally-invented "Total Equity × 2.5%" (later patched once
+ // already to stop double-counting Net Income, per the comment still on
+ // the Management Dashboard's own KPI card below) -- but even after that
+ // patch it still silently ignored the rest of the ZATCA formula
+ // (+ Long-term Liabilities, − Fixed Assets net, − Long-term Investments),
+ // so the two dashboards kept showing a materially different "Estimated
+ // Zakat" figure than the actual Zakat screen for the exact same data —
+ // exactly the kind of drift zakatCalc() was created to prevent everywhere
+ // else. Calling the real function here closes that last gap.
+ var zakatDue=zakatCalc(f,t).zakatDue;
+ return {rev:rev,exp:exp,netIncome:netIncome,grossProfit:grossProfit,grossMargin:grossMargin,netMargin:netMargin,tAsset:tAsset,tLiab:tLiab,tEquity:tEquity,cash:cash,receivables:receivables,inventory:inventory,currentAssets:currentAssets,currentLiab:currentLiab,currentRatio:currentRatio,debtToEquity:debtToEquity,roe:roe,siCount:siCount,siTotal:siTotal,budRev:budRev,budRevPct:budRevPct,zakatDue:zakatDue,yr:yr,asOf:t};
 }
 
 function kpiCard(title,value,sub,color,icon,extra){
@@ -6912,14 +6925,15 @@ function pMgmtDash(){
  // Row 3: Ratios
  h+='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:12px">';
  h+=kpiCard(isAr?'التدفقات من الأنشطة التشغيلية':'Operating CF',N(d.netIncome+d.exp*0.1),isAr?'تقريبي':'Approx','#185FA5','💧');
- // Found while regression-testing the isMain fixes above (unrelated bug):
- // d.tEquity already includes d.netIncome (see execCalc()'s "var
- // tEquity=sumType('Equity','','')+netIncome;"), so adding d.netIncome
- // again here double-counted it -- e.g. equity 0 + net income 3,500
- // showed an estimated Zakat of 175.00 (0.025×7,000) instead of the
- // correct 87.50 (0.025×3,500), disagreeing with the dedicated Zakat
- // report's own (correct) zakatCalc() result for the same data.
- h+=kpiCard(isAr?'الزكاة المقدرة':'Estimated Zakat',N(Math.max(0,d.tEquity)*0.025),(isAr?'2.5% من الوعاء':'2.5% of base'),'#B45309','☪️');
+ // d.zakatDue now comes straight from the shared zakatCalc(f,t) — the same
+ // function the dedicated Zakat screen/exports use — instead of a
+ // locally-invented "Total Equity × 2.5%" shortcut. That shortcut had
+ // already been patched once before (it used to double-count Net Income,
+ // since d.tEquity already includes it — see execCalc()'s "var
+ // tEquity=sumType('Equity','','')+netIncome;"), but even patched it still
+ // ignored the rest of the ZATCA formula and kept disagreeing with the
+ // Zakat screen's own figure for the same data.
+ h+=kpiCard(isAr?'الزكاة المقدرة':'Estimated Zakat',N(d.zakatDue),(isAr?'2.5% من الوعاء':'2.5% of base'),'#B45309','☪️');
  h+=kpiCard(isAr?'إجمالي الديون':'Total Liabilities',N(d.tLiab),(isAr?'نسبة الدين للملكية:':'Debt/Equity:')+' '+d.debtToEquity.toFixed(2)+'x','#b91c1c','📊');
  h+=kpiCard(isAr?'العائد على حقوق الملكية':'ROE',d.roe.toFixed(1)+'%',(isAr?'حقوق الملكية:':'Equity:')+' '+N(d.tEquity),'#0F6E56','📈');
  h+='</div>';
@@ -7031,8 +7045,8 @@ function pBoardDash(){
  h+=kpiCard(isAr?'نسبة التداول':'Current Ratio',d.currentRatio.toFixed(2)+'x',isAr?'الأصول المتداولة/الخصوم':' Current Assets/Liabilities',d.currentRatio>=1.5?'#0F6E56':d.currentRatio>=1?'#B45309':'#b91c1c','⚖️');
  h+=kpiCard(isAr?'هامش صافي الربح':'Net Margin',d.netMargin.toFixed(1)+'%',isAr?'صافي الربح/الإيرادات':'Net Income/Revenue',d.netMargin>=10?'#0F6E56':d.netMargin>=5?'#B45309':'#b91c1c','📊');
  h+=kpiCard(isAr?'نسبة الدين للملكية':'D/E Ratio',d.debtToEquity.toFixed(2)+'x',isAr?'الديون/حقوق الملكية':'Liabilities/Equity',d.debtToEquity<=1?'#0F6E56':d.debtToEquity<=2?'#B45309':'#b91c1c','📋');
- // Same double-count fix as the Management Dashboard's identical KPI.
- h+=kpiCard(isAr?'الزكاة المقدرة':'Est. Zakat',N(Math.max(0,d.tEquity)*0.025),isAr?'2.5% من الوعاء الزكوي':'2.5% of Zakat base','#B45309','☪️');
+ // Same fix as the Management Dashboard's identical KPI — see execCalc().
+ h+=kpiCard(isAr?'الزكاة المقدرة':'Est. Zakat',N(d.zakatDue),isAr?'2.5% من الوعاء الزكوي':'2.5% of Zakat base','#B45309','☪️');
  h+='</div>';
 
  h+='<div style="background:var(--bg);border-radius:8px;padding:10px 14px;font-size:11px;color:var(--t2);line-height:1.8">'
@@ -10306,6 +10320,12 @@ function bindEvents(){
   var origPi=(db.purchaseInvoices||[]).find(function(p){return p.id===tPI.origPiId;});
   tPI.lines=buildPIReturnLines(origPi,tPI.editId);
   render();
+  // The rebuilt lines already carry real qty/cost/vat, but the summary box
+  // (#piSubtotal/#piVat/#piTotal) only updates from live input events —
+  // without this call it stays frozen at 0.00 until the user happens to
+  // touch a field by hand, even though the per-line amounts above it
+  // already show correctly (those are rendered straight from the data).
+  updatePITotals();
  });
  // Selecting a Reference PO used to do nothing but remember the id — the
  // PO's own items were never copied in, so the user had to re-type every
@@ -10331,6 +10351,12 @@ function bindEvents(){
   });
   var unmatched=tPI.lines.filter(function(l){return !l.itemId;}).length;
   render();
+  // Same reason as the pi-orig handler above: lines copied in from the PO
+  // already carry real qty/cost/vat, so the summary box needs an explicit
+  // recalculation here too — otherwise it stays stuck at 0.00 until the
+  // user manually edits a field, even though every per-line amount and the
+  // PO's own total are already correct.
+  updatePITotals();
   if(unmatched)alert(lang==='ar'?'تم نسخ '+tPI.lines.length+' بند من أمر الشراء، لكن '+unmatched+' منها لم يُطابَق تلقائياً مع صنف في المخزون — الرجاء اختيار الصنف الصحيح لكل بند يدوياً.':'Copied '+tPI.lines.length+' line(s) from the PO, but '+unmatched+' could not be auto-matched to an inventory item — please pick the correct item for those lines manually.');
  });
  on('.piCost','input',function(){updatePITotals();});
@@ -10426,7 +10452,14 @@ function bindEvents(){
   if(!isRet){
    pi3.lines.forEach(function(l){var it4=itemById(l.itemId);if(it4&&it4.invAccId)jeL.push({acc:it4.invAccId,dr:l.qty*l.cost,cr:0});});
    if(pi3.vat>0){var vA=(db.accounts||[]).find(function(a){return a.id==='2002'||( a.name&&a.name.toLowerCase().indexOf('vat input')!==-1);});if(vA)jeL.push({acc:vA.id,dr:pi3.vat,cr:0});}
-   var apA=(db.accounts||[]).find(function(a){return a.type==='Liability'&&!a.isMain&&a.name&&a.name.toLowerCase().indexOf('payable')!==-1;});
+   // Same fix as the Sales Invoice "Post" handler above: credit THIS
+   // supplier's own sub-ledger account (supplier.linkedAccId, e.g.
+   // "2101-01-001") when one exists, instead of always guessing one shared
+   // "any non-main Liability account named *payable*" account for every
+   // supplier -- see the long comment above the matching arA lookup.
+   var supForPI=(db.suppliers||[]).find(function(s){return s.id===pi3.supplierId;});
+   var apA=supForPI&&supForPI.linkedAccId?(db.accounts||[]).find(function(a){return a.id===supForPI.linkedAccId;}):null;
+   if(!apA)apA=(db.accounts||[]).find(function(a){return a.type==='Liability'&&!a.isMain&&a.name&&a.name.toLowerCase().indexOf('payable')!==-1;});
    if(apA)jeL.push({acc:apA.id,dr:0,cr:pi3.total});
   }
   if(jeL.length){var je4={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:pi3.date,desc:(isRet?'Purchase Return: ':'Purchase Invoice: ')+pi3.id,lines:jeL};db.journals.push(je4);pi3.jeId=je4.id;jeL.forEach(function(l){var a=db.accounts.find(function(x){return x.id===l.acc;});if(a){if(a.normal==='Debit')a.bal=(a.bal||0)+(l.dr-l.cr);else a.bal=(a.bal||0)+(l.cr-l.dr);}});}
@@ -10519,7 +10552,19 @@ function bindEvents(){
   si3.lines.forEach(function(l){if(isRet5){var avg=(itemById(l.itemId)||{avgCost:0}).avgCost;receiveStock(l.itemId,l.qty,avg);}else{var c5=issueStock(l.itemId,l.qty);cogsT+=c5*l.qty;}});
   var jeL2=[];
   if(!isRet5){
-   var arA=(db.accounts||[]).find(function(a){return a.type==='Asset'&&!a.isMain&&a.name&&a.name.toLowerCase().indexOf('receivable')!==-1;});
+   // Post the receivable debit to THIS customer's own sub-ledger account
+   // (customer.linkedAccId, e.g. "1103-01-001") whenever one exists -- this
+   // is the whole point of a customer having a dedicated account: their own
+   // Account Statement should show their own invoices. Falling back to a
+   // generic "find any non-main Asset account named *receivable*" (the old,
+   // sole behavior) silently pools EVERY customer's sales onto one shared
+   // account, leaving every individual customer's own Account Statement
+   // empty even though real, correctly-balanced activity exists in the
+   // Trial Balance -- just sitting on the wrong line. The name-search stays
+   // only as a last-resort fallback for a customer with no linked account.
+   var cusForSI=(db.customers||[]).find(function(c){return c.id===si3.customerId;});
+   var arA=cusForSI&&cusForSI.linkedAccId?(db.accounts||[]).find(function(a){return a.id===cusForSI.linkedAccId;}):null;
+   if(!arA)arA=(db.accounts||[]).find(function(a){return a.type==='Asset'&&!a.isMain&&a.name&&a.name.toLowerCase().indexOf('receivable')!==-1;});
    var firstIt=si3.lines.length?itemById(si3.lines[0].itemId):null;
    var revId=firstIt&&firstIt.revAccId?firstIt.revAccId:((db.accounts||[]).find(function(a){return a.type==='Revenue'&&!a.isMain;})||{}).id;
    if(arA)jeL2.push({acc:arA.id,dr:si3.total,cr:0});
@@ -11511,12 +11556,34 @@ function bindEvents(){
     // in db.accounts.
     var srAcc=db.accounts.find(function(a){return !a.isMain&&(a.id==='4102-01'||(a.name&&a.name.toLowerCase().indexOf('sales returns')>-1));});
     var vatAcc=db.accounts.find(function(a){return a.id==='2103-01'||a.name.indexOf('VAT Collected')>-1;});
-    var recAcc=db.accounts.find(function(a){return a.id==='1103-01'||a.name.indexOf('Local Customers')>-1;});
-    if(!recAcc)recAcc=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&(a.name.indexOf('Receiv')>-1||a.name.indexOf('Customer')>-1);})[0];
-    // Check linked customer account
-    if(cur4.customerId){var cus4=db.customers.find(function(c){return c.id===cur4.customerId;});if(cus4&&cus4.linkedAccId){var la4=db.accounts.find(function(a){return a.id===cus4.linkedAccId;});if(la4)recAcc=la4;}}
+    // Prefer THIS customer's own sub-ledger account (customer.linkedAccId,
+    // e.g. "1103-01-001") — that is the whole point of a customer having a
+    // dedicated account: only postings actually booked there ever show up
+    // on their own Account Statement. Only when that can't be resolved (no
+    // customerId on the invoice, the customer record is gone, or its
+    // linkedAccId is blank/stale) do we fall back to the shared "Local
+    // Customers" bucket account below — and recAccWarn flags that fallback
+    // so the user gets a chance to cancel and fix the link first, instead of
+    // the amount silently vanishing into the bucket account with no trace of
+    // which customer it belonged to (exactly what previously made a real
+    // customer's own account show "No transactions" while their money sat,
+    // unexplained, on the "Local Customers" control account's own line in
+    // the Trial Balance).
+    var recAcc=null,recAccWarn=false;
+    if(cur4.customerId){var cus4=db.customers.find(function(c){return c.id===cur4.customerId;});if(cus4&&cus4.linkedAccId)recAcc=db.accounts.find(function(a){return a.id===cus4.linkedAccId;});}
+    if(!recAcc){
+     recAccWarn=true;
+     recAcc=db.accounts.find(function(a){return a.id==='1103-01'||a.name.indexOf('Local Customers')>-1;});
+     if(!recAcc)recAcc=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain&&(a.name.indexOf('Receiv')>-1||a.name.indexOf('Customer')>-1);})[0];
+    }
     if(!revAcc){alert(isAr4?'لم يتم العثور على حساب إيرادات. تأكد من دليل الحسابات':'Revenue account not found in Chart of Accounts.');return;}
     if(!recAcc){alert(isAr4?'لم يتم العثور على حساب الذمم المدينة':'Receivable account not found.');return;}
+    if(recAccWarn){
+     var recWarnMsg4=(isAr4
+      ?'تنبيه: تعذر تحديد الحساب الخاص بالعميل "'+(cur4.customerName||'—')+'" (تأكد من ربط العميل بحسابه الخاص من شاشة العملاء). سيتم ترحيل هذه الفاتورة إلى الحساب العام "'+recAcc.name+'" بدلاً من حساب هذا العميل، ولن تظهر في كشف حسابه الخاص.\n\nالأفضل: اضغط إلغاء، وافتح شاشة العملاء وتأكد من أن هذا العميل مرتبط بحسابه الخاص، ثم أعد ترحيل الفاتورة.\n\nهل تريد المتابعة على أي حال؟'
+      :'Warning: could not determine customer "'+(cur4.customerName||'—')+'"\'s own account (check that this customer is linked to their own account on the Customers screen). This invoice will post to the generic account "'+recAcc.name+'" instead, and will not show up on that customer\'s own Account Statement.\n\nBetter: click Cancel, open the Customers screen, make sure this customer is linked to their own account, then re-post this invoice.\n\nContinue anyway?');
+     if(!confirm(recWarnMsg4))return;
+    }
     var advAcc4=cur4.advAccId?db.accounts.find(function(a){return a.id===cur4.advAccId;}):null;
     if(adv4>0&&!advAcc4){alert(isAr4?'تم تسجيل دفعة مقدمة لكن لم يتم تحديد حساب الدفعات المقدمة':'An advance amount was entered but no advance-payment account was selected.');return;}
     // Cost-basis guard — run BEFORE any mutation (issueStock/journals) so a
@@ -11636,11 +11703,26 @@ function bindEvents(){
     var invAcc5=db.accounts.find(function(a){return a.id==='1104-01'||a.name.indexOf('Merchandise Inventory')>-1;});
     if(!invAcc5)invAcc5=db.accounts.filter(function(a){return a.type==='Expense'&&!a.isMain;})[0];
     var vatInAcc5=db.accounts.find(function(a){return a.id==='1105-03'||a.name.indexOf('VAT Input')>-1;});
-    var payAcc5=db.accounts.find(function(a){return a.id==='2101-01'||a.name.indexOf('Local Suppliers')>-1;});
-    if(!payAcc5)payAcc5=db.accounts.filter(function(a){return a.type==='Liability'&&!a.isMain&&(a.name.indexOf('Payable')>-1||a.name.indexOf('Supplier')>-1);})[0];
-    if(cur4.supplierId){var sup5=db.suppliers.find(function(s){return s.id===cur4.supplierId;});if(sup5&&sup5.linkedAccId){var la5=db.accounts.find(function(a){return a.id===sup5.linkedAccId;});if(la5)payAcc5=la5;}}
+    // Same fix, mirrored, as the Sales Invoice recAcc block above: prefer
+    // THIS supplier's own sub-ledger account (supplier.linkedAccId) so their
+    // own Account Statement actually reflects their invoices, and only fall
+    // back to the shared "Local Suppliers" bucket account — with a warning —
+    // when that link can't be resolved.
+    var payAcc5=null,payAccWarn5=false;
+    if(cur4.supplierId){var sup5=db.suppliers.find(function(s){return s.id===cur4.supplierId;});if(sup5&&sup5.linkedAccId)payAcc5=db.accounts.find(function(a){return a.id===sup5.linkedAccId;});}
+    if(!payAcc5){
+     payAccWarn5=true;
+     payAcc5=db.accounts.find(function(a){return a.id==='2101-01'||a.name.indexOf('Local Suppliers')>-1;});
+     if(!payAcc5)payAcc5=db.accounts.filter(function(a){return a.type==='Liability'&&!a.isMain&&(a.name.indexOf('Payable')>-1||a.name.indexOf('Supplier')>-1);})[0];
+    }
     if(!invAcc5){alert(isAr4?'لم يتم العثور على حساب المخزون أو المشتريات':'Inventory/Expense account not found.');return;}
     if(!payAcc5){alert(isAr4?'لم يتم العثور على حساب الموردين':'Payable account not found.');return;}
+    if(payAccWarn5){
+     var payWarnMsg5=(isAr4
+      ?'تنبيه: تعذر تحديد الحساب الخاص بالمورد "'+(cur4.supplierName||'—')+'" (تأكد من ربط المورد بحسابه الخاص من شاشة الموردين). سيتم ترحيل هذه الفاتورة إلى الحساب العام "'+payAcc5.name+'" بدلاً من حساب هذا المورد، ولن تظهر في كشف حسابه الخاص.\n\nالأفضل: اضغط إلغاء، وافتح شاشة الموردين وتأكد من أن هذا المورد مرتبط بحسابه الخاص، ثم أعد ترحيل الفاتورة.\n\nهل تريد المتابعة على أي حال؟'
+      :'Warning: could not determine supplier "'+(cur4.supplierName||'—')+'"\'s own account (check that this supplier is linked to their own account on the Suppliers screen). This invoice will post to the generic account "'+payAcc5.name+'" instead, and will not show up on that supplier\'s own Account Statement.\n\nBetter: click Cancel, open the Suppliers screen, make sure this supplier is linked to their own account, then re-post this invoice.\n\nContinue anyway?');
+     if(!confirm(payWarnMsg5))return;
+    }
     // Inventory quantity: a normal purchase receives stock in; a return
     // takes the same quantity back out (previously this branch did nothing
     // at all for a return, silently leaving the returned goods in stock).
