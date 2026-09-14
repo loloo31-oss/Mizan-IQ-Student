@@ -381,6 +381,17 @@ function findOrphanedAccountsWithHistory(){
 }
 function normalizeDB(d){
  if(!d.exp)d.exp={};
+ // These two are read WITHOUT a "||[]" guard in several places (most
+ // importantly pDashboard(), the very first screen shown after login —
+ // "var totalInv=db.invoices.length;", "var totalJE=db.journals.length;"),
+ // unlike every other array below which already gets backfilled here.
+ // Any company data missing either key (older data saved before "invoices"
+ // existed in the default template, or a restored/imported backup that
+ // dropped an empty array) crashed the WHOLE app on load with "Cannot read
+ // properties of undefined (reading 'length')" and no way back in short of
+ // editing localStorage by hand.
+ if(!d.journals)d.journals=[];
+ if(!d.invoices)d.invoices=[];
  if(!d.customers)d.customers=[];
  if(!d.suppliers)d.suppliers=[];
  if(!d.receipts)d.receipts=[];
