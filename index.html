@@ -822,6 +822,59 @@ function restoreAdminDataFromCloud(){
   alert(isAr?'تعذر الاتصال بالسحابة. تأكد من اتصال الإنترنت.':'Could not reach the cloud. Check your internet connection.');
  });
 }
+// ── Admin/local-user LIVE sync (opt-in, built on top of the same linked
+// cloud identity as the backup feature above) ───────────────────────────
+// The backup feature above is deliberately one-way (cloud is only ever
+// pulled back in by hand) precisely to avoid a "last save wins" surprise
+// if someone doesn't realize two devices are being used. Live sync is the
+// opposite, explicit choice: once turned on (see pBackup()), the SAME
+// linked identity becomes this data's second home, not just a backup —
+// save() pushes to it on every save (still saving locally first, so the
+// local/offline experience is unchanged), and a fresh pull runs once right
+// after login so this device starts the session with whatever any other
+// linked device last saved. This is the same trade-off trainee sync already
+// makes (two people saving at the exact same moment: last write wins) —
+// turning it on is a deliberate opt-in for exactly that reason.
+var ADMIN_SYNC_MODE_KEY='ap7_admin_sync_mode';
+function isAdminSyncOn(){try{return localStorage.getItem(ADMIN_SYNC_MODE_KEY)==='on';}catch(e){return false;}}
+function setAdminSyncOn(on){try{localStorage.setItem(ADMIN_SYNC_MODE_KEY,on?'on':'off');}catch(e){}}
+window.isAdminSyncOn=isAdminSyncOn;
+// Pushes THIS device's current company data + its full company registry to
+// the linked cloud identity. cb(err) on completion.
+function pushAdminLiveData(cb){
+ if(typeof firebase==='undefined'||!firebase.auth){if(cb)cb(new Error('no-firebase'));return;}
+ ensureAdminCloudAuth().then(function(uid){
+  var reg=getCompanyRegistry()||ensureCompanySetup();
+  var rootRef=firebase.database().ref('accounting-data/'+uid);
+  return rootRef.child(getActiveCompanyId()).set(db).then(function(){
+   return rootRef.child('companies').set(reg);
+  });
+ }).then(function(){if(cb)cb(null);}).catch(function(err){if(cb)cb(err);});
+}
+window.pushAdminLiveData=pushAdminLiveData;
+// Pulls the linked cloud identity's data down onto this device, REPLACING
+// its local company registry and active company data. cb(err,info) —
+// info.empty is true when the linked identity has no data yet (a brand-new
+// identity, or a device linking in before anyone has pushed anything).
+function pullAdminLiveData(cb){
+ if(typeof firebase==='undefined'||!firebase.auth){if(cb)cb(new Error('no-firebase'));return;}
+ ensureAdminCloudAuth().then(function(uid){
+  return firebase.database().ref('accounting-data/'+uid).once('value').then(function(snap){return snap.val()||{};});
+ }).then(function(root){
+  var reg=Array.isArray(root.companies)?root.companies:null;
+  if(!reg||!reg.length){if(cb)cb(null,{empty:true});return;}
+  try{localStorage.setItem(COMP_REG_KEY,JSON.stringify(reg));}catch(e){}
+  var activeId=getActiveCompanyId();
+  if(!activeId||!reg.some(function(c){return c.id===activeId;}))activeId=reg[0].id;
+  setActiveCompanyId(activeId);
+  var coVal=root[activeId];
+  var pulled=(coVal&&Array.isArray(coVal.accounts))?applyGlobalUsers(normalizeDB(coVal)):normalizeDB(JSON.parse(JSON.stringify(DEF)));
+  try{localStorage.setItem(coStorageKey(activeId),JSON.stringify(pulled));}catch(e){}
+  db=pulled;window.db=db;
+  if(cb)cb(null,{empty:false});
+ }).catch(function(err){if(cb)cb(err);});
+}
+window.pullAdminLiveData=pullAdminLiveData;
 var backupReminderChecked=false; // set once per page load — see maybeShowBackupReminder()
 var cbState={contactId:''}; // Balance Confirmation Letter — see pConfirmBalance()
 var rptFrom='',rptTo='',rptLevel='all',rptShowCodes=false,rptLoaded=false; // report filters
@@ -1041,6 +1094,22 @@ function save(){
    localStorage.setItem(coStorageKey(getActiveCompanyId()),JSON.stringify(db));
    localStorage.setItem('ap7',JSON.stringify(db)); // legacy key, kept as an extra safety copy
   }catch(e){}
+  if(isAdminSyncOn()){
+   // Live sync is on (see pBackup()): the linked cloud identity is a second
+   // home for this data now, not just a backup, so push there too and show
+   // real success/failure feedback — like a trainee's cloud save does —
+   // instead of the old silent fire-and-forget backup below.
+   if(el)el.textContent=lang==='ar'?'جارٍ المزامنة السحابية...':'Syncing to cloud...';
+   pushAdminLiveData(function(err){
+    lastSave=new Date();
+    var el2=document.getElementById('sv');
+    if(!el2)return;
+    el2.textContent=err
+     ?('⚠️ '+(lang==='ar'?'تم الحفظ محليًا (فشلت المزامنة) ':'Saved locally (sync failed) ')+lastSave.toLocaleTimeString())
+     :('☁️ '+(lang==='ar'?'تمت المزامنة ':'Synced ')+lastSave.toLocaleTimeString());
+   });
+   return;
+  }
   // One-way cloud backup of this admin installation's current company —
   // never blocks/overrides the local save above. See ensureAdminCloudAuth().
   backupAdminDataToCloud();
@@ -1955,7 +2024,18 @@ function render(){
     // this part of the login system was NOT changed.
     var usr=db.users.find(function(x){return x.username===uv&&x.active;});
     if(usr){
-     if(usr.passwordHash===hashPwd(pv)){currentUser=usr;saveSession(usr);render();}
+     if(usr.passwordHash===hashPwd(pv)){
+      currentUser=usr;saveSession(usr);render();
+      // Live sync is on: refresh from the linked cloud identity right after
+      // login (non-blocking — the local copy already rendered above, so
+      // there's no wait; this just upgrades to the latest synced data if
+      // another linked device saved something more recent).
+      if(isAdminSyncOn()){
+       pullAdminLiveData(function(err,info){
+        if(!err&&info&&!info.empty)render();
+       });
+      }
+     }
      else showLoginErr();
      return;
     }
@@ -7816,26 +7896,43 @@ function pBackup(){
   +'<input type="file" id="importBackupFile" accept=".json,application/json" style="display:none">'
   +'</div></div>';
  var linkCode=getAdminCloudLinkCode();
+ var syncOn=isAdminSyncOn();
  h+='<div class="card" style="max-width:660px">'
-  +'<div class="ct">☁️ '+(isAr?'النسخ الاحتياطي السحابي':'Cloud Backup')+'</div>'
-  +'<div style="font-size:13px;color:var(--t2);margin-bottom:16px;line-height:1.8">'
-  +(isAr
-   ?'يقوم البرنامج تلقائيًا برفع نسخة احتياطية من بيانات هذه الشركة إلى السحابة عند كل حفظ. بياناتك المحلية تبقى دائمًا هي المرجع الأساسي على هذا الجهاز — النسخة السحابية تُستعاد يدويًا فقط عند الضغط على الزر أدناه، ولن تستبدل بياناتك تلقائيًا أبدًا.'
-   :'The program automatically uploads a backup of this company\'s data to the cloud on every save. Your local data on this device always stays the source of truth — the cloud copy is only ever pulled back in manually with the button below, never automatically.')
-  +'</div>'
-  +'<div style="margin-bottom:14px">'
+  +'<div class="ct">☁️ '+(isAr?'المزامنة السحابية':'Cloud Sync')+'</div>';
+ if(syncOn){
+  h+='<div style="font-size:13px;color:#0F6E56;font-weight:700;margin-bottom:10px">✅ '+(isAr?'المزامنة اللحظية مفعّلة — بيانات هذه الشركة تُرفع للسحابة تلقائيًا مع كل حفظ، وتُحدَّث من السحابة تلقائيًا عند كل تسجيل دخول.':'Live sync is on — this company\'s data is pushed to the cloud automatically on every save, and refreshed from the cloud automatically on every login.')+'</div>'
+   +'<div style="font-size:12px;color:var(--t2);margin-bottom:16px;line-height:1.8">'
+   +(isAr
+    ?'أي جهاز آخر تربطه برمز الربط أدناه سيشارك نفس البيانات لحظيًا. تنبيه: لو حفظ شخصان من جهازين فى نفس اللحظة بالضبط، آخر حفظ هو اللي يبقى — تمامًا كما يعمل حساب الدارسين.'
+    :'Any other device you link with the code below shares this exact same data live. Note: if two people save from two devices at the exact same moment, the last save wins — the same trade-off trainee accounts already make.')
+   +'</div>'
+   +'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px">'
+   +'<button class="btn bp" id="btnSyncNow">🔁 '+(isAr?'مزامنة الآن':'Sync Now')+'</button>'
+   +'<button class="btn bdr" id="btnDisableSync">⏸️ '+(isAr?'إيقاف المزامنة اللحظية':'Turn off live sync')+'</button>'
+   +'</div>';
+ } else {
+  h+='<div style="font-size:13px;color:var(--t2);margin-bottom:16px;line-height:1.8">'
+   +(isAr
+    ?'حاليًا: يرفع البرنامج نسخة احتياطية من بيانات هذه الشركة للسحابة تلقائيًا مع كل حفظ، لكن بياناتك المحلية تبقى هي المرجع، والنسخة السحابية تُستعاد يدويًا فقط بالزر بالأسفل. فعّل "المزامنة اللحظية" لو تريد أكثر من جهاز يشتركون فى نفس البيانات تلقائيًا بدون أي استعادة يدوية.'
+    :'Currently: the program backs this company\'s data up to the cloud automatically on every save, but your local data stays the source of truth, and the cloud copy is only pulled back in by hand with the button below. Turn on "Live Sync" if you want more than one device to automatically share the same data with no manual restore step.')
+   +'</div>'
+   +'<div style="margin-bottom:16px">'
+   +'<button class="btn bp" id="btnEnableSync">🔄 '+(isAr?'تفعيل المزامنة اللحظية':'Enable Live Sync')+'</button>'
+   +'</div>';
+ }
+ h+='<div style="margin-bottom:14px">'
   +'<label style="font-size:12px;font-weight:600;color:var(--t2);display:block;margin-bottom:5px">'+(isAr?'رمز ربط هذا الجهاز بالسحابة (احتفظ به لربط جهاز آخر بنفس بياناتك):':'This device\'s cloud link code (keep it to link another device to the same data):')+'</label>'
   +'<div style="display:flex;gap:8px">'
   +'<input id="cloudLinkCode" type="text" readonly value="'+linkCode+'" placeholder="'+(isAr?'سيظهر الرمز بعد أول عملية حفظ':'Appears after the first save')+'" style="flex:1;padding:8px 10px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;font-family:monospace;background:var(--bg);color:var(--tx)">'
   +'<button class="btn bdr bsm" id="btnCopyCloudCode">📋 '+(isAr?'نسخ':'Copy')+'</button>'
   +'</div></div>'
   +'<div style="margin-bottom:14px">'
-  +'<label style="font-size:12px;font-weight:600;color:var(--t2);display:block;margin-bottom:5px">'+(isAr?'ربط هذا الجهاز برمز من جهاز آخر:':'Link this device with a code from another device:')+'</label>'
+  +'<label style="font-size:12px;font-weight:600;color:var(--t2);display:block;margin-bottom:5px">'+(isAr?'ربط هذا الجهاز برمز من جهاز آخر (يفعّل المزامنة اللحظية تلقائيًا بعد الربط):':'Link this device with a code from another device (turns on live sync here automatically once linked):')+'</label>'
   +'<div style="display:flex;gap:8px">'
   +'<input id="cloudLinkInput" type="text" placeholder="'+(isAr?'الصق الرمز هنا':'Paste code here')+'" style="flex:1;padding:8px 10px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;font-family:monospace">'
   +'<button class="btn bdr bsm" id="btnLinkCloudCode">🔗 '+(isAr?'ربط':'Link')+'</button>'
   +'</div></div>'
-  +'<button class="btn bp" id="btnRestoreCloud">☁️⬇️ '+(isAr?'استعادة من السحابة الآن':'Restore from Cloud Now')+'</button>'
+  +'<button class="btn bdr" id="btnRestoreCloud">☁️⬇️ '+(isAr?'استعادة من السحابة الآن (يدوي)':'Restore from Cloud Now (manual)')+'</button>'
   +'</div></div>';
  // Orphaned-account repair: accounts with real posted activity that no
  // customer/supplier currently points to (see findOrphanedAccountsWithHistory
@@ -10549,12 +10646,46 @@ function bindEvents(){
   if(!code)return;
   var cred=decodeAdminCloudCode(code);
   if(!cred||!cred.email||!cred.password){alert(isAr?'رمز غير صالح.':'Invalid code.');return;}
-  if(!confirm(isAr?'سيتم ربط هذا الجهاز بنفس هوية النسخ الاحتياطي السحابي لهذا الرمز. متابعة؟':'This device will be linked to the same cloud backup identity as this code. Continue?'))return;
+  if(!confirm(isAr?'سيتم استبدال بيانات هذه الشركة على هذا الجهاز ببيانات الرمز المُدخل، وتفعيل المزامنة اللحظية معه تلقائيًا. متابعة؟':'This device\'s company data will be replaced with the linked code\'s data, and live sync with it will turn on automatically. Continue?'))return;
   setAdminCloudCred(cred);
-  render();
-  alert(isAr?'✅ تم الربط. اضغط "استعادة من السحابة الآن" لجلب البيانات.':'✅ Linked. Click "Restore from Cloud Now" to pull the data.');
+  pullAdminLiveData(function(err,info){
+   if(err){alert(isAr?'تعذر الاتصال بالسحابة. تأكد من اتصال الإنترنت.':'Could not reach the cloud. Check your internet connection.');return;}
+   if(info&&info.empty){alert(isAr?'تم الربط، لكن لا توجد بيانات على هذا الرمز بعد.':'Linked, but this code has no data yet.');return;}
+   setAdminSyncOn(true);
+   render();
+   alert(isAr?'✅ تم الربط وتفعيل المزامنة اللحظية، وتم جلب أحدث البيانات.':'✅ Linked, live sync is on, and the latest data was pulled in.');
+  });
  });
  on1('btnRestoreCloud','click',function(){restoreAdminDataFromCloud();});
+ on1('btnEnableSync','click',function(){
+  var isAr=lang==='ar';
+  if(!confirm(isAr?'سيتم رفع بيانات هذه الشركة الحالية للسحابة لتصبح المزامنة اللحظية مفعّلة من الآن. متابعة؟':'This company\'s current data will be pushed to the cloud so live sync starts from now. Continue?'))return;
+  pushAdminLiveData(function(err){
+   if(err){alert(isAr?'تعذر الاتصال بالسحابة. تأكد من اتصال الإنترنت وحاول مرة أخرى.':'Could not reach the cloud. Check your internet connection and try again.');return;}
+   setAdminSyncOn(true);
+   render();
+   alert(isAr?'✅ تم تفعيل المزامنة اللحظية. اربط أي جهاز آخر برمز الربط أدناه.':'✅ Live sync is on. Link any other device with the code below.');
+  });
+ });
+ on1('btnDisableSync','click',function(){
+  var isAr=lang==='ar';
+  if(!confirm(isAr?'ستعود المزامنة إلى نسخ احتياطي يدوي فقط (بدون تحديث تلقائي بين الأجهزة). متابعة؟':'Sync will go back to manual backup only (no automatic updates between devices). Continue?'))return;
+  setAdminSyncOn(false);
+  render();
+ });
+ on1('btnSyncNow','click',function(){
+  var isAr=lang==='ar';
+  var el=document.getElementById('btnSyncNow');
+  if(el){el.disabled=true;el.textContent='⏳ '+(isAr?'جارٍ المزامنة...':'Syncing...');}
+  pullAdminLiveData(function(err){
+   if(err){alert(isAr?'تعذر الاتصال بالسحابة.':'Could not reach the cloud.');render();return;}
+   pushAdminLiveData(function(err2){
+    render();
+    if(err2)alert(isAr?'تم الجلب، لكن فشل الرفع.':'Pulled OK, but push failed.');
+    else alert(isAr?'✅ تمت المزامنة.':'✅ Synced.');
+   });
+  });
+ });
  on('[data-action="mergeOrphanAcc"]','click',function(el){
   var isAr9=lang==='ar';
   var orphanId=el.dataset.orphan;
