@@ -206,6 +206,7 @@ var I18N={
  sec_contacts:{ar:'\u062c\u0647\u0627\u062a \u0627\u0644\u0627\u062a\u0635\u0627\u0644',en:'Contacts'},
  sec_settings:{ar:'\u0627\u0644\u0625\u0639\u062f\u0627\u062f\u0627\u062a',en:'Settings'},
  nav_coa:{ar:'\u062f\u0644\u064a\u0644 \u0627\u0644\u062d\u0633\u0627\u0628\u0627\u062a',en:'Chart of Accounts'},
+ nav_openbal:{ar:'\u0627\u0644\u0623\u0631\u0635\u062f\u0629 \u0627\u0644\u0627\u0641\u062a\u062a\u0627\u062d\u064a\u0629',en:'Opening Balances'},
  nav_journal:{ar:'\u0642\u064a\u0648\u062f \u0627\u0644\u064a\u0648\u0645\u064a\u0629',en:'Journal Entries'},
  nav_invoice:{ar:'\u0625\u0635\u062f\u0627\u0631 \u0627\u0644\u0641\u0648\u0627\u062a\u064a\u0631',en:'Issue Invoices'},
  nav_receipt:{ar:'\u0633\u0646\u062f\u0627\u062a \u0627\u0644\u0642\u0628\u0636',en:'Receipt Vouchers'},
@@ -2280,6 +2281,7 @@ function buildLayout(){
   // ── Chart of Accounts ──────────────────────────────────────
   {sec:isAr?'📋 الحسابات':'📋 Accounts'},
   {k:'coa',         i:'list',  l:tr('nav_coa')},
+  {k:'openbal',     i:'edit',  l:tr('nav_openbal')},
 
   // ── Financial Operations ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
   {sec:isAr?'💼 العمليات المالية':'💼 Financial Operations'},
@@ -2385,7 +2387,7 @@ function buildLayout(){
    }
   });
   if(currentSec!==null)nav+='</div>';
- var pages={dashboard:pDashboard,training:pTraining,ai_settings:pAISettings,ai_bank:pAIBank,ai_analysis:pAIAnalysis,ai_cashflow:pAICashFlow,ai_forecast:pAIForecast,coa:pCOA,items:pItems,po:pPurchaseOrders,purchases:pPurchases,sales2:pSales2,stockrpt:pStockRpt,fixedassets:pFixedAssets,assetlocations:pAssetLocations,depreciation:pDepreciation,users:pUsers,fiscalyear:pFiscalYear,journal:pJournal,adjustops:pAdjustOps,receipt:pReceipt,payment:pPayment,trial:pTrial,gl:pGL,acctAnalysis:pAcctAnalysis,income:pIncome,balance:pBalance,equity:pEquity,workcap:pWorkCap,statement:pStatement,agingAR:pAgingAR,agingAP:pAgingAP,taxSales:pTaxSales,taxPurchases:pTaxPurchases,zakat:pZakat,budget:pBudget,budgetcmp:pBudgetCompare,mgmtdash:pMgmtDash,boarddash:pBoardDash,licadmin:pLicenseAdmin,customers:pCustomers,suppliers:pSuppliers,confirmbal:pConfirmBalance,settings:pSettings,backup:pBackup,costcenters:pCostCenters,ccreport:pCCReport};
+ var pages={dashboard:pDashboard,training:pTraining,ai_settings:pAISettings,ai_bank:pAIBank,ai_analysis:pAIAnalysis,ai_cashflow:pAICashFlow,ai_forecast:pAIForecast,coa:pCOA,openbal:pOpeningBalances,items:pItems,po:pPurchaseOrders,purchases:pPurchases,sales2:pSales2,stockrpt:pStockRpt,fixedassets:pFixedAssets,assetlocations:pAssetLocations,depreciation:pDepreciation,users:pUsers,fiscalyear:pFiscalYear,journal:pJournal,adjustops:pAdjustOps,receipt:pReceipt,payment:pPayment,trial:pTrial,gl:pGL,acctAnalysis:pAcctAnalysis,income:pIncome,balance:pBalance,equity:pEquity,workcap:pWorkCap,statement:pStatement,agingAR:pAgingAR,agingAP:pAgingAP,taxSales:pTaxSales,taxPurchases:pTaxPurchases,zakat:pZakat,budget:pBudget,budgetcmp:pBudgetCompare,mgmtdash:pMgmtDash,boarddash:pBoardDash,licadmin:pLicenseAdmin,customers:pCustomers,suppliers:pSuppliers,confirmbal:pConfirmBalance,settings:pSettings,backup:pBackup,costcenters:pCostCenters,ccreport:pCCReport};
  // This used to be `if(view==='fixedassets'&&tFA){return pAssetDetail();}`,
  // returning pAssetDetail()'s HTML directly and skipping every line below —
  // including the sidebar/nav AND the `(modal?buildModal():'')` append at
@@ -2436,6 +2438,7 @@ function fld(lbl,inp){return '<div class="fl"><label>'+lbl+'</label>'+inp+'</div
 // ── Permission modules list ──────────────────────────────────
 var PERM_MODULES=[
  {k:'coa',          l:'Chart of Accounts',      actions:'vaed'},
+ {k:'openbal',      l:'Opening Balances',       actions:'ve'},
  {k:'journal',      l:'Journal Entries',         actions:'vaed'},
  {k:'adjustops',    l:'Adjust Transactions',     actions:'vaed'},
  {k:'invoice',      l:'Tax Invoices',            actions:'vaed'},
@@ -2854,40 +2857,86 @@ function mLocation(){
  return wrap((l.editId?'Edit':'New')+' Location',body,'mSaveLoc','Save');
 }
 
-function mOpeningBalances(){
+// Dedicated "Opening Balances" screen (replaces the old mOpeningBalances()
+// popup — that modal rendered fine but its "Save Opening Balances" button
+// was never actually wired to anything: there was no on1('mSaveOB',...)
+// handler anywhere in bindEvents(), and its Debit/Credit totals footer was
+// likewise never recalculated, so every value typed into it was silently
+// discarded the moment the modal closed or the app re-rendered. This screen
+// is a real, working replacement: a full page (own sidebar entry, own
+// permission module 'openbal') with a working Save (see on1('btnSaveOB',...)
+// in bindEvents()), a search box + "show all" reset, and a live Debit/
+// Credit totals footer (see on('.obBal','input',...) in bindEvents()).
+// Only LEAF accounts are listed/editable here, by design: acctRollupBal()
+// (used by every report) only ever reads a leaf's own accBalRange()/.bal —
+// a parent/group account's own .bal is never added once it has children
+// (see the comment on acctRollupBal()), so letting someone type an opening
+// balance directly onto a group header would silently vanish from every
+// report. This matches the exact same restriction the old modal already
+// had (leafAccs()).
+function pOpeningBalances(){
+ var isAr=lang==='ar';
  var leaves=leafAccs();
- var body='<div style="margin-bottom:10px;padding:10px;background:var(--bg);border-radius:var(--r);font-size:12px;color:var(--t2)">'
-  +'Enter the opening balance for each account. Debit accounts (Assets, Expenses) enter positive for debit balance. '
-  +'Credit accounts (Liabilities, Equity, Revenue) enter positive for credit balance.'
+ var h=tb(tr('nav_openbal'),
+  '<input id="obSearch" placeholder="'+(isAr?'بحث بالاسم أو الرمز...':'Search by name or code...')+'" style="padding:6px 10px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;width:200px">'
+  +'<button class="btn" id="btnShowAllOB">'+ic('list')+' '+(isAr?'عرض جميع الحسابات':'Show All Accounts')+'</button>'
+  +'<button class="btn bp" id="btnSaveOB">'+ic('save')+' '+(isAr?'حفظ الأرصدة الافتتاحية':'Save Opening Balances')+'</button>');
+ h+='<div class="pg">';
+ h+='<div class="hint">'+(isAr
+   ?'أدخل الرصيد الافتتاحي لكل حساب مباشرة — بدون إنشاء قيد افتتاحي. الحسابات المدينة (الأصول والمصروفات) أدخل رصيدها موجبًا كمدين، والحسابات الدائنة (الخصوم وحقوق الملكية والإيرادات) أدخل رصيدها موجبًا كدائن.'
+   :'Enter the opening balance for each account directly — no opening journal entry is created. Debit accounts (Assets, Expenses) enter positive for a debit balance; Credit accounts (Liabilities, Equity, Revenue) enter positive for a credit balance.')
   +'</div>';
- body+='<div style="max-height:450px;overflow-y:auto"><div class="tw"><table style="font-size:13px"><thead><tr>'
-  +'<th>Code</th><th>Account</th><th>Type</th><th>Normal</th>'
-  +'<th style="text-align:right;min-width:130px">Balance</th>'
-  +'</tr></thead><tbody>';
+ if(!leaves.length){
+  h+='<div style="text-align:center;padding:60px 20px;color:var(--t3)">'+(isAr?'لا توجد حسابات فرعية (قابلة للترحيل) بعد.':'No postable (leaf) accounts yet.')+'</div>';
+  h+='</div>';return h;
+ }
  var types=['Asset','Liability','Equity','Revenue','Expense'];
  types.forEach(function(tp){
   var accs=leaves.filter(function(a){return a.type===tp;});
   if(!accs.length)return;
-  body+='<tr style="background:var(--bg)"><td colspan="5" style="font-weight:700;font-size:11px;color:var(--t2);padding:6px 12px;text-transform:uppercase;letter-spacing:.05em">'+tp+'</td></tr>';
+  h+='<div class="card"><div class="ct" style="margin-bottom:12px">'+tp+'</div>';
+  h+='<div class="tw"><table><thead><tr><th>Code</th><th>'+(isAr?'الحساب':'Account')+'</th><th>'+(isAr?'الطبيعة':'Normal')+'</th><th class="tr" style="min-width:130px">'+(isAr?'الرصيد الافتتاحي':'Opening Balance')+'</th></tr></thead><tbody>';
   accs.forEach(function(a){
-   body+='<tr>'
+   h+='<tr>'
     +'<td><span class="tag">'+a.id+'</span></td>'
-    +'<td style="font-weight:500">'+a.name+'</td>'
-    +'<td style="font-size:11px;color:var(--t2)">'+a.type+'</td>'
-    +'<td><span class="b '+(a.normal==="Debit"?"bbl":"bgn")+'" style="font-size:10px">'+a.normal+'</span></td>'
-    +'<td><input type="number" class="obBal" data-id="'+a.id+'" value="'+( a.bal||0)+'" step="0.01"'
-    +' style="width:120px;text-align:right;padding:4px 8px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px"></td>'
+    +'<td style="font-weight:500">'+a.name+(a.nameAr&&isAr?' | '+a.nameAr:'')+'</td>'
+    +'<td><span class="b '+(a.normal==='Debit'?'bbl':'bgn')+'" style="font-size:10px">'+a.normal+'</span></td>'
+    +'<td class="tr"><input type="number" class="obBal" data-id="'+a.id+'" data-normal="'+a.normal+'" value="'+(a.bal||0)+'" step="0.01"'
+    +' style="width:130px;text-align:right;padding:5px 8px;border:1px solid var(--bd2);border-radius:var(--r);font-size:12px;background:var(--sf);color:var(--tx)"></td>'
     +'</tr>';
   });
+  h+='</tbody></table></div></div>';
  });
- body+='</tbody></table></div></div>';
- // Totals hint
- body+='<div style="margin-top:10px;padding:8px 12px;background:var(--bg);border-radius:var(--r);font-size:12px">'
-  +'<span id="obSumDR" style="color:var(--bl);margin-right:16px">Debit Total: 0.00</span>'
-  +'<span id="obSumCR" style="color:var(--gn);margin-right:16px">Credit Total: 0.00</span>'
+ h+='<div class="card" style="display:flex;gap:20px;flex-wrap:wrap;align-items:center">'
+  +'<span id="obSumDR" style="color:var(--bl);font-weight:700">'+(isAr?'إجمالي المدين: ':'Debit Total: ')+'0.00</span>'
+  +'<span id="obSumCR" style="color:var(--gn);font-weight:700">'+(isAr?'إجمالي الدائن: ':'Credit Total: ')+'0.00</span>'
   +'<span id="obDiff" style="font-weight:700"></span>'
   +'</div>';
- return wrap('Opening Balances',body,'mSaveOB','Save Opening Balances');
+ h+='</div>';
+ return h;
+}
+// Recomputes the Debit/Credit totals footer on pOpeningBalances() from
+// whatever is currently typed into every .obBal input on screen (a leaf
+// account's OWN entered amount counts toward Debit if that account's own
+// normal side is Debit, toward Credit otherwise) — mirrors a trial balance:
+// a set of correctly-entered opening balances should always net to the
+// same Debit and Credit total. No-ops safely when the screen isn't open.
+function recalcOB(){
+ var drEl=document.getElementById('obSumDR'),crEl=document.getElementById('obSumCR'),diffEl=document.getElementById('obDiff');
+ if(!drEl||!crEl)return;
+ var isAr7=lang==='ar';
+ var dr=0,cr=0;
+ document.querySelectorAll('.obBal').forEach(function(inp){
+  var v=parseFloat(inp.value)||0;
+  if(inp.dataset.normal==='Debit')dr+=v;else cr+=v;
+ });
+ drEl.textContent=(isAr7?'إجمالي المدين: ':'Debit Total: ')+N(dr);
+ crEl.textContent=(isAr7?'إجمالي الدائن: ':'Credit Total: ')+N(cr);
+ if(diffEl){
+  var diff=dr-cr;
+  if(Math.abs(diff)<0.01){diffEl.textContent=isAr7?'✅ متوازن':'✅ Balanced';diffEl.style.color='var(--gn)';}
+  else{diffEl.textContent=(isAr7?'⚠️ الفرق: ':'⚠️ Difference: ')+N(Math.abs(diff));diffEl.style.color='var(--rd)';}
+ }
 }
 
 function nextPO(){return 'PO-'+String((db.purchaseOrders||[]).length+1).padStart(4,'0');}
@@ -5480,7 +5529,7 @@ function pTrial(){
  var isAr=lang==='ar';
  var f=rptFrom,t=rptTo,lv=rptLevel;
  var h=tb(tr('nav_trial'),
-  '<button class="btn" data-action="editOB">'+ic('edit')+' '+(isAr?'الأرصدة الافتتاحية':'Opening Balances')+'</button>'
+  '<button class="btn" data-nav="openbal">'+ic('edit')+' '+(isAr?'الأرصدة الافتتاحية':'Opening Balances')+'</button>'
   +'<button class="btn" data-action="xlsTrial">'+ic('dn')+' Excel</button>'
   +'<button class="btn" data-action="pdfTrial">'+ic('prt')+' PDF</button>');
  h+='<div class="pg">'+buildFilterBar();
@@ -7828,7 +7877,7 @@ function pLicenseAdmin(){
    +fld(isAr?'اسم الدورة':'Course','<select id="lic-course" style="width:100%;padding:8px;border:1px solid var(--bd2);border-radius:var(--r);background:var(--sf);color:var(--tx);font-size:13px"><option>دورة محاسبة - مستوى أول</option><option>دورة محاسبة - مستوى ثاني</option><option>دورة Mizan IQ الشاملة</option><option>دورة ZATCA</option><option>دورة خاصة</option></select>')
    +'</div>'
    +'<div class="fr2">'
-   +fld(isAr?'مدة الترخيص':'Duration','<select id="lic-months" onchange="window.licRegenKey()" style="width:100%;padding:8px;border:1px solid var(--bd2);border-radius:var(--r);background:var(--sf);color:var(--tx);font-size:13px"><option value="15d">15 يوم</option><option value="6m">6 شهور</option><option value="12m" selected>12 شهر</option><option value="24m">24 شهر</option><option value="0">غير محدود</option></select>')
+   +fld(isAr?'مدة الترخيص':'Duration','<select id="lic-months" onchange="window.licRegenKey()" style="width:100%;padding:8px;border:1px solid var(--bd2);border-radius:var(--r);background:var(--sf);color:var(--tx);font-size:13px"><option value="15d">15 يوم</option><option value="1m">شهر</option><option value="3m">3 شهور</option><option value="6m">6 شهور</option><option value="9m">9 شهور</option><option value="12m" selected>12 شهر</option><option value="24m">24 شهر</option><option value="0">غير محدود</option></select>')
    +fld(isAr?'السعر (ر.س)':'Price','<input id="lic-price" type="number" value="500" style="width:100%;padding:8px;border:1px solid var(--bd2);border-radius:var(--r);background:var(--sf);color:var(--tx);font-size:13px">')
    +'</div>'
    +fld(isAr?'المفتاح':'Key','<input id="lic-key" value="'+gk+'" readonly style="width:100%;padding:8px;border:1px solid var(--bd2);border-radius:var(--r);background:var(--bg);color:#185FA5;font-family:monospace;font-size:11px;font-weight:700">')
@@ -8078,7 +8127,7 @@ function pFiscalYear(){
 }
 
 function buildModal(){
- var fns={acc:mAcc,item:mItem,po:mPurchaseOrder,pi:function(){return mPurchaseInvoice(tPI.isReturn);},si:function(){return mSalesInvoice(tSI.isReturn);},je:mJE,inv:mInv,cus:mContact,sup:mContact,rcpt:mVoucher,pymt:mVoucher,cc:mCC,user:mUser,chpwd:mChangePwd,fa:mFA,at:mAddTransaction,loc:mLocation,ob:mOpeningBalances};
+ var fns={acc:mAcc,item:mItem,po:mPurchaseOrder,pi:function(){return mPurchaseInvoice(tPI.isReturn);},si:function(){return mSalesInvoice(tSI.isReturn);},je:mJE,inv:mInv,cus:mContact,sup:mContact,rcpt:mVoucher,pymt:mVoucher,cc:mCC,user:mUser,chpwd:mChangePwd,fa:mFA,at:mAddTransaction,loc:mLocation};
  var fn=fns[modal];return fn?fn():'';
 }
 function wrap(title,body,saveId,saveLabel){
@@ -8595,7 +8644,6 @@ window.xAction=function(type){
   }
   render();return;
  }
- if(type==='editOB'){modal='ob';render();return;}
  if(type==='addFA'){tFAEdit={};modal='fa';render();return;}
  if(type==='backFA'){tFA=null;view='fixedassets';render();return;}
  if(type==='addAT'){modal='at';render();return;}
@@ -8660,18 +8708,32 @@ window.xAction=function(type){
    // activity came through journals/receipts/payments, which made these
    // exports permanently disagree with the on-screen Chart of Accounts and
    // every other report (Trial Balance, Balance Sheet) built on the data.
-   db.accounts.filter(function(a){return a.type===t&&a.isMain&&!a.pid;}).forEach(function(m){
+   // IMPORTANT: mirrors pCOA()'s own tree-walk exactly (mains = ALL
+   // isMain accounts of this type, not just the ones with no pid — this
+   // chart of accounts uses isMain:true at BOTH the top level (e.g. "11")
+   // AND on intermediate group headers that have their own parent (e.g.
+   // "1101" Cash, pid:"11"). The old `&&!a.pid` filter here excluded every
+   // one of those intermediate headers, and since their real children were
+   // then unreachable too (nothing else pointed at "11" directly), entire
+   // branches of the chart silently vanished from this export while still
+   // showing normally on the pCOA() screen. Also adds "stand" (accounts
+   // with no pid and not flagged isMain), which this export never listed
+   // at all before.
+   var mains=db.accounts.filter(function(a){return a.type===t&&a.isMain;});
+   var stand=db.accounts.filter(function(a){return a.type===t&&!a.isMain&&!a.pid;});
+   mains.forEach(function(m){
+    coaRows.push({id:m.id,name:m.name,nameAr:m.nameAr||'',type:t,level:'Main',normal:m.normal,bal:acctRollupBal(m),indent:0,isMain:true});
     var subs=db.accounts.filter(function(s){return s.pid===m.id&&!s.isMain;});
-    var bal=subs.length?subs.reduce(function(s,x){return s+acctRollupBal(x);},0):acctRollupBal(m);
-    coaRows.push({id:m.id,name:m.name,nameAr:m.nameAr||'',type:t,level:'Main',normal:m.normal,bal:bal,indent:0,isMain:true});
     subs.forEach(function(s){
      var subSubs=db.accounts.filter(function(ss){return ss.pid===s.id;});
-     var sBal=acctRollupBal(s);
-     coaRows.push({id:s.id,name:s.name,nameAr:s.nameAr||'',type:t,level:subSubs.length?'Sub-Main':'Sub',normal:s.normal,bal:sBal,indent:1,isMain:false});
+     coaRows.push({id:s.id,name:s.name,nameAr:s.nameAr||'',type:t,level:subSubs.length?'Sub-Main':'Sub',normal:s.normal,bal:acctRollupBal(s),indent:1,isMain:false});
      subSubs.forEach(function(ss){
       coaRows.push({id:ss.id,name:ss.name,nameAr:ss.nameAr||'',type:t,level:'Sub-Sub',normal:ss.normal,bal:acctRollupBal(ss),indent:2,isMain:false});
      });
     });
+   });
+   stand.forEach(function(a){
+    coaRows.push({id:a.id,name:a.name,nameAr:a.nameAr||'',type:t,level:'Standalone',normal:a.normal,bal:acctRollupBal(a),indent:0,isMain:false});
    });
   });
 
@@ -11386,6 +11448,52 @@ function bindEvents(){
   });
  });
  on1('cusSearch','input',function(){var el=document.getElementById('cusSearch');if(!el)return;var q=el.value.toLowerCase();document.querySelectorAll('[data-viewcus]').forEach(function(c){var x=db.customers.find(function(x){return x.id===c.dataset.viewcus;});c.style.display=(!q||!x||(x.name+x.city||'').toLowerCase().includes(q))?'':'none';});});
+
+ // ── Opening Balances screen (pOpeningBalances) ──────────────────────────
+ on1('obSearch','input',function(){
+  var el=document.getElementById('obSearch');
+  if(!el)return;
+  var q=el.value.toLowerCase().trim();
+  document.querySelectorAll('.tw table tbody tr').forEach(function(r){
+   r.style.display=(!q||(r.textContent||'').toLowerCase().includes(q))?'':'none';
+  });
+  document.querySelectorAll('.card').forEach(function(card){
+   var tbl=card.querySelector('table');
+   if(!tbl)return;
+   var visRows=Array.from(tbl.querySelectorAll('tbody tr')).filter(function(r){return r.style.display!=='none';});
+   card.style.display=visRows.length?'':'none';
+  });
+ });
+ on1('btnShowAllOB','click',function(){
+  var el=document.getElementById('obSearch');
+  if(el)el.value='';
+  document.querySelectorAll('.tw table tbody tr').forEach(function(r){r.style.display='';});
+  document.querySelectorAll('.card').forEach(function(c){c.style.display='';});
+ });
+ // Delegated (registered once, survives re-renders) — recompute the totals
+ // footer live as the admin types into any account's opening balance.
+ on('.obBal','input',recalcOB);
+ // Initial paint of the totals footer whenever this screen is on screen —
+ // a no-op elsewhere (recalcOB() bails out if #obSumDR isn't in the DOM).
+ recalcOB();
+ on1('btnSaveOB','click',function(){
+  var isAr8=lang==='ar';
+  var inputs=document.querySelectorAll('.obBal');
+  var dr=0,cr=0;
+  inputs.forEach(function(inp){var v=parseFloat(inp.value)||0;if(inp.dataset.normal==='Debit')dr+=v;else cr+=v;});
+  if(Math.abs(dr-cr)>0.01){
+   var warnMsg=isAr8
+    ?'الأرصدة الافتتاحية غير متزنة: إجمالي المدين ('+N(dr)+') لا يساوي إجمالي الدائن ('+N(cr)+'). هل تريد الحفظ رغم ذلك؟'
+    :'Opening balances are not balanced: Debit total ('+N(dr)+') does not equal Credit total ('+N(cr)+'). Save anyway?';
+   if(!confirm(warnMsg))return;
+  }
+  inputs.forEach(function(inp){
+   var a=db.accounts.find(function(x){return x.id===inp.dataset.id;});
+   if(a)a.bal=parseFloat(inp.value)||0;
+  });
+  save();render();
+  alert(isAr8?'✅ تم حفظ الأرصدة الافتتاحية بنجاح.':'✅ Opening balances saved successfully.');
+ });
 
  // Action buttons (PDF/Excel exports)
 
