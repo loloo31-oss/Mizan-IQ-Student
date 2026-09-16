@@ -615,6 +615,7 @@ var tAcc={},tJE={},tInv={},tCus={},tSup={},tRcpt={},tPymt={},tCC={},tUser={};
 var tFAEdit={},tFA=null,tLocEdit={},postDepTarget=null,mergeOrphanTarget=null;
 var currentUser=null;
 var coSwitcherOpen=false;
+var tCoManage=null;
 // Renders the small "switch company" popover shown under the ⇄ button in
 // the sidebar: one row per registered company (✓ marks the active one)
 // plus an "add new company" row at the bottom.
@@ -626,13 +627,34 @@ function coSwitcherMenuHtml(){
  var side=isAr?'right':'left';
  var rows=reg.map(function(c){
   var active=c.id===activeId;
-  return '<div data-action="selectCo" data-id="'+c.id+'" style="padding:8px 10px;font-size:12px;cursor:pointer;color:'+(active?'#185FA5':'#222')+';background:'+(active?'#eef4fb':'#fff')+';font-weight:'+(active?'700':'400')+';white-space:nowrap;overflow:hidden;text-overflow:ellipsis;border-bottom:1px solid #eee">'
-   +(active?'✓ ':'')+(c.name||c.id)+'</div>';
+  return '<div style="display:flex;align-items:center;background:'+(active?'#eef4fb':'#fff')+';border-bottom:1px solid #eee">'
+   +'<div data-action="selectCo" data-id="'+c.id+'" style="flex:1;min-width:0;padding:8px 10px;font-size:12px;cursor:pointer;color:'+(active?'#185FA5':'#222')+';font-weight:'+(active?'700':'400')+';white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'
+   +(active?'✓ ':'')+(c.name||c.id)+'</div>'
+   +'<span data-action="manageCo" data-id="'+c.id+'" title="'+(isAr?'إدارة / تعديل / حذف':'Manage / edit / delete')+'" style="flex-shrink:0;padding:6px 9px;cursor:pointer;color:#888;font-size:13px">⚙️</span>'
+   +'</div>';
  }).join('');
  return '<div style="position:absolute;'+side+':0;bottom:38px;min-width:180px;max-width:240px;max-height:220px;overflow-y:auto;background:#fff;border-radius:8px;box-shadow:0 4px 18px rgba(0,0,0,0.35);z-index:200;text-align:'+side+'">'
   +rows
   +'<div data-action="addCo" style="padding:9px 10px;font-size:12px;cursor:pointer;color:#185FA5;font-weight:700;background:#f7faff">+ '+(isAr?'إضافة شركة جديدة':'Add new company')+'</div>'
   +'</div>';
+}
+// True when a company's own data has NO accounting operations recorded yet
+// (no journal entries, receipts, payments, purchase/sales invoices, fixed
+// asset transactions, or manually-entered opening balances) — the condition
+// under which mCoManage() allows editing its fiscal year dates or deleting
+// it outright. Master-data lists (customers/suppliers/items/cost centers)
+// don't count on their own since they carry no financial impact yet.
+function companyDataIsEmpty(d){
+ if(!d)return true;
+ if((d.journals||[]).length)return false;
+ if((d.receipts||[]).length)return false;
+ if((d.payments||[]).length)return false;
+ if((d.purchaseInvoices||[]).length)return false;
+ if((d.salesInvoices2||[]).length)return false;
+ if((d.fixedAssets||[]).length)return false;
+ if((d.assetTransactions||[]).length)return false;
+ if((d.accounts||[]).some(function(a){return a.bal;}))return false;
+ return true;
 }
 // Switches the active company and reloads its own data set (accounts,
 // journals, customers, invoices...) without logging the user out — users
@@ -667,13 +689,22 @@ function switchToCompany(id){
 // transactions) registers it, and switches to it. For a trainee session
 // the fresh company's data is written straight to the cloud (their local
 // device never holds a copy of it) instead of localStorage.
-function addNewCompany(name){
+// fyFrom/fyTo (both optional, "YYYY-MM-DD") seed the company's first
+// fiscal year record directly (same shape pFiscalYear()'s own "New Fiscal
+// Year" form creates) so fyDateCheck() locks out any transaction dated
+// outside it from the company's very first save — see mNewCompany().
+// Passing neither leaves the company with no open fiscal year, i.e. fully
+// unrestricted, exactly like every company created before this existed.
+function addNewCompany(name,fyFrom,fyTo){
  var reg=getCompanyRegistry()||[];
  var id='co'+Date.now();
  reg.push({id:id,name:name});
  saveCompanyRegistry(reg);
  var fresh=normalizeDB(JSON.parse(JSON.stringify(DEF)));
  fresh.company.name=name;
+ if(fyFrom&&fyTo){
+  fresh.fiscalYears=[{year:new Date(fyFrom).getFullYear(),from:fyFrom,to:fyTo,status:'open',netIncome:0,createdAt:today()}];
+ }
  if(window.mizanCurrentTrainee&&window.mizanCurrentTrainee.uid){
   try{firebase.database().ref('accounting-data/'+window.mizanCurrentTrainee.uid+'/'+id).set(fresh);}catch(e){}
  } else {
@@ -2855,6 +2886,150 @@ function mLocation(){
  var body=fld('Location Code *','<input id="loc-id" value="'+(l.id||'')+'" placeholder="e.g. LOC001">')
   +fld('Location Name *','<input id="loc-name" value="'+(l.name||'')+'" placeholder="e.g. Head Office">');
  return wrap((l.editId?'Edit':'New')+' Location',body,'mSaveLoc','Save');
+}
+// "New Company" modal — replaces the old bare prompt() (name only). Now
+// also collects the new company's Fiscal Year start/end date up front
+// (defaulting to the current calendar year, same defaults pFiscalYear()'s
+// own "New Fiscal Year" form already uses) and creates that fiscal year
+// record immediately, so a brand-new company is protected by fyDateCheck()
+// from its very first transaction — no separate trip to "Fiscal Year
+// Close" needed. Leaving the dates blank still creates the company with NO
+// open fiscal year (see mSaveNewCo), preserving the old, fully unrestricted
+// behavior for anyone who doesn't want the date lock.
+function mNewCompany(){
+ var isAr=lang==='ar';
+ var yr=new Date().getFullYear();
+ var body=fld(isAr?'اسم الشركة *':'Company Name *','<input id="nco-name" placeholder="'+(isAr?'مثال: شركة الأمل التجارية':'e.g. Al-Amal Trading Co.')+'">')
+  +'<div style="margin:10px 0;padding:10px;background:var(--bg);border-radius:var(--r);font-size:12px;color:var(--t2)">'
+  +(isAr
+    ?'حدد بداية ونهاية السنة المالية — لن يقبل النظام بعد ذلك أي معاملة (قيد، فاتورة، سند قبض/صرف، عملية أصل ثابت) بتاريخ خارج هذا النطاق. اتركهما فارغين إذا كنت لا تريد هذا القيد.'
+    :'Set the fiscal year start/end — the system will then reject any transaction (journal entry, invoice, receipt/payment, fixed asset transaction) dated outside this range. Leave both blank if you don\'t want this restriction.')
+  +'</div>'
+  +'<div class="fr2">'
+  +fld(isAr?'بداية السنة المالية':'Fiscal Year Start','<input id="nco-fyfrom" type="date" value="'+yr+'-01-01">')
+  +fld(isAr?'نهاية السنة المالية':'Fiscal Year End','<input id="nco-fyto" type="date" value="'+yr+'-12-31">')
+  +'</div>';
+ return wrap(isAr?'شركة جديدة':'New Company',body,'mSaveNewCo',isAr?'إنشاء الشركة':'Create Company');
+}
+// "Manage Company" modal — opened from the ⚙️ icon next to each company row
+// in the switcher popover (see coSwitcherMenuHtml()/openManageCo()). Always
+// lets you rename the company. Only lets you change its fiscal year dates,
+// or delete it outright, while companyDataIsEmpty() is true for that
+// specific company's OWN data (checked by openManageCo() right before this
+// modal opens) — i.e. it has no journal entries, receipts, payments,
+// purchase/sales invoices, fixed asset transactions, or opening balances
+// yet. This is exactly the "undo/edit/cancel a newly-created company"
+// request: as long as nothing has been posted to it, it's fully editable
+// and deletable; once real accounting data exists, only the name stays
+// editable and deletion is blocked entirely (never destroys real data).
+function mCoManage(){
+ var isAr=lang==='ar';
+ var c=tCoManage||{};
+ var empty=!!c.isEmpty;
+ var onlyOne=(getCompanyRegistry()||[]).length<=1;
+ var body=fld(isAr?'اسم الشركة *':'Company Name *','<input id="cm-name" value="'+(c.name||'').replace(/"/g,'&quot;')+'">')
+  +'<div class="fr2">'
+  +fld(isAr?'بداية السنة المالية':'Fiscal Year Start','<input id="cm-fyfrom" type="date" value="'+(c.fyFrom||'')+'"'+(empty?'':' disabled')+'>')
+  +fld(isAr?'نهاية السنة المالية':'Fiscal Year End','<input id="cm-fyto" type="date" value="'+(c.fyTo||'')+'"'+(empty?'':' disabled')+'>')
+  +'</div>'
+  +(empty?'':'<div style="margin:2px 0 10px;padding:9px 10px;background:#fff6e5;border-radius:var(--r);font-size:12px;color:#8a6100">'
+    +(isAr?'⚠️ توجد معاملات محاسبية مسجّلة على هذه الشركة، لذلك لا يمكن تعديل تواريخ السنة المالية.':'⚠️ This company already has accounting transactions recorded, so its fiscal year dates cannot be changed.')
+    +'</div>')
+  +'<div style="margin-top:10px;border-top:1px solid var(--bd);padding-top:12px">'
+  +'<button type="button" id="btnDeleteCoManage"'+(empty&&!onlyOne?'':' disabled')+' class="btn" style="width:100%;background:#fdecea;color:#c0392b;border-color:#f3c8c3'+(empty&&!onlyOne?'':';opacity:.5;cursor:not-allowed')+'">'+ic('del')+' '+(isAr?'حذف هذه الشركة نهائيًا':'Delete this company permanently')+'</button>'
+  +'<div style="margin-top:6px;font-size:11px;color:var(--t2)">'
+  +(onlyOne
+    ?(isAr?'لا يمكن حذف الشركة الوحيدة المتبقية.':'The only remaining company cannot be deleted.')
+    :(empty
+      ?(isAr?'لا يمكن التراجع عن الحذف.':'This cannot be undone.')
+      :(isAr?'لا يمكن حذف شركة تحتوي على معاملات محاسبية (قيود، فواتير، سندات، أصول ثابتة، أرصدة افتتاحية...).':'A company with accounting data (journal entries, invoices, vouchers, fixed assets, opening balances...) cannot be deleted.')))
+  +'</div></div>';
+ return wrap(isAr?'إدارة الشركة':'Manage Company',body,'mSaveCoManage',isAr?'حفظ التعديلات':'Save Changes');
+}
+// Looks up a specific company's OWN stored data (not necessarily the
+// currently active one) so mCoManage() can show accurate empty/non-empty
+// state, then opens the modal. Synchronous for the active company (already
+// in memory) and for any other LOCAL company (localStorage read is
+// synchronous); a trainee's non-active companies live only in the cloud, so
+// that branch fetches from Firebase first and opens the modal in the
+// callback.
+function openManageCo(id){
+ var reg=getCompanyRegistry()||[];
+ var entry=reg.find(function(r){return r.id===id;})||{id:id,name:id};
+ coSwitcherOpen=false;
+ function openWith(data){
+  var fy=(data&&(data.fiscalYears||[]).find(function(y){return y.status==='open';}))||null;
+  tCoManage={id:id,name:entry.name,fyFrom:fy?fy.from:'',fyTo:fy?fy.to:'',isEmpty:companyDataIsEmpty(data)};
+  modal='comanage';render();
+ }
+ if(id===getActiveCompanyId()){openWith(db);return;}
+ if(window.mizanCurrentTrainee&&window.mizanCurrentTrainee.uid){
+  firebase.database().ref('accounting-data/'+window.mizanCurrentTrainee.uid+'/'+id).once('value').then(function(snap){
+   openWith(snap.val());
+  }).catch(function(){openWith(null);});
+  return;
+ }
+ var raw=null;
+ try{var s=localStorage.getItem(coStorageKey(id));if(s)raw=JSON.parse(s);}catch(e){}
+ openWith(raw);
+}
+// Applies the edits made in mCoManage() to a specific company's OWN stored
+// record (name always; fiscalYears only when it was empty when the modal
+// opened — re-checked here too, defensively, in case something changed the
+// underlying data in between). Mirrors the three storage branches used
+// throughout this file (active/in-memory db, trainee cloud, local
+// non-active company).
+function saveManagedCompany(id,newName,fyFrom,fyTo,allowFyEdit){
+ var reg=getCompanyRegistry()||[];
+ var entry=reg.find(function(r){return r.id===id;});
+ if(entry)entry.name=newName;
+ saveCompanyRegistry(reg);
+ function applyTo(data){
+  if(!data)return data;
+  data.company=data.company||{};
+  data.company.name=newName;
+  if(allowFyEdit){
+   if(fyFrom&&fyTo)data.fiscalYears=[{year:new Date(fyFrom).getFullYear(),from:fyFrom,to:fyTo,status:'open',netIncome:0,createdAt:today()}];
+   else data.fiscalYears=[];
+  }
+  return data;
+ }
+ if(id===getActiveCompanyId()){
+  applyTo(db);save();render();
+  return;
+ }
+ if(window.mizanCurrentTrainee&&window.mizanCurrentTrainee.uid){
+  var ref=firebase.database().ref('accounting-data/'+window.mizanCurrentTrainee.uid+'/'+id);
+  ref.once('value').then(function(snap){
+   var data=applyTo(snap.val());
+   if(data)ref.set(data);
+  }).finally(function(){render();});
+  return;
+ }
+ var raw=null;
+ try{var s=localStorage.getItem(coStorageKey(id));if(s)raw=JSON.parse(s);}catch(e){}
+ raw=applyTo(raw);
+ if(raw){try{localStorage.setItem(coStorageKey(id),JSON.stringify(raw));}catch(e){}}
+ render();
+}
+// Permanently removes a company (registry entry + its own stored data).
+// Only ever called after mCoManage() has confirmed companyDataIsEmpty() was
+// true for it, so no accounting data is ever destroyed by this.
+function deleteManagedCompany(id){
+ var reg=(getCompanyRegistry()||[]).filter(function(r){return r.id!==id;});
+ saveCompanyRegistry(reg);
+ if(window.mizanCurrentTrainee&&window.mizanCurrentTrainee.uid){
+  try{firebase.database().ref('accounting-data/'+window.mizanCurrentTrainee.uid+'/'+id).remove();}catch(e){}
+ } else {
+  try{localStorage.removeItem(coStorageKey(id));}catch(e){}
+ }
+ if(id===getActiveCompanyId()){
+  var next=reg[0];
+  if(next)switchToCompany(next.id);
+  else {modal=null;render();}
+ } else {
+  modal=null;render();
+ }
 }
 
 // Dedicated "Opening Balances" screen (replaces the old mOpeningBalances()
@@ -8043,6 +8218,30 @@ function pBackup(){
  return h;
 }
 
+// Returns null when `dateStr` is acceptable, or a ready-to-show bilingual
+// error message when it falls outside the company's currently OPEN fiscal
+// year (db.fiscalYears, status:'open') -- set either when the company was
+// created (see the "New Company" dialog, addCo2/mSaveNewCo) or later via
+// this "Fiscal Year Close" screen's own "New Fiscal Year" form below.
+// Deliberately permissive by default: a company with NO open fiscal year
+// record at all (every company created before this feature existed, or
+// one currently between a closed year and the next) is left completely
+// unrestricted here -- this only ever narrows what a company that HAS
+// opted into a fiscal year (new companies from now on, or an existing one
+// whose owner explicitly created one) can post, never breaks one that
+// predates the feature. ISO "YYYY-MM-DD" strings compare correctly with
+// plain <, > since every field is fixed-width, so no Date parsing needed.
+function fyDateCheck(dateStr){
+ var activeFY=(db.fiscalYears||[]).find(function(y){return y.status==='open';});
+ if(!activeFY||!dateStr)return null;
+ if(dateStr<activeFY.from||dateStr>activeFY.to){
+  var isAr9=lang==='ar';
+  return isAr9
+   ?'⚠️ التاريخ ('+dateStr+') خارج نطاق السنة المالية الحالية ('+activeFY.from+' إلى '+activeFY.to+'). لا يمكن حفظ معاملات خارج هذا النطاق.'
+   :'⚠️ This date ('+dateStr+') is outside the current fiscal year ('+activeFY.from+' to '+activeFY.to+'). Transactions outside this range cannot be saved.';
+ }
+ return null;
+}
 function pFiscalYear(){
  var isAr=lang==='ar';
  var fy=db.fiscalYears||[];
@@ -8127,7 +8326,7 @@ function pFiscalYear(){
 }
 
 function buildModal(){
- var fns={acc:mAcc,item:mItem,po:mPurchaseOrder,pi:function(){return mPurchaseInvoice(tPI.isReturn);},si:function(){return mSalesInvoice(tSI.isReturn);},je:mJE,inv:mInv,cus:mContact,sup:mContact,rcpt:mVoucher,pymt:mVoucher,cc:mCC,user:mUser,chpwd:mChangePwd,fa:mFA,at:mAddTransaction,loc:mLocation};
+ var fns={acc:mAcc,item:mItem,po:mPurchaseOrder,pi:function(){return mPurchaseInvoice(tPI.isReturn);},si:function(){return mSalesInvoice(tSI.isReturn);},je:mJE,inv:mInv,cus:mContact,sup:mContact,rcpt:mVoucher,pymt:mVoucher,cc:mCC,user:mUser,chpwd:mChangePwd,fa:mFA,at:mAddTransaction,loc:mLocation,newco:mNewCompany,comanage:mCoManage};
  var fn=fns[modal];return fn?fn():'';
 }
 function wrap(title,body,saveId,saveLabel){
@@ -9541,6 +9740,7 @@ function bindEvents(){
   var date2=(document.getElementById('j-date')||{}).value||today();
   var desc2=(document.getElementById('j-desc')||{}).value||'';
   if(!desc2){alert(lang==='ar'?'أدخل وصف القيد':'Enter description');return;}
+  var fyErrJE2=fyDateCheck(date2);if(fyErrJE2){alert(fyErrJE2);return;}
   // Optional document number — only present on the "Adjust Transactions"
   // screen (pAdjustOps); absent (null) on pJournal()'s own form, so this
   // stays a no-op there.
@@ -9630,6 +9830,7 @@ function bindEvents(){
   var date=((document.getElementById('j-date')||{}).value||'').trim();
   var desc=((document.getElementById('j-desc')||{}).value||'').trim();
   if(!date||!desc){alert('Fill date and description.');return;}
+  var fyErrJE=fyDateCheck(date);if(fyErrJE){alert(fyErrJE);return;}
   var lines=tJE.lines.filter(function(l){return l.acc&&(Number(l.dr)||Number(l.cr));});
   var tD=lines.reduce(function(s,l){return s+Number(l.dr||0);},0);
   var tC=lines.reduce(function(s,l){return s+Number(l.cr||0);},0);
@@ -9847,6 +10048,7 @@ function bindEvents(){
   var amount=Number((document.getElementById('v-amount')||{}).value)||0;
   var accMain=((document.getElementById('v-accmain')||{}).value||'').trim();
   if(!date||!amount||!accMain){alert('Fill date, amount and account.');return;}
+  var fyErrV=fyDateCheck(date);if(fyErrV){alert(fyErrV);return;}
   var pSel=document.getElementById('v-party')||{value:''};
   var pId=pSel.value==='__m__'?'':pSel.value;
   var pName=pId?'':((document.getElementById('v-pname')||{}).value||'').trim();
@@ -10109,6 +10311,7 @@ function bindEvents(){
   var ccId2=(document.getElementById('fa-cc')||{}).value||'';
   var desc2=((document.getElementById('fa-desc')||{}).value||'').trim();
   if(!id2||!name2||!cost2||!pDate){alert('Fill all required fields (Code, Name, Cost, Date).');return;}
+  var fyErrFA=fyDateCheck(pDate);if(fyErrFA){alert(fyErrFA);return;}
   if(!assetAccId2||!depAccId2||!accDepAccId2){alert('Please link all three accounting accounts.');return;}
   var obj2={id:id2,name:name2,cost:cost2,usefulLife:life2,salvageValue:salvage2,purchaseDate:pDate,
    assetAccId:assetAccId2,depAccId:depAccId2,accDepAccId:accDepAccId2,
@@ -10145,6 +10348,7 @@ function bindEvents(){
   // is a completely normal, common transaction — requiring a nonzero value
   // made it impossible to record a real zero-proceeds disposal.
   if(!aamt&&atype!=='Disposal'){alert('Enter amount.');return;}
+  var fyErrAT=fyDateCheck(adate);if(fyErrAT){alert(fyErrAT);return;}
   var txn2={id:nextAT(),assetId:a2.id,date:adate,type:atype,amount:aamt,desc:adesc||atype+': '+a2.name};
   var je3={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:adate,desc:txn2.desc,lines:[]};
   if(atype==='Depreciation'){
@@ -10262,6 +10466,41 @@ function bindEvents(){
   }
   else{db.assetLocations.push({id:lid,name:lname});}
   modal=null;save();render();
+ });
+ on1('mSaveNewCo','click',function(){
+  var isAr10=lang==='ar';
+  var nm2=((document.getElementById('nco-name')||{}).value||'').trim();
+  if(!nm2){alert(isAr10?'أدخل اسم الشركة.':'Enter a company name.');return;}
+  var fyFrom2=((document.getElementById('nco-fyfrom')||{}).value||'').trim();
+  var fyTo2=((document.getElementById('nco-fyto')||{}).value||'').trim();
+  if((fyFrom2&&!fyTo2)||(!fyFrom2&&fyTo2)){alert(isAr10?'أدخل تاريخ البداية والنهاية معًا، أو اتركهما فارغين.':'Enter both the start and end date, or leave both blank.');return;}
+  if(fyFrom2&&fyTo2&&fyFrom2>=fyTo2){alert(isAr10?'يجب أن يكون تاريخ نهاية السنة المالية بعد تاريخ البداية.':'The fiscal year end date must be after the start date.');return;}
+  modal=null;
+  addNewCompany(nm2,fyFrom2,fyTo2);
+ });
+ on1('mSaveCoManage','click',function(){
+  var isAr11=lang==='ar';
+  if(!tCoManage)return;
+  var nm3=((document.getElementById('cm-name')||{}).value||'').trim();
+  if(!nm3){alert(isAr11?'أدخل اسم الشركة.':'Enter a company name.');return;}
+  var fyFrom3=((document.getElementById('cm-fyfrom')||{}).value||'').trim();
+  var fyTo3=((document.getElementById('cm-fyto')||{}).value||'').trim();
+  if(tCoManage.isEmpty){
+   if((fyFrom3&&!fyTo3)||(!fyFrom3&&fyTo3)){alert(isAr11?'أدخل تاريخ البداية والنهاية معًا، أو اتركهما فارغين.':'Enter both the start and end date, or leave both blank.');return;}
+   if(fyFrom3&&fyTo3&&fyFrom3>=fyTo3){alert(isAr11?'يجب أن يكون تاريخ نهاية السنة المالية بعد تاريخ البداية.':'The fiscal year end date must be after the start date.');return;}
+  }
+  var id3=tCoManage.id,allowFy=tCoManage.isEmpty;
+  modal=null;tCoManage=null;
+  saveManagedCompany(id3,nm3,fyFrom3,fyTo3,allowFy);
+ });
+ on1('btnDeleteCoManage','click',function(){
+  var isAr12=lang==='ar';
+  if(!tCoManage||!tCoManage.isEmpty)return;
+  if((getCompanyRegistry()||[]).length<=1){alert(isAr12?'لا يمكن حذف الشركة الوحيدة المتبقية.':'The only remaining company cannot be deleted.');return;}
+  if(!confirm(isAr12?'هل أنت متأكد من حذف الشركة "'+tCoManage.name+'" نهائيًا؟ لا يمكن التراجع عن هذا الإجراء.':'Are you sure you want to permanently delete "'+tCoManage.name+'"? This cannot be undone.'))return;
+  var id4=tCoManage.id;
+  modal=null;tCoManage=null;
+  deleteManagedCompany(id4);
  });
  on('[data-delat]','click',function(el){
   if(confirm('Delete this transaction?')){db.assetTransactions=db.assetTransactions.filter(function(t){return t.id!==el.dataset.delat;});save();render();}
@@ -10485,6 +10724,7 @@ function bindEvents(){
    if(qty4>0)lines3.push({itemId:itemId,qty:qty4,cost:cost4,vat:vat4});
   });
   if(!lines3.length){alert('Add at least one item.');return;}
+  var fyErrPI=fyDateCheck(dt3);if(fyErrPI){alert(fyErrPI);return;}
   // Defensive server-side re-check: never trust the UI's max= clamp alone —
   // re-derive the true remaining returnable qty right now and cap to it, in
   // case another return against the same invoice was posted meanwhile.
@@ -10582,6 +10822,7 @@ function bindEvents(){
    if(qty6>0)lines5.push({itemId:itemId5,qty:qty6,price:price6,vat:vat6});
   });
   if(!lines5.length){alert('Add at least one item.');return;}
+  var fyErrSI=fyDateCheck(dt5);if(fyErrSI){alert(fyErrSI);return;}
   // Defensive server-side re-check: never trust the UI's max= clamp alone —
   // re-derive the true remaining returnable qty right now and cap to it, in
   // case another return against the same invoice was posted meanwhile.
@@ -11509,10 +11750,11 @@ function bindEvents(){
    return;
   }
   if(act==='addCo'){
-   var isAr2=lang==='ar';
-   var nm=prompt(isAr2?'اسم الشركة الجديدة:':'New company name:','');
-   if(nm&&nm.trim())addNewCompany(nm.trim());
-   else{coSwitcherOpen=false;render();}
+   coSwitcherOpen=false;modal='newco';render();
+   return;
+  }
+  if(act==='manageCo'){
+   if(id)openManageCo(id);
    return;
   }
   window.xAction(act);
