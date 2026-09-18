@@ -422,6 +422,45 @@ function normalizeDB(d){
   d.accounts.push({id:'5102-01',name:'Material Price Variance',nameAr:'انحراف سعر المواد',type:'Expense',normal:'Debit',bal:0,isMain:false,pid:'5102'});
   d.accounts.push({id:'5102-02',name:'Material Usage Variance',nameAr:'انحراف كمية المواد',type:'Expense',normal:'Debit',bal:0,isMain:false,pid:'5102'});
  }
+ // ── Manufacturing Phase 2: Labor + Factory Overhead ─────────────────────
+ // Labor Variance sits as a third sibling under the same 5102 "Manufacturing
+ // Cost Variances" header created above (added independently of the block
+ // above so it also reaches companies that already got 5102/-01/-02 from
+ // Phase 1 and would otherwise never see this new account).
+ if(!d.accounts.some(function(a){return a.id==='5102-03';})){
+  d.accounts.push({id:'5102-03',name:'Labor Variance',nameAr:'انحراف تكلفة العمالة',type:'Expense',normal:'Debit',bal:0,isMain:false,pid:'5102'});
+ }
+ // Factory Overhead Applied is a CONTRA-expense (posted TO with credits) —
+ // same convention this app already uses for "Sales Returns" (Debit-normal
+ // nested under Credit-normal Revenue): here a Credit-normal leaf nested
+ // under the Debit-normal "51" COGS header. Overhead is applied to WIP at
+ // the product's own standard rate only (see btnApplyLaborOH below) — no
+ // actual-vs-applied variance yet, since actual factory overhead isn't
+ // tracked per-order anywhere in this app; that reconciliation belongs in a
+ // later period-end/reporting phase, not bolted onto this per-order entry.
+ if(!d.accounts.some(function(a){return a.id==='5103';})){
+  var cogsParent2=d.accounts.find(function(a){return a.id==='51';});
+  d.accounts.push({id:'5103',name:'Factory Overhead Applied',nameAr:'التكاليف الصناعية المحملة',type:'Expense',normal:'Credit',bal:0,isMain:false,pid:cogsParent2?'51':undefined});
+ }
+ // Labor's ACTUAL cost, unlike overhead, legitimately is entered per order
+ // (it mirrors a timesheet/payroll allocation, which is naturally order-
+ // specific) and is credited to the chart's own existing "Accrued Salaries &
+ // Wages" account (2102-01, present in both the DEF seed and the 138-account
+ // IFRS import) rather than a new manufacturing-only account — see
+ // mfgPayrollAccId() for the defensive name-search fallback.
+ d.products.forEach(function(p){if(p.stdLaborCostPerUnit===undefined)p.stdLaborCostPerUnit=0;if(p.stdOhCostPerUnit===undefined)p.stdOhCostPerUnit=0;});
+ d.mfgOrders.forEach(function(o){if(o.laborOh===undefined)o.laborOh=null;if(!o.scraps)o.scraps=[];});
+ // ── Manufacturing Phase 3: Scrap + Reports ──────────────────────────────
+ // Scrap/spoilage is written off WIP at the order's own FULL standard unit
+ // cost (material+labor+OH — see productFullStdCost()) the moment it's
+ // recorded (see btnRecordScrap), straight to a dedicated expense account —
+ // not blended into any variance account, since spoiled units are a real,
+ // separate cost category management wants to see on its own line, not
+ // hidden inside a price/usage/labor variance.
+ if(!d.accounts.some(function(a){return a.id==='5104';})){
+  var cogsParent3=d.accounts.find(function(a){return a.id==='51';});
+  d.accounts.push({id:'5104',name:'Scrap & Spoilage Expense',nameAr:'مصروف الهالك والتوالف',type:'Expense',normal:'Debit',bal:0,isMain:false,pid:cogsParent3?'51':undefined});
+ }
  if(!d.fixedAssets)d.fixedAssets=[];
  if(!d.assetLocations)d.assetLocations=[{id:'LOC001',name:'Head Office'},{id:'LOC002',name:'Branch 1'}];
  if(!d.assetTransactions)d.assetTransactions=[];
@@ -2350,6 +2389,9 @@ function buildLayout(){
   {sec:isAr?'🏭 التصنيع':'🏭 Manufacturing'},
   {k:'products',    i:'list',  l:(isAr?'المنتجات':'Products')+' ('+(db.products||[]).length+')'},
   {k:'mfgorders',   i:'doc',   l:(isAr?'أوامر التصنيع':'Manufacturing Orders')+' ('+(db.mfgOrders||[]).length+')'},
+  {k:'mfgproduction',  i:'doc',   l:isAr?'تقرير الإنتاج':'Production Report'},
+  {k:'mfgvariance',    i:'trend', l:isAr?'تقرير انحرافات التكلفة':'Cost Variance Report'},
+  {k:'mfgprofitability',i:'trend',l:isAr?'ربحية المنتج':'Product Profitability'},
 
   // ── Fixed Assets ───────────────────────────────────────────
   {sec:isAr?'🏭 الأصول الثابتة':'🏭 Fixed Assets'},
@@ -2440,7 +2482,7 @@ function buildLayout(){
    }
   });
   if(currentSec!==null)nav+='</div>';
- var pages={dashboard:pDashboard,training:pTraining,ai_settings:pAISettings,ai_bank:pAIBank,ai_analysis:pAIAnalysis,ai_cashflow:pAICashFlow,ai_forecast:pAIForecast,coa:pCOA,openbal:pOpeningBalances,items:pItems,po:pPurchaseOrders,purchases:pPurchases,sales2:pSales2,stockrpt:pStockRpt,fixedassets:pFixedAssets,assetlocations:pAssetLocations,depreciation:pDepreciation,users:pUsers,fiscalyear:pFiscalYear,journal:pJournal,adjustops:pAdjustOps,receipt:pReceipt,payment:pPayment,trial:pTrial,gl:pGL,acctAnalysis:pAcctAnalysis,income:pIncome,balance:pBalance,equity:pEquity,workcap:pWorkCap,statement:pStatement,agingAR:pAgingAR,agingAP:pAgingAP,taxSales:pTaxSales,taxPurchases:pTaxPurchases,zakat:pZakat,budget:pBudget,budgetcmp:pBudgetCompare,mgmtdash:pMgmtDash,boarddash:pBoardDash,licadmin:pLicenseAdmin,customers:pCustomers,suppliers:pSuppliers,confirmbal:pConfirmBalance,settings:pSettings,backup:pBackup,costcenters:pCostCenters,ccreport:pCCReport,products:pProducts,mfgorders:pMfgOrders};
+ var pages={dashboard:pDashboard,training:pTraining,ai_settings:pAISettings,ai_bank:pAIBank,ai_analysis:pAIAnalysis,ai_cashflow:pAICashFlow,ai_forecast:pAIForecast,coa:pCOA,openbal:pOpeningBalances,items:pItems,po:pPurchaseOrders,purchases:pPurchases,sales2:pSales2,stockrpt:pStockRpt,fixedassets:pFixedAssets,assetlocations:pAssetLocations,depreciation:pDepreciation,users:pUsers,fiscalyear:pFiscalYear,journal:pJournal,adjustops:pAdjustOps,receipt:pReceipt,payment:pPayment,trial:pTrial,gl:pGL,acctAnalysis:pAcctAnalysis,income:pIncome,balance:pBalance,equity:pEquity,workcap:pWorkCap,statement:pStatement,agingAR:pAgingAR,agingAP:pAgingAP,taxSales:pTaxSales,taxPurchases:pTaxPurchases,zakat:pZakat,budget:pBudget,budgetcmp:pBudgetCompare,mgmtdash:pMgmtDash,boarddash:pBoardDash,licadmin:pLicenseAdmin,customers:pCustomers,suppliers:pSuppliers,confirmbal:pConfirmBalance,settings:pSettings,backup:pBackup,costcenters:pCostCenters,ccreport:pCCReport,products:pProducts,mfgorders:pMfgOrders,mfgproduction:pMfgProductionReport,mfgvariance:pMfgVarianceReport,mfgprofitability:pMfgProfitabilityReport};
  // This used to be `if(view==='fixedassets'&&tFA){return pAssetDetail();}`,
  // returning pAssetDetail()'s HTML directly and skipping every line below —
  // including the sidebar/nav AND the `(modal?buildModal():'')` append at
@@ -2521,6 +2563,9 @@ var PERM_MODULES=[
  {k:'stockrpt',     l:'Stock Report',            actions:'v'},
  {k:'products',     l:'Products (Manufacturing)',actions:'vaed'},
  {k:'mfgorders',    l:'Manufacturing Orders',    actions:'vaed'},
+ {k:'mfgproduction',l:'Production Report',       actions:'v'},
+ {k:'mfgvariance',  l:'Cost Variance Report',    actions:'v'},
+ {k:'mfgprofitability',l:'Product Profitability',actions:'v'},
  {k:'fixedassets',  l:'Fixed Assets',            actions:'vaed'},
  {k:'costcenters',  l:'Cost Centers',            actions:'vaed'},
  {k:'ccreport',     l:'CC Report',               actions:'v'},
@@ -3828,6 +3873,55 @@ function mfgRawAccId(){
 function bomStdCost(bom){
  return (bom||[]).reduce(function(s,l){return s+(Number(l.qty)||0)*(Number(l.stdPrice)||0);},0);
 }
+// Full standard unit cost = material (BOM) + standard labor + standard
+// overhead. This is exactly what Finished Goods Receipt now moves out of
+// WIP per unit — see btnReceiveFG — so WIP only ever balances to zero on a
+// fully-completed order if ALL three components were actually debited into
+// it first (material via Issue Materials, labor+OH via btnApplyLaborOH).
+function productFullStdCost(p){
+ return bomStdCost(p?p.bom:null)+(Number(p&&p.stdLaborCostPerUnit)||0)+(Number(p&&p.stdOhCostPerUnit)||0);
+}
+// Whether this order still needs a Labor & Overhead application before FG
+// Receipt is allowed. Only true when the PRODUCT actually carries a
+// non-zero standard labor/OH rate — a product with both at 0 (the default,
+// and the only possibility for every Phase-1 product) behaves exactly as
+// before: Material Issue -> Finished Goods Receipt, no new step inserted.
+function mfgNeedsLaborOh(o,p){
+ return !!p&&((Number(p.stdLaborCostPerUnit)||0)>0||(Number(p.stdOhCostPerUnit)||0)>0)&&!o.laborOh;
+}
+// Accrued Salaries & Wages (2102-01) already exists in both the DEF seed
+// chart and the 138-account IFRS import — reused here rather than adding a
+// new manufacturing-only liability account, since crediting actual labor
+// cost to payroll is exactly what that account is for. Unlike
+// mfgWipAccId()/mfgFgAccId()/mfgRawAccId() above, this one returns null
+// (not a guessed fallback id) when truly not found, so btnApplyLaborOH can
+// refuse cleanly instead of silently posting to a phantom account id.
+function mfgPayrollAccId(){
+ var a=db.accounts.find(function(x){return x.id==='2102-01';});
+ if(a)return a.id;
+ var b=db.accounts.find(function(x){return x.name&&/accrued salar|salaries.*(payable|wages)|wages.*payable/i.test(x.name);});
+ return b?b.id:null;
+}
+function mfgOhAppliedAccId(){
+ var a=db.accounts.find(function(x){return x.id==='5103';});
+ if(a)return a.id;
+ var b=db.accounts.find(function(x){return x.name&&/factory overhead applied/i.test(x.name);});
+ return b?b.id:'5103';
+}
+function mfgScrapAccId(){
+ var a=db.accounts.find(function(x){return x.id==='5104';});
+ if(a)return a.id;
+ var b=db.accounts.find(function(x){return x.name&&/scrap|spoilage/i.test(x.name);});
+ return b?b.id:'5104';
+}
+// Total quantity already scrapped/spoiled on this order across every scrap
+// entry recorded so far (see btnRecordScrap) — used both to cap how much
+// more can be scrapped and to shrink the remaining receivable quantity on
+// Finished Goods Receipt, so qtyScrapped + qtyReceived never exceeds
+// qtyOrdered and WIP always closes to exactly zero on a fully-closed order.
+function mfgScrappedQty(o){
+ return (o.scraps||[]).reduce(function(s,x){return s+(Number(x.qty)||0);},0);
+}
 
 function pProducts(){
  var isAr=lang==='ar';
@@ -3841,6 +3935,8 @@ function pProducts(){
    +'<th>'+(isAr?'الكود':'Code')+'</th><th>'+(isAr?'الاسم':'Name')+'</th><th>'+(isAr?'الوحدة':'Unit')+'</th>'
    +'<th style="text-align:center">'+(isAr?'بنود BOM':'BOM Lines')+'</th>'
    +'<th class="tr">'+(isAr?'التكلفة المعيارية للمواد/وحدة':'Std Material Cost/Unit')+'</th>'
+   +'<th class="tr">'+(isAr?'عمالة+تكاليف صناعية/وحدة':'Labor+OH/Unit')+'</th>'
+   +'<th class="tr">'+(isAr?'إجمالي التكلفة المعيارية/وحدة':'Total Std Cost/Unit')+'</th>'
    +'<th style="width:70px"></th>'
    +'</tr></thead><tbody>';
   prods.forEach(function(p){
@@ -3848,6 +3944,8 @@ function pProducts(){
     +'<td>'+(p.unit||'pcs')+'</td>'
     +'<td style="text-align:center">'+(p.bom||[]).length+'</td>'
     +'<td class="tr mn">'+N(bomStdCost(p.bom))+'</td>'
+    +'<td class="tr mn">'+N((Number(p.stdLaborCostPerUnit)||0)+(Number(p.stdOhCostPerUnit)||0))+'</td>'
+    +'<td class="tr mn" style="font-weight:700">'+N(productFullStdCost(p))+'</td>'
     +'<td><div style="display:flex;gap:3px">'
     +'<button class="btn bsm bg0" data-viewproduct="'+p.id+'">'+ic('eye')+'</button>'
     +'<button class="btn bsm bg0 bdr" data-delproduct="'+p.id+'">'+ic('del')+'</button>'
@@ -3895,6 +3993,22 @@ function pProductDetail(){
   +btn_('bg0','addBomLine',ic('plus')+' '+(isAr?'إضافة مادة':'Add Material'))
   +'<div style="margin-top:10px;font-weight:700;font-size:15px">'+(isAr?'إجمالي التكلفة المعيارية للمواد / وحدة: ':'Total Std Material Cost / Unit: ')+'<span id="bomTotal" style="color:var(--gn)">'+N(bomStdCost(tBOM))+'</span></div>'
   +'<div style="margin-top:10px"><button class="btn bp" id="btnSaveBOM">'+ic('save')+' '+(isAr?'حفظ BOM':'Save BOM')+'</button></div>'
+  +'</div>';
+ // Labor & Factory Overhead: two flat standard rates per unit, entered
+ // directly here (not a routing/operations list — see the long comment at
+ // the top of the manufacturing module for why full Routing/Stages is out
+ // of scope for now). Left at 0/0, a product behaves exactly like a
+ // Phase-1 product: Material Issue -> Finished Goods Receipt, no extra
+ // step. As soon as either is > 0, pMfgOrderDetail() requires "Apply Labor
+ // & Overhead" on the order before it will allow Finished Goods Receipt —
+ // see mfgNeedsLaborOh().
+ h+='<div class="card" style="max-width:900px;margin-top:14px"><div class="ct">🏭 '+(isAr?'العمالة والتكاليف الصناعية (معدلات معيارية للوحدة)':'Labor & Factory Overhead (standard rates per unit)')+'</div>'
+  +'<div class="fr2">'
+  +fld(isAr?'التكلفة المعيارية للعمالة / وحدة':'Standard Labor Cost / Unit','<input type="number" id="prd-stdlabor" value="'+(p.stdLaborCostPerUnit||0)+'" min="0" step="0.01">')
+  +fld(isAr?'التكلفة المعيارية للتكاليف الصناعية / وحدة':'Standard Overhead Cost / Unit','<input type="number" id="prd-stdoh" value="'+(p.stdOhCostPerUnit||0)+'" min="0" step="0.01">')
+  +'</div>'
+  +'<div style="margin-top:6px"><button class="btn bp" id="btnSaveLaborOh">'+ic('save')+' '+(isAr?'حفظ':'Save')+'</button></div>'
+  +'<div style="margin-top:12px;font-weight:700;font-size:15px;border-top:1px solid var(--bd);padding-top:10px">'+(isAr?'إجمالي التكلفة المعيارية الكاملة / وحدة (مواد + عمالة + تكاليف صناعية): ':'Total Full Standard Cost / Unit (Material + Labor + Overhead): ')+'<span style="color:var(--gn)">'+N(productFullStdCost(p))+'</span></div>'
   +'</div>';
  return h+'</div>';
 }
@@ -3973,6 +4087,7 @@ function pMfgOrderDetail(){
   +'<div class="rr"><span>'+(isAr?'الكمية المطلوبة':'Qty Ordered')+'</span><span class="mn">'+N(o.qtyOrdered)+' '+(p?p.unit:'')+'</span></div>'
   +'<div class="rr"><span>'+(isAr?'التاريخ':'Date')+'</span><span>'+o.date+'</span></div>'
   +'<div class="rr"><span>'+(isAr?'التكلفة المعيارية للمواد/وحدة':'Std Material Cost/Unit')+'</span><span class="mn">'+N(p?bomStdCost(p.bom):0)+'</span></div>'
+  +'<div class="rr"><span>'+(isAr?'إجمالي التكلفة المعيارية الكاملة/وحدة':'Total Full Std Cost/Unit')+'</span><span class="mn" style="font-weight:700">'+N(p?productFullStdCost(p):0)+'</span></div>'
   +'</div>';
 
  h+='<div class="card" style="max-width:900px;margin-top:14px"><div class="ct">🔄 '+(isAr?'صرف المواد':'Material Issue')+'</div>';
@@ -4004,20 +4119,241 @@ function pMfgOrderDetail(){
  }
  h+='</div>';
 
+ // Labor & Overhead: only shown at all once materials are issued, and only
+ // when the product actually carries a non-zero standard labor/OH rate —
+ // a Phase-1-style product (both at 0, the default) skips straight from
+ // Material Issue to Finished Goods Receipt exactly as before.
+ var needsLO=p&&((Number(p.stdLaborCostPerUnit)||0)>0||(Number(p.stdOhCostPerUnit)||0)>0);
+ if(o.issue&&needsLO){
+  h+='<div class="card" style="max-width:900px;margin-top:14px"><div class="ct">🏭 '+(isAr?'العمالة والتكاليف الصناعية':'Labor & Factory Overhead')+'</div>';
+  if(o.laborOh){
+   h+='<div class="rr"><span>'+(isAr?'العمالة المعيارية':'Std Labor Cost')+'</span><span class="mn">'+N(o.laborOh.stdLaborCost)+'</span></div>'
+    +'<div class="rr"><span>'+(isAr?'العمالة الفعلية':'Actual Labor Cost')+'</span><span class="mn">'+N(o.laborOh.actualLaborCost)+'</span></div>'
+    +'<div class="rr"><span>'+(isAr?'التكاليف الصناعية المحملة':'Overhead Applied')+'</span><span class="mn">'+N(o.laborOh.stdOhCost)+'</span></div>'
+    +'<div class="rr"><span>'+(isAr?'قيد اليومية':'Journal Entry')+'</span><span><span class="tag">'+(o.laborOh.jeId||'—')+'</span></span></div>';
+  } else {
+   var stdLaborShow=(Number(p.stdLaborCostPerUnit)||0)*o.qtyOrdered;
+   var stdOhShow=(Number(p.stdOhCostPerUnit)||0)*o.qtyOrdered;
+   h+='<div class="rr"><span>'+(isAr?'العمالة المعيارية لهذا الأمر':'Std Labor Cost for this Order')+'</span><span class="mn">'+N(stdLaborShow)+'</span></div>'
+    +fld(isAr?'العمالة الفعلية المتكبدة *':'Actual Labor Cost Incurred *','<input type="number" id="mo-actlabor" value="'+stdLaborShow+'" min="0" step="0.01">')
+    +'<div class="rr"><span>'+(isAr?'التكاليف الصناعية المعيارية (تُحمَّل كما هي)':'Std Overhead to Apply (applied as-is)')+'</span><span class="mn">'+N(stdOhShow)+'</span></div>'
+    +'<div style="margin-top:10px"><button class="btn bp" id="btnApplyLaborOH">'+ic('save')+' '+(isAr?'تطبيق العمالة والتكاليف الصناعية':'Apply Labor & Overhead')+'</button></div>';
+  }
+  h+='</div>';
+ }
+
+ // Scrap/Spoilage: only offered once WIP is fully costed (materials issued,
+ // and labor/OH applied if the product needs it) — scrap is written off at
+ // the order's FULL standard unit cost, so that cost must already be sitting
+ // in WIP before any of it can be written back out. Recording scrap reduces
+ // the qty still receivable as good Finished Goods (see mfgScrappedQty()) —
+ // if scrap ever reaches the full order qty, the order closes on its own
+ // with no Finished Goods Receipt at all (see btnRecordScrap).
+ var wipReady=o.issue&&!mfgNeedsLaborOh(o,p);
+ var scrappedQty=mfgScrappedQty(o);
+ if(wipReady&&o.status!=='completed'){
+  h+='<div class="card" style="max-width:900px;margin-top:14px"><div class="ct">♻️ '+(isAr?'الهالك':'Scrap / Spoilage')+'</div>';
+  if(o.scraps&&o.scraps.length){
+   h+='<div class="tw"><table><thead><tr><th>'+(isAr?'التاريخ':'Date')+'</th><th class="tr">'+(isAr?'الكمية':'Qty')+'</th><th class="tr">'+(isAr?'تكلفة الوحدة':'Unit Cost')+'</th><th class="tr">'+(isAr?'القيمة':'Amount')+'</th><th>'+(isAr?'قيد اليومية':'JE')+'</th></tr></thead><tbody>';
+   o.scraps.forEach(function(s){
+    h+='<tr><td>'+s.date+'</td><td class="tr mn">'+N(s.qty)+'</td><td class="tr mn">'+N(s.unitCost)+'</td><td class="tr mn">'+N(s.amount)+'</td><td><span class="tag">'+(s.jeId||'—')+'</span></td></tr>';
+   });
+   h+='</tbody></table></div>';
+  }
+  var remainingForScrap=o.qtyOrdered-scrappedQty;
+  if(remainingForScrap>0.0001){
+   h+='<div style="margin-top:'+(o.scraps&&o.scraps.length?'10px':'0')+'">'
+    +fld(isAr?'كمية الهالك':'Scrap Qty','<input type="number" id="mo-scrapqty" min="0.001" max="'+remainingForScrap+'" step="0.001">')
+    +'<button class="btn bdr" id="btnRecordScrap">'+ic('save')+' '+(isAr?'تسجيل الهالك':'Record Scrap')+'</button></div>';
+  }
+  h+='</div>';
+ }
+
  h+='<div class="card" style="max-width:900px;margin-top:14px"><div class="ct">✅ '+(isAr?'استلام الإنتاج التام':'Finished Goods Receipt')+'</div>';
+ var remainingForFG=o.qtyOrdered-scrappedQty;
  if(o.receipt){
   h+='<div class="rr"><span>'+(isAr?'الكمية المستلمة':'Qty Completed')+'</span><span class="mn">'+N(o.receipt.qtyCompleted)+'</span></div>'
    +'<div class="rr"><span>'+(isAr?'تكلفة الوحدة':'Unit Cost')+'</span><span class="mn">'+N(o.receipt.unitStdCost)+'</span></div>'
    +'<div class="rr" style="border-top:2px solid var(--tx);margin-top:4px;padding-top:8px"><span style="font-weight:700">'+(isAr?'إجمالي القيمة':'Total Value')+'</span><span class="mn" style="font-weight:700">'+N(o.receipt.amount)+'</span></div>'
    +'<div class="rr"><span>'+(isAr?'قيد اليومية':'Journal Entry')+'</span><span><span class="tag">'+(o.receipt.jeId||'—')+'</span></span></div>';
- } else if(o.status==='issued'){
-  h+=fld(isAr?'الكمية المستلمة *':'Qty Completed *','<input type="number" id="fg-qty" value="'+o.qtyOrdered+'" min="0" max="'+o.qtyOrdered+'" step="0.001">')
+ } else if(o.status==='completed'){
+  h+='<div class="es">'+(isAr?'تم إهلاك كامل كمية هذا الأمر — لا يوجد إنتاج تام لاستلامه.':'This order\'s entire quantity was scrapped — there is no Finished Goods to receive.')+'</div>';
+ } else if(o.status==='issued'&&mfgNeedsLaborOh(o,p)){
+  h+='<div class="es">'+(isAr?'يجب تطبيق العمالة والتكاليف الصناعية أولاً (أعلاه).':'Labor & Overhead must be applied first (above).')+'</div>';
+ } else if(o.status==='issued'&&remainingForFG>0.0001){
+  h+=fld(isAr?'الكمية المستلمة *':'Qty Completed *','<input type="number" id="fg-qty" value="'+remainingForFG+'" min="0" max="'+remainingForFG+'" step="0.001">')
+   +(scrappedQty>0.0001?('<div class="hint">'+(isAr?'الحد الأقصى '+N(remainingForFG)+' بعد خصم '+N(scrappedQty)+' هالك.':'Capped at '+N(remainingForFG)+' after '+N(scrappedQty)+' already scrapped.')+'</div>'):'')
    +'<div style="margin-top:10px"><button class="btn bp" id="btnReceiveFG">'+ic('save')+' '+(isAr?'استلام الإنتاج وترحيل القيد':'Receive & Post Journal')+'</button></div>';
+ } else if(o.status==='issued'){
+  h+='<div class="es">'+(isAr?'تم إهلاك كامل كمية هذا الأمر — لا يوجد إنتاج تام لاستلامه.':'This order\'s entire quantity was scrapped — there is no Finished Goods to receive.')+'</div>';
  } else {
   h+='<div class="es">'+(isAr?'يجب صرف المواد أولاً.':'Materials must be issued first.')+'</div>';
  }
  h+='</div>';
 
+ return h+'</div>';
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Manufacturing Phase 3 — Reports. All three are read-only, derived purely
+// from data the earlier phases already wrote (db.mfgOrders, db.journals,
+// db.salesInvoices2) — no new fields are written by this section.
+// ═══════════════════════════════════════════════════════════════════════
+
+// Net (dr-cr) amount posted to accId within a single journal — 0 if that
+// account never appears in it. Used to pull a variance's signed amount back
+// out of the journal Issue Materials / Apply Labor & Overhead already
+// posted, rather than recomputing it (recomputing would silently drift from
+// the actual GL posting if either of those ever changes independently).
+function jeAccNet(je,accId){
+ if(!je)return 0;
+ return (je.lines||[]).reduce(function(s,l){return l.acc===accId?s+(l.dr||0)-(l.cr||0):s;},0);
+}
+function jeById(id){return (db.journals||[]).find(function(j){return j.id===id;});}
+
+function pMfgProductionReport(){
+ var isAr=lang==='ar';
+ var h=tb(isAr?'📑 تقرير الإنتاج':'📑 Production Report','');
+ h+='<div class="pg">';
+ var orders=(db.mfgOrders||[]).slice().reverse();
+ var totCompleted=orders.filter(function(o){return o.status==='completed';}).length;
+ var totInProgress=orders.length-totCompleted;
+ var totQtyCompleted=orders.reduce(function(s,o){return s+(o.receipt?o.receipt.qtyCompleted:0);},0);
+ var totValueProduced=orders.reduce(function(s,o){return s+(o.receipt?o.receipt.amount:0);},0);
+ var totScrapValue=orders.reduce(function(s,o){return s+(o.scraps||[]).reduce(function(s2,x){return s2+x.amount;},0);},0);
+ h+='<div class="mets">'
+  +'<div class="met"><div class="mlab">'+(isAr?'إجمالي الأوامر':'Total Orders')+'</div><div class="mv">'+orders.length+'</div></div>'
+  +'<div class="met"><div class="mlab">'+(isAr?'مكتملة':'Completed')+'</div><div class="mv pos">'+totCompleted+'</div></div>'
+  +'<div class="met"><div class="mlab">'+(isAr?'قيد التنفيذ':'In Progress')+'</div><div class="mv">'+totInProgress+'</div></div>'
+  +'<div class="met"><div class="mlab">'+(isAr?'إجمالي قيمة الإنتاج التام':'Total FG Value Produced')+'</div><div class="mv mn">'+N(totValueProduced)+'</div></div>'
+  +'<div class="met"><div class="mlab">'+(isAr?'إجمالي قيمة الهالك':'Total Scrap Value')+'</div><div class="mv mn neg">'+N(totScrapValue)+'</div></div>'
+  +'</div>';
+ if(!orders.length){h+='<div class="es">'+(isAr?'لا توجد أوامر تصنيع بعد.':'No manufacturing orders yet.')+'</div>';}
+ else{
+  var statusLbl={draft:isAr?'مسودة':'Draft',issued:isAr?'قيد التنفيذ':'In Progress',completed:isAr?'مكتمل':'Completed'};
+  h+='<div class="card"><div class="tw"><table><thead><tr>'
+   +'<th>'+(isAr?'رقم الأمر':'Order #')+'</th><th>'+(isAr?'المنتج':'Product')+'</th><th>'+(isAr?'التاريخ':'Date')+'</th>'
+   +'<th class="tr">'+(isAr?'مطلوبة':'Ordered')+'</th><th class="tr">'+(isAr?'هالك':'Scrapped')+'</th><th class="tr">'+(isAr?'مستلمة':'Completed')+'</th>'
+   +'<th class="tr">'+(isAr?'تكلفة الوحدة':'Unit Cost')+'</th><th class="tr">'+(isAr?'قيمة الإنتاج':'Value Produced')+'</th><th>'+(isAr?'الحالة':'Status')+'</th>'
+   +'</tr></thead><tbody>';
+  orders.forEach(function(o){
+   var p=productById(o.productId);
+   var scrapQ=mfgScrappedQty(o);
+   h+='<tr><td><span class="tag" style="cursor:pointer" data-viewmo="'+o.id+'">'+o.id+'</span></td>'
+    +'<td>'+(p?(isAr&&p.nameAr?p.nameAr:p.name):o.productId)+'</td>'
+    +'<td>'+o.date+'</td>'
+    +'<td class="tr mn">'+N(o.qtyOrdered)+'</td>'
+    +'<td class="tr mn" style="color:'+(scrapQ>0?'var(--rd)':'var(--t2)')+'">'+N(scrapQ)+'</td>'
+    +'<td class="tr mn">'+N(o.receipt?o.receipt.qtyCompleted:0)+'</td>'
+    +'<td class="tr mn">'+N(o.receipt?o.receipt.unitStdCost:(p?productFullStdCost(p):0))+'</td>'
+    +'<td class="tr mn">'+N(o.receipt?o.receipt.amount:0)+'</td>'
+    +'<td><span class="b '+(o.status==='completed'?'bgn':'bam')+'">'+(statusLbl[o.status]||o.status)+'</span></td>'
+    +'</tr>';
+  });
+  h+='</tbody></table></div></div>';
+ }
+ return h+'</div>';
+}
+
+function pMfgVarianceReport(){
+ var isAr=lang==='ar';
+ var h=tb(isAr?'📈 تقرير انحرافات التكلفة':'📈 Cost Variance Report','');
+ h+='<div class="pg">';
+ h+='<div class="hint" style="margin-bottom:10px">'+(isAr?'دائن (مفضّل) يعني توفيرًا عن المعيار، ومدين (غير مفضّل) يعني تجاوزًا للمعيار. القيم مأخوذة مباشرة من القيود الفعلية المُرحّلة.':'Credit (favorable) means better than standard; debit (unfavorable) means worse than standard. Figures are pulled directly from the actual posted journals.')+'</div>';
+ var orders=(db.mfgOrders||[]).filter(function(o){return o.issue;}).slice().reverse();
+ var rows=orders.map(function(o){
+  var p=productById(o.productId);
+  var issueJe=jeById(o.issue.jeId);
+  var laborJe=o.laborOh?jeById(o.laborOh.jeId):null;
+  var priceVar=jeAccNet(issueJe,'5102-01');
+  var usageVar=jeAccNet(issueJe,'5102-02');
+  var laborVar=jeAccNet(laborJe,'5102-03');
+  return {o:o,p:p,priceVar:priceVar,usageVar:usageVar,laborVar:laborVar,total:priceVar+usageVar+laborVar};
+ });
+ var gp=rows.reduce(function(s,r){return s+r.priceVar;},0);
+ var gu=rows.reduce(function(s,r){return s+r.usageVar;},0);
+ var gl=rows.reduce(function(s,r){return s+r.laborVar;},0);
+ h+='<div class="mets">'
+  +'<div class="met"><div class="mlab">'+(isAr?'انحراف سعر المواد':'Material Price Var.')+'</div><div class="mv mn" style="color:'+(gp>0.01?'var(--rd)':(gp<-0.01?'var(--gn)':'var(--t2)'))+'">'+N(gp)+'</div></div>'
+  +'<div class="met"><div class="mlab">'+(isAr?'انحراف كمية المواد':'Material Usage Var.')+'</div><div class="mv mn" style="color:'+(gu>0.01?'var(--rd)':(gu<-0.01?'var(--gn)':'var(--t2)'))+'">'+N(gu)+'</div></div>'
+  +'<div class="met"><div class="mlab">'+(isAr?'انحراف العمالة':'Labor Var.')+'</div><div class="mv mn" style="color:'+(gl>0.01?'var(--rd)':(gl<-0.01?'var(--gn)':'var(--t2)'))+'">'+N(gl)+'</div></div>'
+  +'<div class="met"><div class="mlab">'+(isAr?'إجمالي الانحراف':'Total Variance')+'</div><div class="mv mn" style="color:'+((gp+gu+gl)>0.01?'var(--rd)':((gp+gu+gl)<-0.01?'var(--gn)':'var(--t2)'))+'">'+N(gp+gu+gl)+'</div></div>'
+  +'</div>';
+ if(!rows.length){h+='<div class="es">'+(isAr?'لا توجد عمليات صرف مواد بعد.':'No materials have been issued yet.')+'</div>';}
+ else{
+  h+='<div class="card"><div class="tw"><table><thead><tr>'
+   +'<th>'+(isAr?'رقم الأمر':'Order #')+'</th><th>'+(isAr?'المنتج':'Product')+'</th><th>'+(isAr?'التاريخ':'Date')+'</th>'
+   +'<th class="tr">'+(isAr?'انحراف سعر المواد':'Material Price')+'</th><th class="tr">'+(isAr?'انحراف كمية المواد':'Material Usage')+'</th>'
+   +'<th class="tr">'+(isAr?'انحراف العمالة':'Labor')+'</th><th class="tr">'+(isAr?'الإجمالي':'Total')+'</th>'
+   +'</tr></thead><tbody>';
+  var vc=function(v){return v>0.01?'var(--rd)':(v<-0.01?'var(--gn)':'var(--t2)');};
+  rows.forEach(function(r){
+   h+='<tr><td><span class="tag" style="cursor:pointer" data-viewmo="'+r.o.id+'">'+r.o.id+'</span></td>'
+    +'<td>'+(r.p?(isAr&&r.p.nameAr?r.p.nameAr:r.p.name):r.o.productId)+'</td>'
+    +'<td>'+r.o.date+'</td>'
+    +'<td class="tr mn" style="color:'+vc(r.priceVar)+'">'+N(r.priceVar)+'</td>'
+    +'<td class="tr mn" style="color:'+vc(r.usageVar)+'">'+N(r.usageVar)+'</td>'
+    +'<td class="tr mn" style="color:'+vc(r.laborVar)+'">'+N(r.laborVar)+'</td>'
+    +'<td class="tr mn" style="font-weight:700;color:'+vc(r.total)+'">'+N(r.total)+'</td>'
+    +'</tr>';
+  });
+  h+='</tbody></table></div></div>';
+ }
+ return h+'</div>';
+}
+
+function pMfgProfitabilityReport(){
+ var isAr=lang==='ar';
+ var h=tb(isAr?'📊 تقرير ربحية المنتج':'📊 Product Profitability Report','');
+ h+='<div class="pg">';
+ h+='<div class="hint" style="margin-bottom:10px">'+(isAr?'تكلفة البضاعة المباعة هنا مبنية على التكلفة المعيارية الحالية للمنتج (مواد + عمالة + تكاليف صناعية)، وليست بالضرورة نفس التكلفة الفعلية المرحلة في فواتير المبيعات.':'Cost of goods sold here uses the product\'s CURRENT standard cost (material + labor + overhead), which may differ from the actual cost posted on individual sales invoices.')+'</div>';
+ var prods=db.products||[];
+ var rows=prods.map(function(p){
+  var qtySold=0,revenue=0;
+  (db.salesInvoices2||[]).forEach(function(si){
+   if(!si.posted)return;
+   var sign=si.type==='return'?-1:1;
+   (si.lines||[]).forEach(function(l){
+    if(l.itemId!==p.id)return;
+    qtySold+=sign*(l.qty||0);
+    revenue+=sign*(l.qty||0)*(l.price||0);
+   });
+  });
+  var stdCost=productFullStdCost(p);
+  var cogs=qtySold*stdCost;
+  var margin=revenue-cogs;
+  var qtyProduced=(db.mfgOrders||[]).filter(function(o){return o.productId===p.id&&o.receipt;}).reduce(function(s,o){return s+o.receipt.qtyCompleted;},0);
+  var stockItem=itemById(p.fgItemId);
+  return {p:p,qtySold:qtySold,revenue:revenue,cogs:cogs,margin:margin,marginPct:revenue>0.001?(margin/revenue*100):0,qtyProduced:qtyProduced,stockQty:stockItem?stockItem.qty||0:0,stockVal:stockItem?(stockItem.qty||0)*(stockItem.avgCost||0):0};
+ });
+ var totRev=rows.reduce(function(s,r){return s+r.revenue;},0);
+ var totCogs=rows.reduce(function(s,r){return s+r.cogs;},0);
+ var totMargin=totRev-totCogs;
+ h+='<div class="mets">'
+  +'<div class="met"><div class="mlab">'+(isAr?'إجمالي الإيرادات':'Total Revenue')+'</div><div class="mv mn">'+N(totRev)+'</div></div>'
+  +'<div class="met"><div class="mlab">'+(isAr?'تكلفة البضاعة المباعة (معيارية)':'Std COGS')+'</div><div class="mv mn">'+N(totCogs)+'</div></div>'
+  +'<div class="met"><div class="mlab">'+(isAr?'إجمالي هامش الربح':'Total Gross Margin')+'</div><div class="mv mn '+(totMargin>=0?'pos':'neg')+'">'+N(totMargin)+'</div></div>'
+  +'</div>';
+ if(!prods.length){h+='<div class="es">'+(isAr?'لا توجد منتجات بعد.':'No products yet.')+'</div>';}
+ else{
+  h+='<div class="card"><div class="tw"><table><thead><tr>'
+   +'<th>'+(isAr?'المنتج':'Product')+'</th><th class="tr">'+(isAr?'كمية منتجة':'Qty Produced')+'</th><th class="tr">'+(isAr?'كمية مباعة':'Qty Sold')+'</th>'
+   +'<th class="tr">'+(isAr?'المخزون الحالي':'Current Stock')+'</th><th class="tr">'+(isAr?'الإيرادات':'Revenue')+'</th>'
+   +'<th class="tr">'+(isAr?'ت. البضاعة المباعة':'Std COGS')+'</th><th class="tr">'+(isAr?'هامش الربح':'Gross Margin')+'</th><th class="tr">'+(isAr?'الهامش %':'Margin %')+'</th>'
+   +'</tr></thead><tbody>';
+  rows.forEach(function(r){
+   h+='<tr><td style="font-weight:500">'+(isAr&&r.p.nameAr?r.p.nameAr:r.p.name)+' <span class="tag">'+r.p.id+'</span></td>'
+    +'<td class="tr mn">'+N(r.qtyProduced)+'</td>'
+    +'<td class="tr mn">'+N(r.qtySold)+'</td>'
+    +'<td class="tr mn">'+N(r.stockQty)+' <span style="color:var(--t2);font-size:11px">('+N(r.stockVal)+')</span></td>'
+    +'<td class="tr mn">'+N(r.revenue)+'</td>'
+    +'<td class="tr mn">'+N(r.cogs)+'</td>'
+    +'<td class="tr mn" style="font-weight:700;color:'+(r.margin>=0?'var(--gn)':'var(--rd)')+'">'+N(r.margin)+'</td>'
+    +'<td class="tr mn">'+N(r.marginPct)+'%</td>'
+    +'</tr>';
+  });
+  h+='</tbody></table></div></div>';
+ }
  return h+'</div>';
 }
 
@@ -10946,6 +11282,14 @@ function bindEvents(){
   save();render();
   alert(isArB?'✅ تم حفظ قائمة المواد (BOM)':'✅ BOM saved');
  });
+ on1('btnSaveLaborOh','click',function(){
+  var p2=productById(tProductView);if(!p2)return;
+  var lb=Number((document.getElementById('prd-stdlabor')||{}).value)||0;
+  var oh=Number((document.getElementById('prd-stdoh')||{}).value)||0;
+  p2.stdLaborCostPerUnit=lb<0?0:lb;
+  p2.stdOhCostPerUnit=oh<0?0:oh;
+  save();render();
+ });
 
  // ── Manufacturing: Orders / Material Issue / FG Receipt ───────
  on('[data-viewmo]','click',function(el){tMfgOrderView=el.dataset.viewmo;view='mfgorders';render();});
@@ -10959,7 +11303,7 @@ function bindEvents(){
   var fyErrMO=fyDateCheck(date);if(fyErrMO){alert(fyErrMO);return;}
   var id=nextMfgOrderId();
   if(!db.mfgOrders)db.mfgOrders=[];
-  db.mfgOrders.push({id:id,productId:pid,qtyOrdered:qty,date:date,status:'draft',issue:null,receipt:null,createdAt:today()});
+  db.mfgOrders.push({id:id,productId:pid,qtyOrdered:qty,date:date,status:'draft',issue:null,receipt:null,laborOh:null,createdAt:today()});
   modal=null;save();
   tMfgOrderView=id;view='mfgorders';render();
  });
@@ -11019,15 +11363,82 @@ function bindEvents(){
   o.status='issued';
   save();render();
  });
+ // Labor & Overhead application — only reachable once materials are issued
+ // (o.status==='issued') and only shown at all when the product carries a
+ // non-zero standard labor/OH rate (see mfgNeedsLaborOh()). Mirrors the
+ // Material Issue variance pattern: standard cost always goes to WIP, the
+ // ACTUAL labor cost (entered here, defaulting to standard) is compared
+ // against standard for a single Labor Variance, and overhead is applied at
+ // its standard rate only (see the long comment on the 5103 backfill above
+ // for why overhead has no actual-vs-applied variance yet).
+ on1('btnApplyLaborOH','click',function(){
+  var isArL=lang==='ar';
+  var o=mfgOrderById(tMfgOrderView);if(!o)return;
+  var p=productById(o.productId);if(!p)return;
+  var fyErrL=fyDateCheck(o.date);if(fyErrL){alert(fyErrL);return;}
+  var stdLabor=(Number(p.stdLaborCostPerUnit)||0)*o.qtyOrdered;
+  var stdOh=(Number(p.stdOhCostPerUnit)||0)*o.qtyOrdered;
+  var actualLabor=Number((document.getElementById('mo-actlabor')||{}).value);
+  if(isNaN(actualLabor)||actualLabor<0){alert(isArL?'أدخل تكلفة عمالة فعلية صحيحة':'Enter a valid actual labor cost');return;}
+  var payrollAcc=mfgPayrollAccId();
+  if(!payrollAcc){alert(isArL?'لم يتم العثور على حساب "رواتب وأجور مستحقة" في دليل الحسابات.':'Could not find an "Accrued Salaries & Wages" account in the Chart of Accounts.');return;}
+  var ohAcc=mfgOhAppliedAccId();
+  var jeLines=[];
+  var wipTotal=stdLabor+stdOh;
+  if(wipTotal>0)jeLines.push({acc:mfgWipAccId(),dr:wipTotal,cr:0});
+  var laborVar=actualLabor-stdLabor;
+  if(Math.abs(laborVar)>0.01){
+   if(laborVar>0)jeLines.push({acc:'5102-03',dr:laborVar,cr:0});
+   else jeLines.push({acc:'5102-03',dr:0,cr:-laborVar});
+  }
+  if(actualLabor>0)jeLines.push({acc:payrollAcc,dr:0,cr:actualLabor});
+  if(stdOh>0)jeLines.push({acc:ohAcc,dr:0,cr:stdOh});
+  if(!jeLines.length){alert(isArL?'لا توجد تكلفة عمالة أو تكاليف صناعية لتطبيقها.':'No labor or overhead cost to apply.');return;}
+  var je={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:o.date,desc:(isArL?'عمالة وتكاليف صناعية لأمر تصنيع ':'Labor & overhead for MO ')+o.id,lines:jeLines};
+  db.journals.push(je);
+  o.laborOh={date:o.date,stdLaborCost:stdLabor,actualLaborCost:actualLabor,stdOhCost:stdOh,jeId:je.id};
+  save();render();
+ });
+ // Scrap: written off at the order's own full standard unit cost (material+
+ // labor+OH), straight from WIP to the dedicated Scrap & Spoilage Expense
+ // account — see the 5104 backfill comment for why it's a separate line
+ // from the Phase-2 variance accounts. If this scrap entry consumes the
+ // entire remaining order qty, the order closes immediately with no
+ // Finished Goods Receipt (there is nothing good left to receive) — see
+ // mfgScrappedQty() and the "order fully scrapped" message on the page.
+ on1('btnRecordScrap','click',function(){
+  var isArS=lang==='ar';
+  var o=mfgOrderById(tMfgOrderView);if(!o)return;
+  var p=productById(o.productId);if(!p)return;
+  if(mfgNeedsLaborOh(o,p)){alert(isArS?'يجب تطبيق العمالة والتكاليف الصناعية أولاً.':'Labor & Overhead must be applied first.');return;}
+  var fyErrS=fyDateCheck(o.date);if(fyErrS){alert(fyErrS);return;}
+  var scrapQty=Number((document.getElementById('mo-scrapqty')||{}).value)||0;
+  if(scrapQty<=0){alert(isArS?'أدخل كمية هالك صحيحة':'Enter a valid scrap quantity');return;}
+  var already=mfgScrappedQty(o);
+  var remaining=o.qtyOrdered-already;
+  if(scrapQty>remaining+0.0001){alert(isArS?'لا يمكن تسجيل هالك أكثر من الكمية المتبقية من الأمر.':'Cannot scrap more than the order\'s remaining quantity.');return;}
+  var unitCost=productFullStdCost(p);
+  var amount=scrapQty*unitCost;
+  if(amount<=0){alert(isArS?'لا يمكن تسجيل هالك بتكلفة صفرية.':'Cannot record scrap at zero cost.');return;}
+  var jeLines=[{acc:mfgScrapAccId(),dr:amount,cr:0},{acc:mfgWipAccId(),dr:0,cr:amount}];
+  var je={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:o.date,desc:(isArS?'هالك لأمر تصنيع ':'Scrap for MO ')+o.id,lines:jeLines};
+  db.journals.push(je);
+  if(!o.scraps)o.scraps=[];
+  o.scraps.push({date:o.date,qty:scrapQty,unitCost:unitCost,amount:amount,jeId:je.id});
+  if(already+scrapQty>=o.qtyOrdered-0.0001&&!o.receipt)o.status='completed';
+  save();render();
+ });
  on1('btnReceiveFG','click',function(){
   var isArR=lang==='ar';
   var o=mfgOrderById(tMfgOrderView);if(!o)return;
   var p=productById(o.productId);if(!p)return;
+  if(mfgNeedsLaborOh(o,p)){alert(isArR?'يجب تطبيق العمالة والتكاليف الصناعية أولاً.':'Labor & Overhead must be applied first.');return;}
+  var remainingFG=o.qtyOrdered-mfgScrappedQty(o);
   var qtyC=Number((document.getElementById('fg-qty')||{}).value)||0;
   if(qtyC<=0){alert(isArR?'أدخل كمية صحيحة':'Enter a valid quantity');return;}
-  if(qtyC>o.qtyOrdered+0.0001){alert(isArR?'لا يمكن استلام أكثر من الكمية المطلوبة':'Cannot receive more than the ordered quantity');return;}
+  if(qtyC>remainingFG+0.0001){alert(isArR?'لا يمكن استلام أكثر من الكمية المتبقية من الأمر (بعد خصم الهالك).':'Cannot receive more than the order\'s remaining quantity (after scrap).');return;}
   var fyErrR=fyDateCheck(o.date);if(fyErrR){alert(fyErrR);return;}
-  var unitCost=bomStdCost(p.bom);
+  var unitCost=productFullStdCost(p);
   var amount=qtyC*unitCost;
   if(amount<=0){alert(isArR?'لا يمكن استلام الإنتاج بتكلفة صفرية — تأكد من BOM.':'Cannot receive at zero cost — check the BOM.');return;}
   var jeLines=[{acc:p.fgAccId||mfgFgAccId(),dr:amount,cr:0},{acc:mfgWipAccId(),dr:0,cr:amount}];
