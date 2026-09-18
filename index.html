@@ -404,7 +404,24 @@ function normalizeDB(d){
  if(!d.fiscalYears)d.fiscalYears=[];
  if(!d.budgets)d.budgets=[];
  if(!d.salesInvoices2)d.salesInvoices2=[];
- d.items.forEach(function(it){if(it.qty===undefined)it.qty=0;if(it.avgCost===undefined)it.avgCost=0;});
+ d.items.forEach(function(it){if(it.qty===undefined)it.qty=0;if(it.avgCost===undefined)it.avgCost=0;if(!it.matType)it.matType='other';});
+ // ── Manufacturing module (see pProducts()/pMfgOrders()) ─────────────────
+ // Backward-compatible for every existing company: an old company simply
+ // has empty products/mfgOrders lists and never sees any manufacturing UI
+ // difference until it actually creates a product, exactly like every
+ // other module added this session (fiscalYears, opening balances, ...).
+ if(!d.products)d.products=[];
+ if(!d.mfgOrders)d.mfgOrders=[];
+ // Standard-costing variance accounts the Material Issue journal posts to
+ // (see mfgIssueMaterials()) — added once to EVERY company's chart here so
+ // an old company gets them automatically the same way fiscalYears/opening
+ // balances were backfilled, without disturbing anything else in its COA.
+ if(!d.accounts.some(function(a){return a.id==='5102';})){
+  var cogsParent=d.accounts.find(function(a){return a.id==='51';});
+  d.accounts.push({id:'5102',name:'Manufacturing Cost Variances',nameAr:'انحرافات تكلفة التصنيع',type:'Expense',normal:'Debit',bal:0,isMain:true,pid:cogsParent?'51':undefined});
+  d.accounts.push({id:'5102-01',name:'Material Price Variance',nameAr:'انحراف سعر المواد',type:'Expense',normal:'Debit',bal:0,isMain:false,pid:'5102'});
+  d.accounts.push({id:'5102-02',name:'Material Usage Variance',nameAr:'انحراف كمية المواد',type:'Expense',normal:'Debit',bal:0,isMain:false,pid:'5102'});
+ }
  if(!d.fixedAssets)d.fixedAssets=[];
  if(!d.assetLocations)d.assetLocations=[{id:'LOC001',name:'Head Office'},{id:'LOC002',name:'Branch 1'}];
  if(!d.assetTransactions)d.assetTransactions=[];
@@ -2329,6 +2346,11 @@ function buildLayout(){
   {k:'sales2',      i:'rcpt',  l:isAr?'فواتير المبيعات':'Sales'},
   {k:'stockrpt',    i:'trend', l:isAr?'تقرير المخزون':'Stock Report'},
 
+  // ── Manufacturing ────────────────────────────────────────────
+  {sec:isAr?'🏭 التصنيع':'🏭 Manufacturing'},
+  {k:'products',    i:'list',  l:(isAr?'المنتجات':'Products')+' ('+(db.products||[]).length+')'},
+  {k:'mfgorders',   i:'doc',   l:(isAr?'أوامر التصنيع':'Manufacturing Orders')+' ('+(db.mfgOrders||[]).length+')'},
+
   // ── Fixed Assets ───────────────────────────────────────────
   {sec:isAr?'🏭 الأصول الثابتة':'🏭 Fixed Assets'},
   {k:'fixedassets',    i:'bank',  l:(isAr?'الأصول':'Assets')+' ('+db.fixedAssets.length+')'},
@@ -2418,7 +2440,7 @@ function buildLayout(){
    }
   });
   if(currentSec!==null)nav+='</div>';
- var pages={dashboard:pDashboard,training:pTraining,ai_settings:pAISettings,ai_bank:pAIBank,ai_analysis:pAIAnalysis,ai_cashflow:pAICashFlow,ai_forecast:pAIForecast,coa:pCOA,openbal:pOpeningBalances,items:pItems,po:pPurchaseOrders,purchases:pPurchases,sales2:pSales2,stockrpt:pStockRpt,fixedassets:pFixedAssets,assetlocations:pAssetLocations,depreciation:pDepreciation,users:pUsers,fiscalyear:pFiscalYear,journal:pJournal,adjustops:pAdjustOps,receipt:pReceipt,payment:pPayment,trial:pTrial,gl:pGL,acctAnalysis:pAcctAnalysis,income:pIncome,balance:pBalance,equity:pEquity,workcap:pWorkCap,statement:pStatement,agingAR:pAgingAR,agingAP:pAgingAP,taxSales:pTaxSales,taxPurchases:pTaxPurchases,zakat:pZakat,budget:pBudget,budgetcmp:pBudgetCompare,mgmtdash:pMgmtDash,boarddash:pBoardDash,licadmin:pLicenseAdmin,customers:pCustomers,suppliers:pSuppliers,confirmbal:pConfirmBalance,settings:pSettings,backup:pBackup,costcenters:pCostCenters,ccreport:pCCReport};
+ var pages={dashboard:pDashboard,training:pTraining,ai_settings:pAISettings,ai_bank:pAIBank,ai_analysis:pAIAnalysis,ai_cashflow:pAICashFlow,ai_forecast:pAIForecast,coa:pCOA,openbal:pOpeningBalances,items:pItems,po:pPurchaseOrders,purchases:pPurchases,sales2:pSales2,stockrpt:pStockRpt,fixedassets:pFixedAssets,assetlocations:pAssetLocations,depreciation:pDepreciation,users:pUsers,fiscalyear:pFiscalYear,journal:pJournal,adjustops:pAdjustOps,receipt:pReceipt,payment:pPayment,trial:pTrial,gl:pGL,acctAnalysis:pAcctAnalysis,income:pIncome,balance:pBalance,equity:pEquity,workcap:pWorkCap,statement:pStatement,agingAR:pAgingAR,agingAP:pAgingAP,taxSales:pTaxSales,taxPurchases:pTaxPurchases,zakat:pZakat,budget:pBudget,budgetcmp:pBudgetCompare,mgmtdash:pMgmtDash,boarddash:pBoardDash,licadmin:pLicenseAdmin,customers:pCustomers,suppliers:pSuppliers,confirmbal:pConfirmBalance,settings:pSettings,backup:pBackup,costcenters:pCostCenters,ccreport:pCCReport,products:pProducts,mfgorders:pMfgOrders};
  // This used to be `if(view==='fixedassets'&&tFA){return pAssetDetail();}`,
  // returning pAssetDetail()'s HTML directly and skipping every line below —
  // including the sidebar/nav AND the `(modal?buildModal():'')` append at
@@ -2428,7 +2450,10 @@ function buildLayout(){
  // Transaction" (Depreciation/Disposal/Addition/Maintenance) silently did
  // nothing no matter what was clicked, since the modal HTML was computed
  // correctly but never had anywhere left in the returned markup to attach.
- var fn=(view==='fixedassets'&&tFA)?pAssetDetail:(pages[view]||pDashboard);
+ var fn=(view==='fixedassets'&&tFA)?pAssetDetail
+  :(view==='products'&&tProductView)?pProductDetail
+  :(view==='mfgorders'&&tMfgOrderView)?pMfgOrderDetail
+  :(pages[view]||pDashboard);
  var isAr=lang==='ar';
  var sbLogoSVG='<svg width="38" height="38" viewBox="0 0 80 80" xmlns="http://www.w3.org/2000/svg"><rect width="80" height="80" rx="16" fill="rgba(255,255,255,0.15)"/><rect x="38" y="16" width="4" height="50" rx="2" fill="white"/><rect x="12" y="16" width="56" height="4" rx="2" fill="white"/><line x1="20" y1="20" x2="20" y2="46" stroke="white" stroke-width="2"/><line x1="60" y1="20" x2="60" y2="36" stroke="#FFD700" stroke-width="2"/><rect x="10" y="46" width="20" height="4" rx="2" fill="rgba(255,255,255,0.85)"/><rect x="50" y="36" width="20" height="4" rx="2" fill="#FFD700"/><rect x="13" y="36" width="4" height="10" rx="1" fill="rgba(255,255,255,0.5)"/><rect x="18" y="32" width="4" height="14" rx="1" fill="rgba(255,255,255,0.7)"/><rect x="23" y="28" width="4" height="18" rx="1" fill="white"/><circle cx="55" cy="28" r="3" fill="#FFD700"/><circle cx="63" cy="28" r="3" fill="#FFD700"/><circle cx="59" cy="22" r="3" fill="#FFD700"/><line x1="55" y1="28" x2="63" y2="28" stroke="#FFD700" stroke-width="1.5"/><line x1="55" y1="28" x2="59" y2="22" stroke="#FFD700" stroke-width="1.5"/><line x1="63" y1="28" x2="59" y2="22" stroke="#FFD700" stroke-width="1.5"/><polyline points="26,24 30,18 34,24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>';
  var sbBrand=isAr?'<span style="font-weight:800">\u0623\u0643\u0627\u0648\u0646\u062a</span><span style="font-weight:300;opacity:.8">\u0628\u0631\u0648</span>':'<span style="font-weight:800">Account</span><span style="font-weight:300;opacity:.8">Pro</span>';
@@ -2494,6 +2519,8 @@ var PERM_MODULES=[
  {k:'purchases',    l:'Purchases',               actions:'vaed'},
  {k:'sales2',       l:'Sales',                   actions:'vaed'},
  {k:'stockrpt',     l:'Stock Report',            actions:'v'},
+ {k:'products',     l:'Products (Manufacturing)',actions:'vaed'},
+ {k:'mfgorders',    l:'Manufacturing Orders',    actions:'vaed'},
  {k:'fixedassets',  l:'Fixed Assets',            actions:'vaed'},
  {k:'costcenters',  l:'Cost Centers',            actions:'vaed'},
  {k:'ccreport',     l:'CC Report',               actions:'v'},
@@ -3690,7 +3717,14 @@ function accSearchFld(labelText, inputId, currentId, accList){
 
 function mItem(){
  var it=tItem,isNew=!it.editId;
+ var isAr9b=lang==='ar';
  var units=['pcs','kg','ton','ltr','box','carton','set','pair','m','m2','m3'];
+ // matType feeds the Manufacturing module's material pickers (BOM lines only
+ // offer 'raw' items — see pProduct()) and its auto-created finished-good
+ // items (matType:'finished', see mSaveProduct()). Every item created before
+ // this existed defaults to 'other' (normalizeDB()) and behaves exactly as
+ // before — this is purely additive.
+ var matTypes=[['other',isAr9b?'عام / أخرى':'General / Other'],['raw',isAr9b?'مادة خام':'Raw Material'],['finished',isAr9b?'منتج تام':'Finished Good']];
  var body='<div class="fr2">'
   +fld('Item Code *','<input id="it-id" value="'+(it.id||nextItemId())+'">')
   +fld('Item Name *','<input id="it-name" value="'+(it.name||'')+'">')
@@ -3701,11 +3735,290 @@ function mItem(){
   +fld('Sale Price','<input type="number" id="it-sp" value="'+(it.salePrice||0)+'" min="0" step="0.01">')
   +fld('Reorder Qty','<input type="number" id="it-rq" value="'+(it.reorderQty||0)+'" min="0">')
   +'</div><div class="fr2">'
+  +fld(isAr9b?'نوع الصنف':'Item Type','<select id="it-mattype">'+matTypes.map(function(m){return '<option value="'+m[0]+'"'+(m[0]===(it.matType||'other')?' selected':'')+'>'+m[1]+'</option>';}).join('')+'</select>')
   +accSearchFld('Inventory Account','it-invacc',it.invAccId)
+  +'</div><div class="fr2">'
   +accSearchFld('COGS Account','it-cogs',it.cogsAccId)
-  +'</div>'
-  +accSearchFld('Revenue Account','it-rev',it.revAccId);
+  +accSearchFld('Revenue Account','it-rev',it.revAccId)
+  +'</div>';
  return wrap((isNew?'New Item':'Edit: '+it.name),body,'mSaveItem','Save Item');
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// MANUFACTURING MODULE — Phase 1 (تعريف المنتجات / BOM / المواد الخام /
+// أوامر التصنيع / صرف المواد / استلام الإنتاج التام), standard costing.
+//
+// Design, in one place since it spans several functions below:
+// - A Product (db.products) owns its own BOM inline — one raw-material list
+//   per product, no separate top-level "BOM" screen, matching how every
+//   other line-item table in this app (invoice lines, JE lines) lives
+//   inside the record it belongs to, not as its own module.
+// - "Raw Materials" is NOT a new master file — it reuses the existing
+//   Items/Inventory module (db.items), tagged matType:'raw' (see mItem()
+//   above). A Product also auto-creates its own matching sellable item
+//   (matType:'finished') the moment it's created, so a manufactured good
+//   is immediately usable on the existing, already-tested Sales Invoice/
+//   COGS flow with zero extra wiring.
+// - Each BOM line locks in its OWN "standard price" when added (defaults
+//   to the item's current avgCost, editable) — this is what makes it a
+//   STANDARD, as opposed to just re-reading the item's live, drifting
+//   average cost every time. Standard-costing variances only exist because
+//   the standard is allowed to differ from the actual.
+// - Material Issue posts the textbook 4-line standard-costing entry, and
+//   it is built to balance ALGEBRAICALLY, not by plugging: for each BOM
+//   line, stdQty*stdPrice (→WIP) + (actualPrice-stdPrice)*actualQty
+//   (→Price Variance) + (actualQty-stdQty)*stdPrice (→Usage Variance)
+//   simplifies to exactly actualQty*actualPrice (→Inventory credit). Try
+//   the algebra: the two stdQty*stdPrice terms cancel, leaving
+//   actualPrice*actualQty on both sides.
+// - Finished Goods Receipt moves ONLY the standard MATERIAL cost of the
+//   completed units from WIP to Finished Goods (Dr FG / Cr WIP). Labor and
+//   Factory Overhead are intentionally NOT part of this phase — adding a
+//   flat manually-typed "std labor/OH cost" now, with no Labor or Overhead
+//   module actually debiting WIP for it yet, would make this entry credit
+//   WIP for more than was ever debited into it, silently breaking every
+//   order's WIP balance. Phase 2 (Routing, Direct Labor, Factory Overhead)
+//   will extend this same Dr FG / Cr WIP entry once there is a real WIP
+//   debit for those costs to draw down.
+// - GL balances: db.journals is the single source of truth for every
+//   account's activity — accBalRange() replays it on top of account.bal
+//   every time a report reads a balance. None of the code below ever
+//   touches account.bal directly (see the long comment on the Depreciation
+//   handler above for why that would double-count every posting).
+// ═══════════════════════════════════════════════════════════════════════
+var tProductView=null;   // product id currently open on pProductDetail()
+var tProduct={};         // New/Edit Product modal buffer
+var tBOM=null;           // draft BOM lines while pProductDetail() is open
+var tMfgOrderView=null;  // mfg order id currently open on pMfgOrderDetail()
+var tMfgOrder={};        // New Manufacturing Order modal buffer (unused fields reserved for phase 2)
+
+function nextProductId(){return 'PRD-'+String((db.products||[]).length+1).padStart(3,'0');}
+function nextMfgOrderId(){return 'MO-'+String((db.mfgOrders||[]).length+1).padStart(4,'0');}
+function productById(id){return (db.products||[]).find(function(p){return p.id===id;});}
+function mfgOrderById(id){return (db.mfgOrders||[]).find(function(o){return o.id===id;});}
+function rawMatItems(){return (db.items||[]).filter(function(it){return it.matType==='raw';});}
+// These three resolve the fixed accounts every manufacturing journal posts
+// through. Every company's chart already has 1104-02/03/04 (Raw Materials/
+// WIP/Finished Goods) — both the DEF seed template and the 138-account IFRS
+// import include them — but a name-search fallback is kept anyway, the same
+// defensive pattern already used for the VAT account lookup on Purchase
+// Invoice posting, in case a heavily customized chart moved/renamed one.
+function mfgWipAccId(){
+ var a=db.accounts.find(function(x){return x.id==='1104-03';});
+ if(a)return a.id;
+ var b=db.accounts.find(function(x){return x.name&&/work.?in.?progress|\bwip\b/i.test(x.name);});
+ return b?b.id:'1104-03';
+}
+function mfgFgAccId(){
+ var a=db.accounts.find(function(x){return x.id==='1104-04';});
+ if(a)return a.id;
+ var b=db.accounts.find(function(x){return x.name&&/finished goods/i.test(x.name);});
+ return b?b.id:'1104-04';
+}
+function mfgRawAccId(){
+ var a=db.accounts.find(function(x){return x.id==='1104-02';});
+ if(a)return a.id;
+ var b=db.accounts.find(function(x){return x.name&&/raw material/i.test(x.name);});
+ return b?b.id:'1104-02';
+}
+// Standard Material Cost per ONE finished unit — the BOM's own locked
+// standard prices, not the items' current (possibly drifted) avgCost. Used
+// to display the product's own cost and, unchanged, as the exact amount
+// the Finished Goods Receipt journal moves out of WIP per unit completed.
+function bomStdCost(bom){
+ return (bom||[]).reduce(function(s,l){return s+(Number(l.qty)||0)*(Number(l.stdPrice)||0);},0);
+}
+
+function pProducts(){
+ var isAr=lang==='ar';
+ var h=tb(isAr?'📋 المنتجات (تعريف المنتجات)':'📋 Products',
+  '<button class="btn bp" data-action="addProduct">'+ic('plus')+' '+(isAr?'منتج جديد':'New Product')+'</button>');
+ h+='<div class="pg">';
+ var prods=db.products||[];
+ if(!prods.length){h+='<div class="es">'+(isAr?'لا توجد منتجات بعد.':'No products yet.')+'</div>';}
+ else{
+  h+='<div class="card"><div class="tw"><table><thead><tr>'
+   +'<th>'+(isAr?'الكود':'Code')+'</th><th>'+(isAr?'الاسم':'Name')+'</th><th>'+(isAr?'الوحدة':'Unit')+'</th>'
+   +'<th style="text-align:center">'+(isAr?'بنود BOM':'BOM Lines')+'</th>'
+   +'<th class="tr">'+(isAr?'التكلفة المعيارية للمواد/وحدة':'Std Material Cost/Unit')+'</th>'
+   +'<th style="width:70px"></th>'
+   +'</tr></thead><tbody>';
+  prods.forEach(function(p){
+   h+='<tr><td><span class="tag">'+p.id+'</span></td><td style="font-weight:500">'+(isAr&&p.nameAr?p.nameAr:p.name)+'</td>'
+    +'<td>'+(p.unit||'pcs')+'</td>'
+    +'<td style="text-align:center">'+(p.bom||[]).length+'</td>'
+    +'<td class="tr mn">'+N(bomStdCost(p.bom))+'</td>'
+    +'<td><div style="display:flex;gap:3px">'
+    +'<button class="btn bsm bg0" data-viewproduct="'+p.id+'">'+ic('eye')+'</button>'
+    +'<button class="btn bsm bg0 bdr" data-delproduct="'+p.id+'">'+ic('del')+'</button>'
+    +'</div></td></tr>';
+  });
+  h+='</tbody></table></div></div>';
+ }
+ return h+'</div>';
+}
+
+function pProductDetail(){
+ var isAr=lang==='ar';
+ var p=productById(tProductView);
+ if(!p)return pProducts();
+ if(!tBOM)tBOM=(p.bom||[]).map(function(l){return Object.assign({},l);});
+ var h=tb((isAr&&p.nameAr?p.nameAr:p.name),
+  '<button class="btn" data-action="backProducts">'+ic('back')+' '+(isAr?'رجوع':'Back')+'</button>'
+  +'<button class="btn" data-action="editProduct">'+ic('edit')+' '+(isAr?'تعديل بيانات المنتج':'Edit Product')+'</button>');
+ h+='<div class="pg">';
+ h+='<div class="card" style="max-width:900px"><div class="ct">'+(isAr?'بيانات المنتج':'Product Info')+'</div>'
+  +'<div class="rr"><span>'+(isAr?'الكود':'Code')+'</span><span class="tag">'+p.id+'</span></div>'
+  +'<div class="rr"><span>'+(isAr?'الاسم':'Name')+'</span><span style="font-weight:500">'+p.name+(p.nameAr?' | '+p.nameAr:'')+'</span></div>'
+  +'<div class="rr"><span>'+(isAr?'الوحدة':'Unit')+'</span><span>'+(p.unit||'pcs')+'</span></div>'
+  +'<div class="rr"><span>'+(isAr?'حساب الإنتاج التام':'Finished Goods Account')+'</span><span><span class="tag">'+(p.fgAccId||mfgFgAccId())+'</span> '+aName(p.fgAccId||mfgFgAccId())+'</span></div>'
+  +'<div class="rr"><span>'+(isAr?'صنف المخزون المرتبط':'Linked Inventory Item')+'</span><span>'+(p.fgItemId?'<span class="tag">'+p.fgItemId+'</span>':'—')+'</span></div>'
+  +'</div>';
+ h+='<div class="card" style="max-width:900px;margin-top:14px"><div class="ct">📋 BOM — '+(isAr?'قائمة المواد':'Bill of Materials')+'</div>';
+ var raws=rawMatItems();
+ if(!raws.length){
+  h+='<div class="hint" style="margin-bottom:8px">'+(isAr?'لا توجد أصناف من نوع "مادة خام" بعد — أضف صنفًا من شاشة الأصناف واختر النوع "مادة خام".':'No items tagged "Raw Material" yet — add one from the Items screen and set its type to "Raw Material".')+'</div>';
+ }
+ h+='<div class="tw"><table><thead><tr><th>'+(isAr?'المادة الخام':'Raw Material')+'</th><th style="width:130px">'+(isAr?'الكمية / وحدة':'Qty / Unit')+'</th><th style="width:150px">'+(isAr?'السعر المعياري':'Standard Price')+'</th><th style="width:120px" class="tr">'+(isAr?'التكلفة':'Cost')+'</th><th style="width:36px"></th></tr></thead><tbody id="bomLines">';
+ tBOM.forEach(function(l,i){
+  var opts='<option value="">'+(isAr?'— اختر —':'— Select —')+'</option>';
+  var pick=raws.slice();
+  if(l.itemId&&!raws.some(function(r){return r.id===l.itemId;})){var cur=itemById(l.itemId);if(cur)pick=[cur].concat(pick);}
+  pick.forEach(function(r){opts+='<option value="'+r.id+'"'+(r.id===l.itemId?' selected':'')+'>'+r.id+' - '+r.name+'</option>';});
+  h+='<tr><td><select class="bomItem" data-i="'+i+'" style="width:100%">'+opts+'</select></td>'
+   +'<td><input type="number" class="bomQty" data-i="'+i+'" value="'+(l.qty||'')+'" min="0" step="0.001"></td>'
+   +'<td><input type="number" class="bomPrice" data-i="'+i+'" value="'+(l.stdPrice||0)+'" min="0" step="0.01"></td>'
+   +'<td class="tr mn bomLineCost" data-i="'+i+'">'+N((Number(l.qty)||0)*(Number(l.stdPrice)||0))+'</td>'
+   +'<td><button class="btn bsm bg0 bdr" data-rmbom="'+i+'">'+ic('del')+'</button></td></tr>';
+ });
+ h+='</tbody></table></div>'
+  +btn_('bg0','addBomLine',ic('plus')+' '+(isAr?'إضافة مادة':'Add Material'))
+  +'<div style="margin-top:10px;font-weight:700;font-size:15px">'+(isAr?'إجمالي التكلفة المعيارية للمواد / وحدة: ':'Total Std Material Cost / Unit: ')+'<span id="bomTotal" style="color:var(--gn)">'+N(bomStdCost(tBOM))+'</span></div>'
+  +'<div style="margin-top:10px"><button class="btn bp" id="btnSaveBOM">'+ic('save')+' '+(isAr?'حفظ BOM':'Save BOM')+'</button></div>'
+  +'</div>';
+ return h+'</div>';
+}
+
+function mProduct(){
+ var isAr=lang==='ar';
+ var p=tProduct,isNew=!p.editId;
+ var fgAccs=db.accounts.filter(function(a){return a.type==='Asset'&&!a.isMain;});
+ var curFg=p.fgAccId||mfgFgAccId();
+ var fgOpts=fgAccs.map(function(a){
+  var par=a.pid?db.accounts.find(function(x){return x.id===a.pid;}):null;
+  return '<option value="'+a.id+'"'+(a.id===curFg?' selected':'')+'>'+(par?accN(par)+' / ':'')+a.id+' - '+accN(a)+'</option>';
+ }).join('');
+ var units=['pcs','kg','ton','ltr','box','carton','set','pair','m','m2','m3'];
+ var body='<div class="fr2">'
+  +fld(isAr?'اسم المنتج *':'Product Name *','<input id="prd-name" value="'+(p.name||'')+'">')
+  +fld(isAr?'الاسم بالعربي':'Arabic Name','<input id="prd-namear" value="'+(p.nameAr||'')+'" dir="rtl">')
+  +'</div><div class="fr2">'
+  +fld(isAr?'الوحدة':'Unit','<select id="prd-unit">'+units.map(function(u){return '<option'+(u===(p.unit||'pcs')?' selected':'')+'>'+u+'</option>';}).join('')+'</select>')
+  +fld(isAr?'حساب الإنتاج التام':'Finished Goods Account','<select id="prd-fgacc">'+fgOpts+'</select>')
+  +'</div>';
+ return wrap((isNew?(isAr?'منتج جديد':'New Product'):(isAr?'تعديل منتج':'Edit Product')),body,'mSaveProduct',isAr?'حفظ':'Save');
+}
+
+function pMfgOrders(){
+ var isAr=lang==='ar';
+ var h=tb(isAr?'📝 أوامر التصنيع':'📝 Manufacturing Orders',
+  '<button class="btn bp" data-action="addMfgOrder">'+ic('plus')+' '+(isAr?'أمر تصنيع جديد':'New Manufacturing Order')+'</button>');
+ h+='<div class="pg">';
+ var orders=(db.mfgOrders||[]).slice().reverse();
+ if(!orders.length){h+='<div class="es">'+(isAr?'لا توجد أوامر تصنيع بعد.':'No manufacturing orders yet.')+'</div>';}
+ else{
+  h+='<div class="card"><div class="tw"><table><thead><tr>'
+   +'<th>'+(isAr?'رقم الأمر':'Order #')+'</th><th>'+(isAr?'المنتج':'Product')+'</th>'
+   +'<th class="tr">'+(isAr?'الكمية المطلوبة':'Qty Ordered')+'</th>'
+   +'<th>'+(isAr?'التاريخ':'Date')+'</th><th>'+(isAr?'الحالة':'Status')+'</th><th style="width:60px"></th>'
+   +'</tr></thead><tbody>';
+  var statusLbl={draft:isAr?'مسودة':'Draft',issued:isAr?'تم صرف المواد':'Materials Issued',completed:isAr?'مكتمل':'Completed'};
+  orders.forEach(function(o){
+   var p=productById(o.productId);
+   h+='<tr><td><span class="tag">'+o.id+'</span></td><td style="font-weight:500">'+(p?(isAr&&p.nameAr?p.nameAr:p.name):o.productId)+'</td>'
+    +'<td class="tr mn">'+N(o.qtyOrdered)+'</td>'
+    +'<td>'+(o.date||'—')+'</td>'
+    +'<td><span class="b '+(o.status==='draft'?'bam':'bgn')+'">'+(statusLbl[o.status]||o.status)+'</span></td>'
+    +'<td><button class="btn bsm bg0" data-viewmo="'+o.id+'">'+ic('eye')+'</button></td></tr>';
+  });
+  h+='</tbody></table></div></div>';
+ }
+ return h+'</div>';
+}
+
+function mMfgOrder(){
+ var isAr=lang==='ar';
+ var prods=(db.products||[]).filter(function(p){return p.active!==false;});
+ var opts='<option value="">'+(isAr?'— اختر المنتج —':'— Select Product —')+'</option>'
+  +prods.map(function(p){return '<option value="'+p.id+'">'+p.id+' - '+(isAr&&p.nameAr?p.nameAr:p.name)+'</option>';}).join('');
+ var body=fld(isAr?'المنتج *':'Product *','<select id="mo-product">'+opts+'</select>')
+  +'<div class="fr2">'
+  +fld(isAr?'الكمية المطلوبة *':'Qty Ordered *','<input type="number" id="mo-qty" value="1" min="0.001" step="0.001">')
+  +fld(isAr?'التاريخ *':'Date *','<input type="date" id="mo-date" value="'+today()+'">')
+  +'</div>';
+ if(!prods.length)body+='<div class="hint">'+(isAr?'أنشئ منتجًا أولاً من شاشة المنتجات.':'Create a product first from the Products screen.')+'</div>';
+ return wrap(isAr?'أمر تصنيع جديد':'New Manufacturing Order',body,'mSaveMfgOrder',isAr?'إنشاء الأمر':'Create Order');
+}
+
+function pMfgOrderDetail(){
+ var isAr=lang==='ar';
+ var o=mfgOrderById(tMfgOrderView);
+ if(!o)return pMfgOrders();
+ var p=productById(o.productId);
+ var h=tb((isAr?'أمر تصنيع ':'Manufacturing Order ')+o.id,
+  '<button class="btn" data-action="backMfgOrders">'+ic('back')+' '+(isAr?'رجوع':'Back')+'</button>');
+ h+='<div class="pg">';
+ h+='<div class="card" style="max-width:900px"><div class="ct">'+(isAr?'بيانات الأمر':'Order Info')+'</div>'
+  +'<div class="rr"><span>'+(isAr?'المنتج':'Product')+'</span><span style="font-weight:500">'+(p?(isAr&&p.nameAr?p.nameAr:p.name):o.productId)+'</span></div>'
+  +'<div class="rr"><span>'+(isAr?'الكمية المطلوبة':'Qty Ordered')+'</span><span class="mn">'+N(o.qtyOrdered)+' '+(p?p.unit:'')+'</span></div>'
+  +'<div class="rr"><span>'+(isAr?'التاريخ':'Date')+'</span><span>'+o.date+'</span></div>'
+  +'<div class="rr"><span>'+(isAr?'التكلفة المعيارية للمواد/وحدة':'Std Material Cost/Unit')+'</span><span class="mn">'+N(p?bomStdCost(p.bom):0)+'</span></div>'
+  +'</div>';
+
+ h+='<div class="card" style="max-width:900px;margin-top:14px"><div class="ct">🔄 '+(isAr?'صرف المواد':'Material Issue')+'</div>';
+ if(o.issue){
+  h+='<div class="tw"><table><thead><tr><th>'+(isAr?'المادة':'Material')+'</th><th class="tr">'+(isAr?'الكمية المعيارية':'Std Qty')+'</th><th class="tr">'+(isAr?'الكمية الفعلية':'Actual Qty')+'</th><th class="tr">'+(isAr?'السعر المعياري':'Std Price')+'</th><th class="tr">'+(isAr?'السعر الفعلي':'Actual Price')+'</th></tr></thead><tbody>';
+  o.issue.lines.forEach(function(l){
+   var it=itemById(l.itemId);
+   h+='<tr><td>'+(it?it.name:l.itemId)+'</td><td class="tr mn">'+N(l.stdQty)+'</td><td class="tr mn">'+N(l.actualQty)+'</td><td class="tr mn">'+N(l.stdPrice)+'</td><td class="tr mn">'+N(l.actualPrice)+'</td></tr>';
+  });
+  h+='</tbody></table></div>'
+   +'<div class="rr" style="margin-top:8px"><span>'+(isAr?'قيد اليومية':'Journal Entry')+'</span><span><span class="tag">'+(o.issue.jeId||'—')+'</span></span></div>';
+ } else if(p) {
+  if(!(p.bom&&p.bom.length)){
+   h+='<div class="es">'+(isAr?'لا توجد BOM لهذا المنتج — أضف موادًا خامًا من شاشة المنتج أولاً.':'This product has no BOM yet — add raw materials from the Product screen first.')+'</div>';
+  } else {
+   h+='<div class="tw"><table><thead><tr><th>'+(isAr?'المادة':'Material')+'</th><th class="tr">'+(isAr?'الكمية المعيارية':'Std Qty')+'</th><th style="width:140px">'+(isAr?'الكمية الفعلية':'Actual Qty')+'</th><th class="tr">'+(isAr?'المتاح بالمخزون':'In Stock')+'</th></tr></thead><tbody id="issueLines">';
+   p.bom.forEach(function(l,i){
+    var it=itemById(l.itemId);
+    var stdQty=(Number(l.qty)||0)*(Number(o.qtyOrdered)||0);
+    h+='<tr data-itemid="'+l.itemId+'" data-stdqty="'+stdQty+'" data-stdprice="'+(l.stdPrice||0)+'">'
+     +'<td>'+(it?it.name:l.itemId)+'</td>'
+     +'<td class="tr mn">'+N(stdQty)+'</td>'
+     +'<td><input type="number" class="issueQty" data-i="'+i+'" value="'+stdQty+'" min="0" step="0.001"></td>'
+     +'<td class="tr mn" style="color:'+(it&&(it.qty||0)<stdQty?'var(--rd)':'var(--t2)')+'">'+N(it?it.qty||0:0)+'</td></tr>';
+   });
+   h+='</tbody></table></div>'
+    +'<div style="margin-top:10px"><button class="btn bp" id="btnIssueMaterials">'+ic('save')+' '+(isAr?'صرف المواد وترحيل القيد':'Issue Materials & Post Journal')+'</button></div>';
+  }
+ }
+ h+='</div>';
+
+ h+='<div class="card" style="max-width:900px;margin-top:14px"><div class="ct">✅ '+(isAr?'استلام الإنتاج التام':'Finished Goods Receipt')+'</div>';
+ if(o.receipt){
+  h+='<div class="rr"><span>'+(isAr?'الكمية المستلمة':'Qty Completed')+'</span><span class="mn">'+N(o.receipt.qtyCompleted)+'</span></div>'
+   +'<div class="rr"><span>'+(isAr?'تكلفة الوحدة':'Unit Cost')+'</span><span class="mn">'+N(o.receipt.unitStdCost)+'</span></div>'
+   +'<div class="rr" style="border-top:2px solid var(--tx);margin-top:4px;padding-top:8px"><span style="font-weight:700">'+(isAr?'إجمالي القيمة':'Total Value')+'</span><span class="mn" style="font-weight:700">'+N(o.receipt.amount)+'</span></div>'
+   +'<div class="rr"><span>'+(isAr?'قيد اليومية':'Journal Entry')+'</span><span><span class="tag">'+(o.receipt.jeId||'—')+'</span></span></div>';
+ } else if(o.status==='issued'){
+  h+=fld(isAr?'الكمية المستلمة *':'Qty Completed *','<input type="number" id="fg-qty" value="'+o.qtyOrdered+'" min="0" max="'+o.qtyOrdered+'" step="0.001">')
+   +'<div style="margin-top:10px"><button class="btn bp" id="btnReceiveFG">'+ic('save')+' '+(isAr?'استلام الإنتاج وترحيل القيد':'Receive & Post Journal')+'</button></div>';
+ } else {
+  h+='<div class="es">'+(isAr?'يجب صرف المواد أولاً.':'Materials must be issued first.')+'</div>';
+ }
+ h+='</div>';
+
+ return h+'</div>';
 }
 
 function mPurchaseInvoice(isReturn){
@@ -4931,7 +5244,28 @@ var jeState={mode:'list',currentIdx:-1}; // mode: list | view | new | edit
 // pJournal()'s own edit mode uses, so it reuses that page's already-wired
 // account-search/VAT/save handlers instead of duplicating them.
 var adjOpsState={mode:'search',type:'journal',num:'',notFound:false};
+// Journal Entry line count the editor always opens with, whether starting a
+// brand-new entry or loading an existing one for edit — so a typical entry
+// rarely needs a click on "Add Line". Extra untouched blank rows are simply
+// skipped on save (jeSave() only keeps a line that has both an account AND
+// an amount), so padding up to this count never affects what gets posted.
+var JE_MIN_LINES=15;
+function padJELines(lines){
+ var out=(lines||[]).slice();
+ while(out.length<JE_MIN_LINES)out.push({acc:'',dr:'',cr:''});
+ return out;
+}
 
+// Shared Total Debit / Total Credit / Difference calculation for the
+// journal-entry lines editor — used both to seed buildJELinesEditor()'s
+// totals bar on first render and by jeHint() to keep it live as the user
+// types. diff = tD-tC: negative means Credit > Debit, positive means
+// Debit > Credit (see the color rule everywhere this is used).
+function computeJETotals(lines){
+ var tD=(lines||[]).reduce(function(s,l){return s+Number(l.dr||0);},0);
+ var tC=(lines||[]).reduce(function(s,l){return s+Number(l.cr||0);},0);
+ return {tD:tD,tC:tC,diff:tD-tC};
+}
 // Shared lines editor (account/cost-center/debit/credit/VAT/per-line note)
 // used by BOTH pJournal()'s inline edit mode and pAdjustOps() — kept as one
 // function so the two entry points into the same tJE buffer can never
@@ -4940,7 +5274,21 @@ var adjOpsState={mode:'search',type:'journal',num:'',notFound:false};
 // function keeps of its own.
 function buildJELinesEditor(j,isAr){
  var leaves=leafAccs();
- var out='<div class="tw"><table style="table-layout:auto"><thead><tr>'
+ // Total Debit / Total Credit / Difference bar shown above the lines table.
+ // jeHint() (fired on every .jeD/.jeC input) keeps #jeTotDrTop/#jeTotCrTop/
+ // #jeDiffTop live without a full re-render — this initial markup just
+ // seeds them with the entry's current totals (non-zero when editing an
+ // existing entry). Difference color: red when Credit > Debit, blue when
+ // Debit > Credit, green when balanced.
+ var t0=computeJETotals(j.lines);
+ var diffColor0=Math.abs(t0.diff)<0.01?'var(--gn)':(t0.diff<0?'var(--rd)':'var(--bl)');
+ var diffTxt0=Math.abs(t0.diff)<0.01?(isAr?'✔ متوازن':'✔ Balanced'):((isAr?'الفرق: ':'Difference: ')+N(Math.abs(t0.diff)));
+ var out='<div id="jeTotalsBar" style="display:flex;gap:22px;flex-wrap:wrap;align-items:center;margin-bottom:10px;padding:10px 14px;background:var(--bg);border-radius:var(--r);font-size:13px">'
+  +'<span><b>'+(isAr?'إجمالي المدين: ':'Total Debit: ')+'</b><span id="jeTotDrTop">'+N(t0.tD)+'</span></span>'
+  +'<span><b>'+(isAr?'إجمالي الدائن: ':'Total Credit: ')+'</b><span id="jeTotCrTop">'+N(t0.tC)+'</span></span>'
+  +'<span id="jeDiffTop" style="font-weight:800;color:'+diffColor0+'">'+diffTxt0+'</span>'
+  +'</div>';
+ out+='<div class="tw"><table style="table-layout:auto"><thead><tr>'
   +'<th style="width:34px">#</th>'
   +'<th>'+(isAr?'الحساب':'Account')+'</th>'
   +'<th style="min-width:120px">'+(isAr?'مركز التكلفة':'Cost Center')+'</th>'
@@ -5165,8 +5513,6 @@ function pAdjustOps(){
 
  if(adjOpsState.mode==='loaded'){
   var j=tJE;
-  var tD=j.lines.reduce(function(s,l){return s+Number(l.dr||0);},0);
-  var tC=j.lines.reduce(function(s,l){return s+Number(l.cr||0);},0);
   h+='<div class="card">';
   h+='<div class="fr2" style="margin-bottom:12px">'
    +fld(isAr?'رقم العملية':'Transaction #','<div class="tag" style="font-size:14px;padding:8px 12px">'+(j.editId||'')+'</div>')
@@ -5176,10 +5522,11 @@ function pAdjustOps(){
    +fld(isAr?'رقم المستند':'Document No.','<input id="j-docno" value="'+(j.docNo||'')+'" placeholder="'+(isAr?'رقم مرجعي اختياري':'Optional reference')+'">')
    +fld(isAr?'الوصف *':'Description *','<input id="j-desc" value="'+(j.desc||'')+'">')
    +'</div>';
-  h+='<div class="fr2" style="margin-bottom:12px">'
-   +fld(isAr?'اجمالي الجانب المدين':'Total Debit Side','<div id="adjTotDr" class="mn" style="padding:8px 0;font-weight:700">'+N(tD)+'</div>')
-   +fld(isAr?'اجمالي الجانب الدائن':'Total Credit Side','<div id="adjTotCr" class="mn" style="padding:8px 0;font-weight:700">'+N(tC)+'</div>')
-   +'</div>';
+  // Total Debit/Credit + colored Difference now come from the shared totals
+  // bar buildJELinesEditor() renders above the lines table (see jeHint()) —
+  // this screen used to show its own plain, uncolored Total Debit/Credit
+  // fields here with no difference figure at all; removed to avoid showing
+  // the same totals twice.
   h+=buildJELinesEditor(j,isAr);
   h+='<div style="margin-top:12px"><button class="btn bp" id="jeSave" style="background:#0F6E56;border-color:#0F6E56">💾 '+(isAr?'حفظ':'Save')+'</button></div>';
   h+='</div>';
@@ -8326,7 +8673,7 @@ function pFiscalYear(){
 }
 
 function buildModal(){
- var fns={acc:mAcc,item:mItem,po:mPurchaseOrder,pi:function(){return mPurchaseInvoice(tPI.isReturn);},si:function(){return mSalesInvoice(tSI.isReturn);},je:mJE,inv:mInv,cus:mContact,sup:mContact,rcpt:mVoucher,pymt:mVoucher,cc:mCC,user:mUser,chpwd:mChangePwd,fa:mFA,at:mAddTransaction,loc:mLocation,newco:mNewCompany,comanage:mCoManage};
+ var fns={acc:mAcc,item:mItem,po:mPurchaseOrder,pi:function(){return mPurchaseInvoice(tPI.isReturn);},si:function(){return mSalesInvoice(tSI.isReturn);},je:mJE,inv:mInv,cus:mContact,sup:mContact,rcpt:mVoucher,pymt:mVoucher,cc:mCC,user:mUser,chpwd:mChangePwd,fa:mFA,at:mAddTransaction,loc:mLocation,newco:mNewCompany,comanage:mCoManage,product:mProduct,mfgorder:mMfgOrder};
  var fn=fns[modal];return fn?fn():'';
 }
 function wrap(title,body,saveId,saveLabel){
@@ -9674,14 +10021,14 @@ function bindEvents(){
  // ── Journal Navigator Handlers ────────────────────────────
  on1('jeListView','click',function(){jeState.mode='list';render();});
  on1('jeNew','click',function(){
-  tJE={editId:null,date:today(),desc:'',lines:[{acc:'',dr:'',cr:''},{acc:'',dr:'',cr:''}]};
+  tJE={editId:null,date:today(),desc:'',lines:padJELines([])};
   jeState.mode='new';render();
  });
  on1('jeEdit','click',function(){
   var allJE=db.journals.slice().reverse();
   var je=allJE[jeState.currentIdx];
   if(!je)return;
-  tJE={editId:je.id,date:je.date,desc:je.desc,lines:jeCollapseVATLines(je.lines)};
+  tJE={editId:je.id,date:je.date,desc:je.desc,lines:padJELines(jeCollapseVATLines(je.lines))};
   jeState.mode='edit';render();
  });
  on1('jeDelete','click',function(){
@@ -9763,7 +10110,16 @@ function bindEvents(){
   if(lines2.length<2){alert(lang==='ar'?'أضف سطرين على الأقل':'Add at least 2 lines');return;}
   var tD3=lines2.reduce(function(s,l){return s+(l.dr||0);},0);
   var tC3=lines2.reduce(function(s,l){return s+(l.cr||0);},0);
-  if(Math.abs(tD3-tC3)>0.01){if(!confirm((lang==='ar'?'القيد غير متوازن. فرق: ':'Unbalanced entry. Diff: ')+N(Math.abs(tD3-tC3))+'. '+(lang==='ar'?'هل تريد الحفظ؟':'Save anyway?')))return;}
+  // Hard block — an unbalanced entry can never be saved, no "save anyway"
+  // escape hatch (previously a confirm() that still saved on OK). The live
+  // totals bar above the lines table (see buildJELinesEditor()/jeHint())
+  // already shows this same Debit/Credit/Difference while typing.
+  if(Math.abs(tD3-tC3)>0.01){
+   alert(lang==='ar'
+    ?'⚠️ القيد غير متوازن: إجمالي المدين ('+N(tD3)+') لا يساوي إجمالي الدائن ('+N(tC3)+'). الفرق: '+N(Math.abs(tD3-tC3))+'. لا يمكن حفظ قيد غير متوازن.'
+    :'⚠️ Unbalanced entry: Total Debit ('+N(tD3)+') does not equal Total Credit ('+N(tC3)+'). Difference: '+N(Math.abs(tD3-tC3))+'. An unbalanced entry cannot be saved.');
+   return;
+  }
   // lines2 holds the gross (VAT-inclusive) amounts exactly as typed —
   // jeExpandVATLines() extracts each VAT-tagged line's tax portion and
   // posts it to the VAT account, which is what actually gets saved.
@@ -9804,7 +10160,7 @@ function bindEvents(){
   if(typeSel==='journal'){
    var je=db.journals.find(function(j){return j.id===num||j.id.toLowerCase()===num.toLowerCase()||(j.docNo&&j.docNo.toLowerCase()===num.toLowerCase());});
    if(!je){adjOpsState.notFound=true;adjOpsState.mode='search';adjOpsState.num=num;render();return;}
-   tJE={editId:je.id,date:je.date,desc:je.desc,docNo:je.docNo||'',lines:jeCollapseVATLines(je.lines)};
+   tJE={editId:je.id,date:je.date,desc:je.desc,docNo:je.docNo||'',lines:padJELines(jeCollapseVATLines(je.lines))};
    adjOpsState.mode='loaded';adjOpsState.notFound=false;adjOpsState.num=num;
    render();
   }
@@ -10519,7 +10875,170 @@ function bindEvents(){
  // ── Inventory Handlers ────────────────────────────────
  on('[data-edititem]','click',function(el){var it=(db.items||[]).find(function(x){return x.id===el.dataset.edititem;});if(it){tItem=Object.assign({},it,{editId:it.id});modal='item';render();}});
  on('[data-delitem]','click',function(el){if(confirm('Delete item?')){db.items=(db.items||[]).filter(function(x){return x.id!==el.dataset.delitem;});save();render();}});
- 
+
+ // ── Manufacturing: Products / BOM ─────────────────────────────
+ on('[data-viewproduct]','click',function(el){tProductView=el.dataset.viewproduct;tBOM=null;view='products';render();});
+ on('[data-delproduct]','click',function(el){
+  var isArDp=lang==='ar';
+  var pid=el.dataset.delproduct;
+  var used=(db.mfgOrders||[]).some(function(o){return o.productId===pid;});
+  if(used){alert(isArDp?'لا يمكن حذف منتج مرتبط بأمر تصنيع.':'Cannot delete a product referenced by a manufacturing order.');return;}
+  if(!confirm(isArDp?'حذف المنتج؟':'Delete this product?'))return;
+  db.products=(db.products||[]).filter(function(x){return x.id!==pid;});
+  if(tProductView===pid){tProductView=null;tBOM=null;}
+  save();render();
+ });
+ on1('mSaveProduct','click',function(){
+  var isArP=lang==='ar';
+  var nm=((document.getElementById('prd-name')||{}).value||'').trim();
+  if(!nm){alert(isArP?'أدخل اسم المنتج':'Enter product name');return;}
+  var nmAr=((document.getElementById('prd-namear')||{}).value||'').trim();
+  var unit=(document.getElementById('prd-unit')||{}).value||'pcs';
+  var fgAcc=(document.getElementById('prd-fgacc')||{}).value||mfgFgAccId();
+  if(tProduct.editId){
+   var pr=productById(tProduct.editId);
+   if(pr){
+    pr.name=nm;pr.nameAr=nmAr;pr.unit=unit;pr.fgAccId=fgAcc;
+    var linkedIt=itemById(pr.fgItemId);
+    if(linkedIt){linkedIt.name=nm;linkedIt.nameAr=nmAr;linkedIt.unit=unit;linkedIt.invAccId=fgAcc;}
+   }
+   modal=null;save();render();
+  } else {
+   var id=nextProductId();
+   // Every product gets its own matching, immediately-sellable inventory
+   // item (matType:'finished') so the existing, already-tested Sales
+   // Invoice/COGS flow works on manufactured goods with no extra wiring —
+   // Finished Goods Receipt (btnReceiveFG below) is what actually moves
+   // real qty/avgCost into it as orders complete.
+   var cogsAcc=db.accounts.find(function(a){return a.id==='5101-01';});
+   var fgItem={id:id,name:nm,nameAr:nmAr,unit:unit,salePrice:0,reorderQty:0,matType:'finished',invAccId:fgAcc,cogsAccId:cogsAcc?cogsAcc.id:'',revAccId:'',qty:0,avgCost:0};
+   if(!db.items)db.items=[];
+   db.items.push(fgItem);
+   if(!db.products)db.products=[];
+   db.products.push({id:id,name:nm,nameAr:nmAr,unit:unit,fgAccId:fgAcc,fgItemId:id,bom:[],active:true,createdAt:today()});
+   modal=null;save();
+   tProductView=id;tBOM=null;view='products';render();
+  }
+ });
+ on1('addBomLine','click',function(){if(!tBOM)tBOM=[];tBOM.push({itemId:'',qty:1,stdPrice:0});render();});
+ on('[data-rmbom]','click',function(el){if(tBOM){tBOM.splice(Number(el.dataset.rmbom),1);render();}});
+ on('.bomItem','change',function(el){
+  var i=Number(el.dataset.i);if(!tBOM||!tBOM[i])return;
+  tBOM[i].itemId=el.value;
+  var it=itemById(el.value);
+  tBOM[i].stdPrice=it?(it.avgCost||0):0;
+  render();
+ });
+ on('.bomQty','input',function(el){var i=Number(el.dataset.i);if(tBOM&&tBOM[i]){tBOM[i].qty=el.value;bomHint();}});
+ on('.bomPrice','input',function(el){var i=Number(el.dataset.i);if(tBOM&&tBOM[i]){tBOM[i].stdPrice=el.value;bomHint();}});
+ on1('btnSaveBOM','click',function(){
+  var isArB=lang==='ar';
+  var lines=[];
+  document.querySelectorAll('#bomLines tr').forEach(function(tr){
+   var itemId=(tr.querySelector('.bomItem')||{}).value||'';
+   var qty=Number((tr.querySelector('.bomQty')||{}).value)||0;
+   var pr=Number((tr.querySelector('.bomPrice')||{}).value)||0;
+   if(itemId&&qty>0)lines.push({itemId:itemId,qty:qty,stdPrice:pr});
+  });
+  var p=productById(tProductView);if(!p)return;
+  p.bom=lines;
+  tBOM=lines.map(function(l){return Object.assign({},l);});
+  save();render();
+  alert(isArB?'✅ تم حفظ قائمة المواد (BOM)':'✅ BOM saved');
+ });
+
+ // ── Manufacturing: Orders / Material Issue / FG Receipt ───────
+ on('[data-viewmo]','click',function(el){tMfgOrderView=el.dataset.viewmo;view='mfgorders';render();});
+ on1('mSaveMfgOrder','click',function(){
+  var isArM=lang==='ar';
+  var pid=(document.getElementById('mo-product')||{}).value||'';
+  if(!pid){alert(isArM?'اختر المنتج':'Select a product');return;}
+  var qty=Number((document.getElementById('mo-qty')||{}).value)||0;
+  if(qty<=0){alert(isArM?'أدخل كمية صحيحة':'Enter a valid quantity');return;}
+  var date=(document.getElementById('mo-date')||{}).value||today();
+  var fyErrMO=fyDateCheck(date);if(fyErrMO){alert(fyErrMO);return;}
+  var id=nextMfgOrderId();
+  if(!db.mfgOrders)db.mfgOrders=[];
+  db.mfgOrders.push({id:id,productId:pid,qtyOrdered:qty,date:date,status:'draft',issue:null,receipt:null,createdAt:today()});
+  modal=null;save();
+  tMfgOrderView=id;view='mfgorders';render();
+ });
+ on1('btnIssueMaterials','click',function(){
+  var isArI=lang==='ar';
+  var o=mfgOrderById(tMfgOrderView);if(!o)return;
+  var p=productById(o.productId);if(!p)return;
+  var fyErrI=fyDateCheck(o.date);if(fyErrI){alert(fyErrI);return;}
+  var lines=[];
+  document.querySelectorAll('#issueLines tr').forEach(function(tr){
+   var itemId=tr.dataset.itemid;
+   var stdQty=Number(tr.dataset.stdqty)||0;
+   var stdPrice=Number(tr.dataset.stdprice)||0;
+   var actualQty=Number((tr.querySelector('.issueQty')||{}).value)||0;
+   lines.push({itemId:itemId,stdQty:stdQty,stdPrice:stdPrice,actualQty:actualQty});
+  });
+  if(!lines.length){alert(isArI?'لا توجد مواد لصرفها':'No materials to issue');return;}
+  for(var k=0;k<lines.length;k++){
+   var itk=itemById(lines[k].itemId);
+   if(!itk||(itk.qty||0)<lines[k].actualQty){
+    alert((isArI?'الكمية المتاحة غير كافية للصنف: ':'Not enough stock for item: ')+(itk?itk.name:lines[k].itemId));
+    return;
+   }
+  }
+  var jeLines=[];
+  var totalStd=0,totalUsageVar=0,totalPriceVar=0;
+  var invByAcc={};
+  lines.forEach(function(l){
+   var it=itemById(l.itemId);
+   var actualPrice=it?(it.avgCost||0):0;
+   totalStd+=l.stdQty*l.stdPrice;
+   totalUsageVar+=(l.actualQty-l.stdQty)*l.stdPrice;
+   totalPriceVar+=(actualPrice-l.stdPrice)*l.actualQty;
+   var accId=(it&&it.invAccId)||mfgRawAccId();
+   invByAcc[accId]=(invByAcc[accId]||0)+l.actualQty*actualPrice;
+   l.actualPrice=actualPrice;
+   if(it)issueStock(it.id,l.actualQty);
+  });
+  jeLines.push({acc:mfgWipAccId(),dr:totalStd,cr:0});
+  // Material Usage Variance: actual qty used vs the standard qty the BOM
+  // allows for this order's target output, valued at the STANDARD price
+  // (isolates the quantity effect from the price effect below).
+  if(Math.abs(totalUsageVar)>0.01){
+   if(totalUsageVar>0)jeLines.push({acc:'5102-02',dr:totalUsageVar,cr:0});
+   else jeLines.push({acc:'5102-02',dr:0,cr:-totalUsageVar});
+  }
+  // Material Price Variance: actual cost vs the locked BOM standard price,
+  // valued at the ACTUAL qty issued.
+  if(Math.abs(totalPriceVar)>0.01){
+   if(totalPriceVar>0)jeLines.push({acc:'5102-01',dr:totalPriceVar,cr:0});
+   else jeLines.push({acc:'5102-01',dr:0,cr:-totalPriceVar});
+  }
+  Object.keys(invByAcc).forEach(function(accId){jeLines.push({acc:accId,dr:0,cr:invByAcc[accId]});});
+  var je={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:o.date,desc:(isArI?'صرف مواد لأمر تصنيع ':'Material issue for MO ')+o.id,lines:jeLines};
+  db.journals.push(je);
+  o.issue={date:o.date,lines:lines,jeId:je.id};
+  o.status='issued';
+  save();render();
+ });
+ on1('btnReceiveFG','click',function(){
+  var isArR=lang==='ar';
+  var o=mfgOrderById(tMfgOrderView);if(!o)return;
+  var p=productById(o.productId);if(!p)return;
+  var qtyC=Number((document.getElementById('fg-qty')||{}).value)||0;
+  if(qtyC<=0){alert(isArR?'أدخل كمية صحيحة':'Enter a valid quantity');return;}
+  if(qtyC>o.qtyOrdered+0.0001){alert(isArR?'لا يمكن استلام أكثر من الكمية المطلوبة':'Cannot receive more than the ordered quantity');return;}
+  var fyErrR=fyDateCheck(o.date);if(fyErrR){alert(fyErrR);return;}
+  var unitCost=bomStdCost(p.bom);
+  var amount=qtyC*unitCost;
+  if(amount<=0){alert(isArR?'لا يمكن استلام الإنتاج بتكلفة صفرية — تأكد من BOM.':'Cannot receive at zero cost — check the BOM.');return;}
+  var jeLines=[{acc:p.fgAccId||mfgFgAccId(),dr:amount,cr:0},{acc:mfgWipAccId(),dr:0,cr:amount}];
+  var je={id:'JE'+String(db.journals.length+1).padStart(3,'0'),date:o.date,desc:(isArR?'استلام إنتاج تام لأمر تصنيع ':'Finished goods receipt for MO ')+o.id,lines:jeLines};
+  db.journals.push(je);
+  if(p.fgItemId)receiveStock(p.fgItemId,qtyC,unitCost);
+  o.receipt={date:o.date,qtyCompleted:qtyC,unitStdCost:unitCost,amount:amount,jeId:je.id};
+  o.status='completed';
+  save();render();
+ });
+
  // ── Universal Account Search Handler ──────────────────────
  // Works for all accSearchFld widgets (items, receipts, payments, etc.)
  on('.itAccSearch','focus',function(el){
@@ -10605,8 +11124,9 @@ function bindEvents(){
   var invAcc=((document.getElementById('it-invacc-id')||{}).value||'').trim();
   var cogs=((document.getElementById('it-cogs-id')||{}).value||'').trim();
   var rev=((document.getElementById('it-rev-id')||{}).value||'').trim();
+  var matType2=((document.getElementById('it-mattype')||{}).value||'other');
   if(!id2||!nm){alert('Fill code and name.');return;}
-  var obj2={id:id2,name:nm,nameAr:nmAr,unit:unit2,salePrice:sp,reorderQty:rq,invAccId:invAcc,cogsAccId:cogs,revAccId:rev,qty:tItem.qty||0,avgCost:tItem.avgCost||0};
+  var obj2={id:id2,name:nm,nameAr:nmAr,unit:unit2,salePrice:sp,reorderQty:rq,matType:matType2,invAccId:invAcc,cogsAccId:cogs,revAccId:rev,qty:tItem.qty||0,avgCost:tItem.avgCost||0};
   if(tItem.editId){var ix=(db.items||[]).findIndex(function(x){return x.id===tItem.editId;});if(ix!==-1)db.items[ix]=Object.assign(db.items[ix],obj2);}
   else{if((db.items||[]).find(function(x){return x.id===id2;})){alert('Code exists.');return;}if(!db.items)db.items=[];db.items.push(obj2);}
   modal=null;save();render();
@@ -11757,6 +12277,15 @@ function bindEvents(){
    if(id)openManageCo(id);
    return;
   }
+  if(act==='addProduct'){tProduct={};modal='product';render();return;}
+  if(act==='editProduct'){
+   var pEd=productById(tProductView);
+   if(pEd)tProduct={editId:pEd.id,name:pEd.name,nameAr:pEd.nameAr,unit:pEd.unit,fgAccId:pEd.fgAccId};
+   modal='product';render();return;
+  }
+  if(act==='backProducts'){tProductView=null;tBOM=null;render();return;}
+  if(act==='addMfgOrder'){tMfgOrder={};modal='mfgorder';render();return;}
+  if(act==='backMfgOrders'){tMfgOrderView=null;render();return;}
   window.xAction(act);
  });
  // Tax report Excel
@@ -12329,21 +12858,47 @@ function calcVATLines(){
   }
  });
 }
+// Live per-row cost + grand total on the Product BOM editor (see
+// pProductDetail()) — mirrors jeHint()'s pattern exactly: update the DOM
+// and tBOM's in-memory values on every keystroke, no full render() (which
+// would drop input focus), same as .jeD/.jeC do for journal-entry lines.
+function bomHint(){
+ var total=0;
+ document.querySelectorAll('#bomLines tr').forEach(function(tr){
+  var q=Number((tr.querySelector('.bomQty')||{}).value)||0;
+  var pr=Number((tr.querySelector('.bomPrice')||{}).value)||0;
+  var cost=q*pr;
+  total+=cost;
+  var costEl=tr.querySelector('.bomLineCost');if(costEl)costEl.textContent=N(cost);
+ });
+ var totEl=document.getElementById('bomTotal');if(totEl)totEl.textContent=N(total);
+}
 function jeHint(){
- var tD=tJE.lines.reduce(function(s,l){return s+Number(l.dr||0);},0);
- var tC=tJE.lines.reduce(function(s,l){return s+Number(l.cr||0);},0);
+ var t=computeJETotals(tJE.lines);
+ var tD=t.tD,tC=t.tC;
+ var isAr=lang==='ar';
  // Live "Total Debit/Credit Side" fields on the Adjust Transactions screen
  // (pAdjustOps) — absent (null) on pJournal()'s own form, so harmless there.
  var totDrEl=document.getElementById('adjTotDr');if(totDrEl)totDrEl.textContent=N(tD);
  var totCrEl=document.getElementById('adjTotCr');if(totCrEl)totCrEl.textContent=N(tC);
+ // Live Total Debit / Total Credit / Difference bar above the lines table
+ // (see buildJELinesEditor()) — red when Credit > Debit, blue when
+ // Debit > Credit, green when balanced. jeSave() hard-blocks saving an
+ // unbalanced entry, so this is the running preview of that same check.
+ var topDr=document.getElementById('jeTotDrTop');if(topDr)topDr.textContent=N(tD);
+ var topCr=document.getElementById('jeTotCrTop');if(topCr)topCr.textContent=N(tC);
+ var topDiff=document.getElementById('jeDiffTop');
+ if(topDiff){
+  if(Math.abs(t.diff)<0.01){topDiff.textContent=isAr?'✔ متوازن':'✔ Balanced';topDiff.style.color='var(--gn)';}
+  else if(t.diff<0){topDiff.textContent=(isAr?'الفرق: ':'Difference: ')+N(Math.abs(t.diff));topDiff.style.color='var(--rd)';}
+  else {topDiff.textContent=(isAr?'الفرق: ':'Difference: ')+N(Math.abs(t.diff));topDiff.style.color='var(--bl)';}
+ }
  var el=document.getElementById('jeHint');if(!el)return;
- var isAr=lang==='ar';
- var diff=Math.abs(tD-tC);
- var msg=diff<0.01?(isAr?'مدين = دائن':'Debits = Credits'):((isAr?'الفرق: ':'Difference: ')+N(diff));
- var color=diff<0.01?'var(--gn)':'var(--am)';
  // Live preview of what jeExpandVATLines() will actually post for each
  // VAT-tagged line — the amount typed stays the full gross total; only
  // this preview note shows the net/VAT split that lands in the ledger.
+ // (The balanced/unbalanced message itself now lives in the totals bar
+ // above the table, so this div is VAT-notes-only.)
  var vatNotes=[];
  tJE.lines.forEach(function(l){
   var vatRate=Number(l.vat)||0;
@@ -12358,8 +12913,8 @@ function jeHint(){
    ?('🧾 ضريبة '+vatRate+'% من '+N(amt)+': سيُرحّل '+N(bd.vatAmt)+' تلقائياً إلى «'+vName+'»، والباقي '+N(bd.netAmt)+' إلى «'+mName+'»')
    :('🧾 '+vatRate+'% VAT within '+N(amt)+': '+N(bd.vatAmt)+' auto-posts to "'+vName+'", net '+N(bd.netAmt)+' to "'+mName+'"'));
  });
- el.innerHTML=msg+(vatNotes.length?'<div style="margin-top:4px;color:var(--t2)">'+vatNotes.join('<br>')+'</div>':'');
- el.style.color=color;
+ el.innerHTML=vatNotes.length?'<div style="color:var(--t2)">'+vatNotes.join('<br>')+'</div>':'';
+ el.style.color='';
 }
 
 // Show loading state immediately
